@@ -86,7 +86,7 @@ been redacted. It must never be committed to the public source repository.
 
 ## Detailed repository evidence and sandbox implementation
 
-### Repository review evidence (version 3)
+### Repository review evidence (version 5)
 
 Before repository task execution, the controller records registry validation and
 origin, a normal-checkout snapshot, and the task-private Git state. Review captures
@@ -177,3 +177,87 @@ outer mode, asking the agent to ignore a discrepancy, or relaxing the task contr
 It is generated from controller startup evidence, not a contract or implementer
 assertion. Repository-agent instructions require this evidence and require stopping
 on missing/conflicting evidence. No attestation file is added to the worktree.
+
+### File-RPC operation evidence
+
+The repository dispatcher journals every `fs/` request, including unsupported
+methods, before dispatch and after completion. Journals are controller-owned under
+runtime `sandbox-*/control/`, outside writable agent roots. Atomic replacement and
+file synchronization retain pending operations across interruption. Failure to save
+the pre-operation observation prevents dispatch. Shutdown seals the journal only
+after queued observations settle; a crash, unsealed journal or unknown outcome is
+not complete capture. The existing kernel profile remains the security authority.
+
+`file_rpc_operation_evidence` is separate from `command_execution_evidence` in
+packets (introduced in version 4). Each record contains a controller-generated operation ID,
+per-generation sequence, method, normalized target classifications (`worktree`,
+`task_scratch`, `outside`, `unknown`), bounded/redacted relative paths for internal
+targets, success/outcome and start/finish timestamps. Copy/rename attempts classify
+both source and destination. Outside paths are omitted. Existing symlink ancestors
+are resolved for the observation; this is not a claim of race-free path enforcement.
+Unsupported rename/write-block requests remain denied, not newly enabled.
+
+No file bytes, request/response bodies, RPC caller IDs, environments, raw errors or
+reasoning are journaled. Each generation and the aggregated reviewer section are
+bounded to 100 records and 24 KiB of record JSON; the full packet still has its
+128 KiB limit. Further operations increment omission counters. Completeness includes
+first-executor coverage, expected/observed generation counts, operation/omission
+counts, seal status and pending/unknown results. Missing or inconsistent journals
+are explicit gaps. A legacy executor cannot acquire retroactive capture coverage.
+
+The controller persists the bounded aggregate in its task record when preparing
+review and before cleanup deletes workspace data. It remains available after
+controller restart and workspace deletion. Original frozen review packets are not
+rewritten. Both command and RPC evidence may be needed for mutation-history
+requirements; neither alone is an exhaustive system-call or read audit.
+
+Reviewer instructions evaluate the explicit contract, invariants and enforced
+boundaries. Broad-read capability alone is not a scope violation. Observed prohibited
+credential/external reads still fail, and an explicit read restriction may fail for
+lack of evidence. Missing/truncated/conflicting required RPC evidence is still FAIL;
+final file contents do not replace a required edit-operation history. Automated
+regressions test packet delivery and preserved simulated reviewer verdicts, not the
+behavior of a new live model session.
+
+### Deterministic packet budgeting
+
+Version-5 review packets remain limited to **131,072 UTF-8 bytes**, including keys
+and completeness metadata. Serialization is compact JSON. `packet_budget` records
+the deterministic section order, measured envelope reserve, and each section's
+original/retained bytes, allocation, completeness and representation. Its controller
+section retains nested unavailable/conflict/truncated observations; retaining the
+section is not a claim that every source observation succeeded.
+
+Contract, identities/baseline, changed-file scope, exact reviewed-tree/file hashes,
+controller/sandbox/checkout/Git observations, required test results, RPC evidence
+and complete baseline/current maps receive budget before redundant diff text.
+Command records have a 30,000-byte collection budget (at most 100 records), leaving
+space for their section metadata within 32 KiB. Git-operation records take priority
+over required-test and ordinary inspection records, then appear in source order.
+Required test results are collected independently of that generic quota, in their
+own 32 KiB required section. Source scanning remains limited to 500 items; all
+retrieval gaps, omitted records and missing configured tests are explicit.
+
+Inspection `output`, `stdout` and `stderr` are each independently limited to 256
+characters. Required test streams retain up to 2,048 characters each. Command and
+cwd limits remain unchanged. Original/retained output byte counts, upstream
+truncation and per-stream truncation flags prevent a bounded prefix from appearing
+complete. Required output details absent from those prefixes must still fail review;
+bounded successful exit status is not a substitute for a task's stronger evidence
+requirement. The packet builder does not drop required test records to fit.
+
+If a redundant text diff cannot fit, complete baseline/current file maps remain
+available for semantic comparison. The diff section explicitly reports omitted
+patch bytes and the equivalent representation; it never claims that omitted patch
+text was inspected. Binary, symlink, rename and mode-changing patches are not
+eligible for this fallback. If required sections (or a non-deduplicable diff) cannot
+fit, packet construction fails before reviewer creation rather than sending hashes
+alone or silently reducing semantic content.
+
+Size failures include numeric section sizes and the blocking required section in
+the MCP error and persisted `review_packet_diagnostic`, also returned by `get_task`.
+Early raw-file/capture limits report the measured section or capture ceiling instead
+of unavailable later section sizes. Unsafe/oversized-file errors retain their
+existing error codes with the additional diagnostic. No diagnostics contain source
+content or command output. Existing sandbox, review PASS validation and exact-tree
+publication gates are unchanged.

@@ -19,32 +19,37 @@ The suite covers:
   symlinks and binary content; missing/failed/stale review and tree mismatch rejection.
 - Remote branch conflicts/races, default-branch rejection, freezing, concurrency,
   lost-response reconciliation, strict MCP schema and durable publication audit.
+- Ordered file-RPC journals, payload exclusion, record limits, missing/conflicting
+  capture, persistence failure before dispatch, and cleanup/restart retention.
+- Deterministic packet budgeting, independent stream truncation, complete semantic
+  file maps, required test retention, Git-operation priority and overflow diagnostics.
+- Contract generation and reviewer instructions that distinguish proven structural
+  boundaries from task-specific behavioral restrictions and optional history.
 
-Latest public-source preparation run: **96 passed, 0 failed, 0 skipped**
-(56.81 seconds). `git diff --check` passed. The first sanitization run found one
-fixture-byte expectation still using the previous sample; it was corrected before
-the successful full rerun. No production enforcement code changed in this cleanup.
-
-## Limits
+## Limits and operational compatibility
 
 Local tests do not prove current ChatGPT discovery, account authorization, model
 behavior, or live GitHub PR creation. Those require separately authorized acceptance
 runs. `npm run test:live` uses real paid sessions and is not part of the local suite.
-Do not run it alongside a production controller. Old review packets without the
-frozen Git tree cannot be retroactively authorized for publication.
+Do not run it alongside a production controller. Reviewer regressions assert inputs
+and preserve simulated verdicts; they do not establish live model behavior.
+
+Activation requires a safe controller restart. Legacy tasks without first-executor
+RPC capture remain incomplete; historical operations cannot be reconstructed or
+retroactively certified. Old review packets without the frozen Git tree cannot be
+retroactively authorized for publication. Existing frozen packets are not rewritten.
+Version-5 packets retain the 128 KiB limit and add explicit section budgets and
+completeness metadata. Required evidence that cannot fit fails before reviewer creation.
 
 ## Public-source scan
 
-The preparation audit scans intended source/untracked files and all available Git
-blobs plus commit/tag objects. It checks credential patterns, exact available
-credential values, private keys, account/runtime IDs, UUIDs, personal paths, and
-credential-bearing URLs/assignments. Findings must be triaged: tests deliberately
-contain synthetic credential strings and mock IDs to verify rejection/redaction.
-A pattern scan cannot establish the absence of every possible secret.
+Before publication, scan the proposed diff for credentials, private keys,
+account/runtime IDs, UUIDs, personal paths and credential-bearing URLs/assignments.
+Inspect every match: tests deliberately contain synthetic credential strings and
+mock identifiers to verify rejection/redaction. A pattern scan cannot establish the
+absence of every possible secret.
 
-Private operational identifiers were removed from public documentation. Existing
-private history still contains earlier operational IDs and author metadata. It
-must not be pushed unchanged; use a reviewed clean public snapshot or separately
-approved history sanitization. No history rewrite or publication was performed.
-Runtime databases, reports and investigation artifacts belong outside the source
-repository and are excluded by `.gitignore` if accidentally copied into it.
+Runtime databases, registry contents, tunnel configuration, reports and investigation
+artifacts belong outside the public source repository. `.gitignore` protects these
+if accidentally copied into it. Publish only reviewed source, tests and public
+documentation, with history based on the public repository.

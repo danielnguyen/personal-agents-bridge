@@ -30,7 +30,7 @@ async function setup(t) {
   const registryFile = path.join(c.stateRoot, 'repositories.json');
   const registry = { version: 1, repositories: { fixture: await repositoryIdentity(normal) } };
   await fs.writeFile(registryFile, JSON.stringify(registry), { mode: 0o600 });
-  t.after(async () => { await c.close(); await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  t.after(async () => { if (!c.closed) await c.close(); await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const input = { contract: contract(), request_id: 'repository_start', repository_id: 'fixture', base_ref: 'approved-base' };
   const start = async (overrides = {}) => {
     const x = await c.start({ ...input, ...overrides }); await Promise.all([...c.jobs.values()]);
@@ -487,4 +487,63 @@ test('authorized repository continuation refreshes controller evidence and rejec
   executor.start = async (...args) => { const owner = await original(...args); delete owner.isolation_evidence; return owner; };
   await assert.rejects(c.continue({ task_id: x.task_id, request_id: 'missing_continue', instruction: 'Ada' }), /REPOSITORY_SANDBOX_ATTESTATION_UNAVAILABLE/);
   assert.equal(api.sent.length, 2);
+});
+
+for (const mode of ['complete', 'missing', 'conflicting', 'prohibited-read']) test(`review packet retains real file-RPC evidence (${mode}) and preserves reviewer verdict`, async t => {
+  const { c, api, executor, start } = await setup(t);
+  const { WebSocket } = await import('ws');
+  const { pathToFileURL } = await import('node:url');
+  const { homedir } = await import('node:os');
+  let sandbox, runtime;
+  const original = executor.start.bind(executor);
+  executor.start = async (...args) => {
+    const owner = await original(...args);
+    if (args[3] === 'implementer') {
+      runtime = args[2];
+      sandbox = await createRepositorySandbox({ binary: process.env.CODEX_BINARY || homedir()+'/.local/bin/codex', workspace: args[1], runtime });
+      owner.isolation_evidence = sandbox.evidence;
+    }
+    return owner;
+  };
+  executor.stop = async owner => { if (owner?.isolation_evidence?.file_rpc_capture_initialized) await sandbox.stop(); return true; };
+  const ctInput = contract();
+  if (mode === 'prohibited-read') ctInput.invariants.push({id:'NO_EXTERNAL_READS',text:'Do not read any file outside the task worktree.'});
+  const x = await start({contract:ctInput});
+  const ws = new WebSocket(sandbox.url); await new Promise((r,j)=>{ws.once('open',r);ws.once('error',j);});
+  const response = new Promise(resolve=>ws.once('message', b=>resolve(JSON.parse(b))));
+  ws.send(JSON.stringify({id:1,method:'fs/writeFile',params:{path:pathToFileURL(path.join(c.workspaceRoot,x.task_id,'repo/greeting.txt')).href,dataBase64:Buffer.from('Hello, Example!\n').toString('base64')}}));
+  assert.equal((await response).error,undefined);
+  if (mode === 'prohibited-read') {
+    const read = new Promise(resolve=>ws.once('message',b=>resolve(JSON.parse(b))));
+    ws.send(JSON.stringify({id:2,method:'fs/readFile',params:{path:pathToFileURL(path.join(c.workspaceRoot,'..','normal/greeting.txt')).href}}));
+    assert.equal((await read).error,undefined);
+  }
+  await sandbox.stop(); ws.terminate();
+  const dir=(await fs.readdir(runtime)).find(n=>n.startsWith('sandbox-')), journal=path.join(runtime,dir,'control/file-rpc.json');
+  if(mode==='missing')await fs.unlink(journal);
+  if(mode==='conflicting'){const v=JSON.parse(await fs.readFile(journal));v.records[0].success=false;await fs.writeFile(journal,JSON.stringify(v));}
+  api.completed(x.implementer.session_id);
+  await c.review({task_id:x.task_id,request_id:'rpc_review'});await Promise.all([...c.jobs.values()]);
+  const saved=c.task(x.task_id), packet=JSON.parse(await fs.readFile(path.join(c.workspaceRoot,x.task_id,saved.reviewer.packet_directory,'evidence.json')));
+  assert.equal(packet.file_rpc_operation_evidence.capture_complete,['complete','prohibited-read'].includes(mode));
+  if(mode==='prohibited-read'){assert.equal(packet.file_rpc_operation_evidence.records[1].method,'fs/readFile');assert.equal(packet.file_rpc_operation_evidence.records[1].targets[0].classification,'outside');assert.equal(packet.file_rpc_operation_evidence.records[1].success,true);}
+  if(mode==='complete')assert.equal(packet.file_rpc_operation_evidence.records[0].targets[0].path,'greeting.txt');
+  const instructions=JSON.stringify(api.created.at(-1));
+  assert.match(instructions,/broad reads: that capability alone is not a SCOPE failure/);
+  assert.match(instructions,/Observed prohibited credential or external reads still FAIL/);
+  assert.match(instructions,/missing, truncated or conflicting required history is FAIL/);
+  assert.match(instructions,/Missing, truncated or conflicting required RPC evidence remains FAIL/);
+  // Simulated independent reviewer output, not a claim about a live model run.
+  const ct=JSON.parse(await fs.readFile(path.join(c.workspaceRoot,x.task_id,'contract.json')));
+  const status=['complete','missing'].includes(mode)?'PASS':'FAIL';
+  const findings=[...ct.requirements,...ct.invariants,{id:'SCOPE'},{id:'TEST_EVIDENCE'}].map(r=>({id:r.id,status,evidence:status==='PASS'?'Controller confinement and final scope evidence support the fixture contract; RPC history is diagnostic without an explicit read prohibition':mode==='prohibited-read'?'Observed outside read violates NO_EXTERNAL_READS despite complete capture':'Conflicting RPC evidence'}));
+  api.completed(saved.reviewer.session_id,JSON.stringify({overall:status,findings}));
+  assert.equal((await c.get(x.task_id)).reviewer.overall,status);
+  const before=c.task(x.task_id).file_rpc_evidence;
+  await c.cleanup({task_id:x.task_id,delete_workspace:true});
+  assert.deepEqual(c.task(x.task_id).file_rpc_evidence,before);
+  await c.close();
+  const restarted=await new Controller({stateRoot:c.stateRoot,workspaceRoot:c.workspaceRoot,api,executor,secrets:[]}).init();
+  assert.deepEqual(restarted.task(x.task_id).file_rpc_evidence,before);
+  await restarted.close();
 });

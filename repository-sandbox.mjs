@@ -7,6 +7,8 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 
+import { createFileRpcJournal } from './file-rpc-evidence.mjs';
+
 const PROFILE = 'bridge_task';
 const FS_METHODS = new Set(['fs/readFile', 'fs/open', 'fs/readBlock', 'fs/close', 'fs/writeFile', 'fs/createDirectory', 'fs/getMetadata', 'fs/canonicalize', 'fs/walk', 'fs/remove', 'fs/copy']);
 const PROCESS_METHODS = new Set(['process/read', 'process/write', 'process/signal', 'process/terminate']);
@@ -77,11 +79,17 @@ export async function createRepositorySandbox({ binary, workspace, runtime, role
     child.on('exit', code => { clearTimeout(timer); code === 0 && output.trim() === 'BRIDGE_SANDBOX_READY' ? resolve() : reject(new Error('REPOSITORY_SANDBOX_FAILED: ' + diagnostic)); });
   });
   if (await fs.readFile(sentinel, 'utf8') !== 'unchanged') throw fail();
-  let closing = false, socket, wss, commands, files;
-  const stop = async () => {
-    if (closing) return; closing = true;
-    socket?.terminate(); commands?.stop(); files?.stop();
-    if (wss) await new Promise(resolve => wss.close(resolve));
+  const journal = createFileRpcJournal(control, workspace, scratch);
+  let closing = false, socket, wss, commands, files, shutdown;
+  const stop = () => {
+    if (shutdown) return shutdown;
+    closing = true;
+    shutdown = (async () => {
+      socket?.terminate(); commands?.stop(); files?.stop();
+      if (wss) await new Promise(resolve => wss.close(resolve));
+      await journal.close();
+    })();
+    return shutdown;
   };
   const fatal = () => { if (!closing) { stop().catch(() => {}); onFailure(); } };
   const notify = msg => { if (socket?.readyState === 1) socket.send(JSON.stringify(msg)); };
@@ -128,7 +136,7 @@ export async function createRepositorySandbox({ binary, workspace, runtime, role
         try {
           m = JSON.parse(data.toString());
           if (!m || typeof m.method !== 'string' || Array.isArray(m)) throw fail();
-          const r = await dispatch(m.method, m.params);
+          const r = await (m.method.startsWith('fs/') ? journal.run(m.method, m.params, () => dispatch(m.method, m.params)) : dispatch(m.method, m.params));
           if (m.id !== undefined && r && ws.readyState === 1) ws.send(JSON.stringify({ ...r, id: m.id }));
         } catch {
           if (m?.id !== undefined && ws.readyState === 1) ws.send(JSON.stringify({ id: m.id, error: { code: -32602, message: 'Repository sandbox rejected request' } }));
@@ -137,14 +145,14 @@ export async function createRepositorySandbox({ binary, workspace, runtime, role
       });
     });
     return { url: `ws://127.0.0.1:${wss.address().port}/${token}`, stop,
-      evidence: { provenance: 'controller', wrapper: 'codex sandbox RPC boundary', profile: PROFILE, policy, policy_sha256: hash(config), dispatcher_sha256: hash(await fs.readFile(fileURLToPath(import.meta.url))), codex_binary_sha256: hash(await fs.readFile(binary)), initialized: true, command_network_access: false, filesystem_rpc_sandboxed: true, preflight: { scratch_write: true, outside_create_denied: true, outside_truncate_denied: true, inet_inet6_unix_connect_denied: true }, enforcement: 'kernel sandbox; profile pinned by trusted CLI; file RPC worker sandboxed; unrecognized RPCs denied' } };
+      evidence: { provenance: 'controller', wrapper: 'codex sandbox RPC boundary', profile: PROFILE, policy, policy_sha256: hash(config), dispatcher_sha256: hash(await fs.readFile(fileURLToPath(import.meta.url))), codex_binary_sha256: hash(await fs.readFile(binary)), initialized: true, file_rpc_capture_initialized: true, command_network_access: false, filesystem_rpc_sandboxed: true, preflight: { scratch_write: true, outside_create_denied: true, outside_truncate_denied: true, inet_inet6_unix_connect_denied: true }, enforcement: 'kernel sandbox; profile pinned by trusted CLI; file RPC worker sandboxed; unrecognized RPCs denied' } };
   } catch { await stop(); throw fail(); }
 }
 
 // Supervisor entry point. Only this forwarder inherits the executor credential.
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  let sandbox, forward;
-  const stop = () => { forward?.kill('SIGTERM'); sandbox?.stop().finally(() => process.exit(1)); if (!sandbox) process.exit(1); };
+  let sandbox, forward, stopping = false;
+  const stop = () => { if (stopping) return; stopping = true; forward?.kill('SIGTERM'); sandbox?.stop().finally(() => process.exit(1)); if (!sandbox) process.exit(1); };
   process.on('SIGTERM', stop); process.on('SIGINT', stop); process.stdin.resume(); process.stdin.on('end', stop);
   try {
     const [binary, workspace, runtime, role, remote, environmentId] = process.argv.slice(2);

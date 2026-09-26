@@ -80,10 +80,13 @@ Cleanup validates process identity (boot ID and start time), never just a reused
 
 Review uses one frozen `evidence.json`, limited to 100 files and 128 KiB total.
 It contains the original contract, baseline/current source, baseline/current Git
-state, full tracked diff, changed-file list including untracked/ignored files, and
+state, a tracked diff (or complete text maps when redundant patch text is omitted),
+changed-file list including untracked/ignored files, and
 actual test command output retrieved from API command-execution items. It never
 includes implementer messages, reasoning, or the controller's credentials.
-Oversized and special-file evidence is rejected, not truncated. Disposable tasks
+Required semantic evidence that cannot fit and unsafe special-file evidence are
+rejected. Command streams and RPC history are bounded with explicit completeness
+metadata; see [packet budgeting](ARCHITECTURE.md#deterministic-packet-budgeting). Disposable tasks
 also reject binary and symlink evidence. Repository packets include binary byte
 counts/hashes, symlink targets, file modes and a controller-generated Git tree SHA;
 symlink targets are never followed. The reviewer must still fail requirements that
