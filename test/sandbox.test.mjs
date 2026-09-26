@@ -23,8 +23,9 @@ async function fixture(t, role = 'implementer') {
   repoGit(normal, 'worktree', 'add', '-qb', 'fixture', work, 'HEAD');
   await fs.writeFile(path.join(work, 'TASK.md'), 'protected contract');
   await fs.mkdir(path.join(root, 'bridge-state')); await fs.writeFile(path.join(root, 'outside'), 'sentinel');
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const sandbox = await createRepositorySandbox({ binary, workspace: work, runtime, role });
+  let sandbox;
+  t.after(async () => { await sandbox?.stop(); await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  sandbox = await createRepositorySandbox({ binary, workspace: work, runtime, role });
   const ws = new WebSocket(sandbox.url); await new Promise((r, j) => { ws.once('open', r); ws.once('error', j); });
   let id = 0; const pending = new Map(), exits = new Map();
   ws.on('message', b => { const m = JSON.parse(b); if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } else if (m.method === 'process/exited') exits.set(m.params.processId, m.params); });
@@ -205,4 +206,28 @@ test('LocalExecutor waits for real sandbox readiness and stops its repository su
   assert.equal(owner.isolation_evidence.command_network_access, false);
   assert.equal(owner.isolation_evidence.filesystem_rpc_sandboxed, true);
   assert.equal(await executor.stop(owner), true);
+});
+
+test('real file RPC operations retain ordered sanitized success and denial metadata', async t => {
+  const { work, root, runtime, rpc, sandbox } = await fixture(t);
+  const uri = name => pathToFileURL(path.join(work, name)).href;
+  const write = name => rpc('fs/writeFile', { path: uri(name), dataBase64: Buffer.from('FILE_CONTENT_CANARY').toString('base64') });
+  const written = await Promise.all([write('first'), write('second')]);
+  assert(written.every(r => !r.error));
+  assert.equal((await rpc('fs/copy', { sourcePath: uri('first'), destinationPath: uri('copied'), recursive: false })).error, undefined);
+  assert.equal((await rpc('fs/remove', { path: uri('copied'), recursive: false })).error, undefined);
+  assert((await rpc('fs/rename', { sourcePath: uri('first'), destinationPath: uri('renamed') })).error); // Unsupported: keep fail-closed.
+  assert((await rpc('fs/writeFile', { path: pathToFileURL(path.join(root,'outside')).href, dataBase64: 'eA==' })).error);
+  await sandbox.stop();
+  const dir = (await fs.readdir(runtime)).find(n => n.startsWith('sandbox-'));
+  const raw = await fs.readFile(path.join(runtime,dir,'control/file-rpc.json'),'utf8'), j = JSON.parse(raw);
+  assert.equal(j.closed,true); assert.equal(j.omitted,0);
+  assert.deepEqual(j.records.map(r => r.sequence),[1,2,3,4,5,6]);
+  assert.deepEqual(j.records.map(r => r.method),['fs/writeFile','fs/writeFile','fs/copy','fs/remove','fs/rename','fs/writeFile']);
+  assert.deepEqual(j.records.slice(0,2).map(r=>r.targets[0].path),['first','second']);
+  assert(j.records.slice(0,4).every(r=>r.success===true));
+  assert.equal(j.records[4].outcome,'denied'); assert.equal(j.records[5].outcome,'denied');
+  assert.equal(j.records[5].targets[0].classification,'outside');
+  assert(j.records.every(r=>r.operation_id && r.started_at && r.finished_at));
+  assert(!raw.includes('FILE_CONTENT_CANARY')); assert(!raw.includes(Buffer.from('FILE_CONTENT_CANARY').toString('base64')));
 });
