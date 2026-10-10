@@ -6,12 +6,44 @@ import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
+import { AppServerRpc } from '../feasibility/local-codex/rpc.mjs';
 import { SessionLedger } from '../feasibility/local-codex/state.mjs';
 import { configuration, environment, validateConfiguration, accountBinding, validateAuthFile, validateThread,
-  newReport, TurnEvidence, runProtocol, loadFixture, prepare, diagnosticLauncher, PROFILE, FIXTURE, RESPONSE } from '../feasibility/local-codex/authenticated-acceptance.mjs';
+  newReport, TurnEvidence, runProtocol, loadFixture, prepare, diagnosticLauncher, classifyMcpNotification, validateEmptyMcpInventory,
+  PROFILE, FIXTURE, RESPONSE } from '../feasibility/local-codex/authenticated-acceptance.mjs';
 
 const clone = value => structuredClone(value);
 const binary = '/opt/synthetic-codex';
+const toml = value => value && typeof value === 'object' && !Array.isArray(value)
+  ? `{ ${Object.entries(value).map(([key, child]) => `${JSON.stringify(key)} = ${toml(child)}`).join(', ')} }` : JSON.stringify(value);
+async function offlineMcpRuntime(context, overrides = {}, onMessage = () => {}, cachedAuth = false, setup = async () => {}) {
+  const runtime = await fs.realpath(process.env.CODEX_BINARY || path.join(homedir(), '.local/bin/codex'));
+  const root = await prepare(runtime);
+  let rpc;
+  context.after(async () => { await rpc?.close(); await fs.rm(root, { recursive: true, force: true }); });
+  await setup(root, runtime);
+  if (cachedAuth) {
+    const claims = { email: 'synthetic@example.invalid', 'https://api.openai.com/auth': { chatgpt_account_id: 'synthetic-account', chatgpt_plan_type: 'pro' } };
+    const token = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.synthetic`;
+    await fs.writeFile(path.join(root, 'codex', 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null,
+      tokens: { access_token: token, id_token: token, refresh_token: 'synthetic', account_id: 'synthetic-account' }, last_refresh: new Date().toISOString() }), { mode: 0o600 });
+  }
+  const permissions = { pab_mcp_offline: { filesystem: { ':minimal': 'read', [runtime]: 'read', [root]: 'write' }, network: { enabled: false } } };
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const launcher = path.join(root, 'offline-launch');
+  const args = ['sandbox', '-c', `permissions=${toml(permissions)}`, '-P', 'pab_mcp_offline', '-C', root, '--', runtime];
+  await fs.writeFile(launcher, `#!/bin/sh\nexec ${[runtime, ...args].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
+  const settings = { ...configuration(root, runtime), ...(typeof overrides === 'function' ? overrides(root, runtime) : overrides) };
+  rpc = new AppServerRpc(launcher, ['--strict-config', ...Object.entries(settings).flatMap(([key, value]) => ['-c', `${key}=${toml(value)}`])],
+    { cwd: root, env: environment(root), onMessage, timeoutMs: 15000 });
+  const request = rpc.request.bind(rpc);
+  rpc.request = (method, params) => {
+    assert(['initialize', 'config/read', 'model/list', 'thread/start', 'mcpServerStatus/list'].includes(method), 'Offline RPC allowlist');
+    return request(method, params);
+  };
+  await rpc.initialize();
+  return { root, runtime, rpc };
+}
 const account = () => ({ account: { type: 'chatgpt', email: 'synthetic@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true });
 const requirements = () => ({ requirements: { allowedLoginMethods: ['chatgpt'], modelProvider: null } });
 const config = root => ({ config: configuration(root, binary), layers: [{ name: { type: 'user', file: path.join(root, 'codex', 'config.toml'), profile: null }, config: configuration(root, binary) }] });
@@ -47,6 +79,7 @@ async function fixture(context, overrides = {}) {
       if (method === 'configRequirements/read') return requirements();
       if (method === 'command/exec') return { exitCode: 0, stdout: 'PAB_BOUNDARY_OK\n', stderr: '' };
       if (method === 'account/read') return account();
+      if (method === 'mcpServerStatus/list') return { data: [], nextCursor: null };
       if (method === 'model/list') return { data: [{ model: 'fixture-model', isDefault: true, hidden: false }], nextCursor: null };
       if (method === 'thread/start') return thread(root);
       if (method === 'turn/start') {
@@ -325,7 +358,9 @@ test('runtime errors and every hook/MCP prefix retain fail-closed category/phase
       evidence.receive({ method, params: { error: 'private-error', token: 'private-token', account: 'private-account' } }); return account();
     } });
     await assert.rejects(value.run(), /RUNTIME_UNCERTAINTY/);
-    assert.deepEqual(value.report.notificationDiagnostics, [{ category, phase: 'authentication' }]);
+    assert.equal(value.report.notificationDiagnostics.length, 1);
+    assert.equal(value.report.notificationDiagnostics[0].category, category);
+    assert.equal(value.report.notificationDiagnostics[0].phase, 'authentication');
     assert.equal(value.report.configuration, 'VERIFIED'); assert.equal(value.report.standaloneBoundary, 'VERIFIED');
     assert.equal(value.report.authentication, 'UNVERIFIED'); assert.equal(value.report.modelTurnsSubmitted, 0);
     assert(!JSON.stringify(value.report).includes('private'));
@@ -414,4 +449,225 @@ test('unrecognized raw errors, including uppercase messages, never become publis
   await assert.rejects(value.run({ diagnostic: true }), /ACCEPTANCE_UNCERTAIN/);
   assert.equal(value.report.blocker, 'ACCEPTANCE_UNCERTAIN'); assert.equal(value.report.blockerPhase, 'authentication');
   assert(!JSON.stringify(value.report).includes('PRIVATE_'));
+});
+
+for (const cachedAuth of [false, true]) test(`offline MCP startup characterization cachedAuth=${cachedAuth} never submits a model turn`, async context => {
+  let phase = 'initialization', threadId;
+  const observations = [];
+  const value = await offlineMcpRuntime(context, {}, message => {
+    if (!message.method.startsWith('mcpServer/')) return;
+    const params = message.params;
+    observations.push({ phase, category: message.method === 'mcpServer/startupStatus/updated' ? 'startup_status' : 'other_mcp',
+      status: ['starting', 'ready', 'failed', 'cancelled'].includes(params?.status) ? params.status : 'unknown',
+      appScoped: params?.threadId === null, threadBound: !!threadId && params?.threadId === threadId,
+      knownAppsIdentity: params?.name === 'codex_apps', knownCodexIdentity: params?.name === 'codex',
+      hasError: params?.error != null });
+    if (observations.length > 16) throw Error('SYNTHETIC_NOTIFICATION_LIMIT');
+  }, cachedAuth);
+  phase = 'configuration';
+  const settings = await value.rpc.request('config/read', { includeLayers: true, cwd: path.join(value.root, 'work') });
+  validateEmptyMcpInventory(await value.rpc.request('mcpServerStatus/list', { detail: 'full', limit: 1 }));
+  const models = await value.rpc.request('model/list', { includeHidden: false });
+  const model = models.data.find(candidate => candidate.isDefault).model;
+  phase = 'thread_creation';
+  const started = await value.rpc.request('thread/start', { model, modelProvider: 'openai', cwd: path.join(value.root, 'work'),
+    approvalPolicy: 'never', approvalsReviewer: 'user', permissions: PROFILE, ephemeral: true, environments: [], dynamicTools: [] });
+  threadId = started.thread.id;
+  phase = 'pre_inference';
+  const inventory = await value.rpc.request('mcpServerStatus/list', { threadId, detail: 'full' });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  context.diagnostic(JSON.stringify({ emptyTable: Object.keys(settings.config.mcp_servers).length === 0, observations,
+    inventoryCount: inventory.data.length, toolCount: inventory.data.reduce((sum, server) => sum + Object.keys(server.tools).length, 0),
+    completePage: inventory.nextCursor === null }));
+  assert.equal(value.rpc.failure, null);
+  assert.deepEqual(settings.config.mcp_servers, {});
+  assert.deepEqual(observations, []);
+  validateEmptyMcpInventory(inventory);
+});
+
+for (const mode of ['cleared', 'enabled', 'disabled']) test(`offline configured MCP startup mode=${mode} characterizes server activity without inference`, async context => {
+  let phase = 'initialization', threadId;
+  const observations = [];
+  const servers = root => {
+    const program = `import json,sys,pathlib\npathlib.Path(${JSON.stringify(path.join(root, 'mcp-process-started'))}).write_text('started')\nfor line in sys.stdin:\n request=json.loads(line)\n if 'id' not in request: continue\n method=request.get('method')\n result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'synthetic','version':'1'}} if method=='initialize' else {'tools':[{'name':'fixture_only','description':'Synthetic offline fixture','inputSchema':{'type':'object','properties':{}}}]} if method=='tools/list' else {}\n print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)`;
+    return { synthetic_fixture: { command: '/usr/bin/python3', args: ['-B', '-u', '-c', program], enabled: mode !== 'disabled' } };
+  };
+  const value = await offlineMcpRuntime(context, root => mode === 'cleared' ? {} : { mcp_servers: servers(root) }, message => {
+    if (!message.method.startsWith('mcpServer/')) return;
+    assert.equal(message.method, 'mcpServer/startupStatus/updated');
+    const classified = classifyMcpNotification(message, threadId);
+    assert.equal(classified.schema, 'recognized');
+    assert.equal(classified.authorized, false);
+    observations.push({ phase, status: ['starting', 'ready', 'failed', 'cancelled'].includes(message.params?.status) ? message.params.status : 'unknown',
+      fixtureIdentity: message.params?.name === 'synthetic_fixture', threadBound: !!threadId && message.params?.threadId === threadId });
+    assert(observations.length <= 2);
+  }, false, async (root, runtime) => {
+    const settings = { ...configuration(root, runtime), mcp_servers: servers(root) };
+    await fs.writeFile(path.join(root, 'codex', 'config.toml'), Object.entries(settings).map(([key, child]) => `${key} = ${toml(child)}\n`).join(''), { mode: 0o600 });
+  });
+  phase = 'configuration';
+  const settings = await value.rpc.request('config/read', { includeLayers: true, cwd: path.join(value.root, 'work') });
+  const models = await value.rpc.request('model/list', { includeHidden: false });
+  const model = models.data.find(candidate => candidate.isDefault).model;
+  phase = 'thread_creation';
+  const started = await value.rpc.request('thread/start', { model, modelProvider: 'openai', cwd: path.join(value.root, 'work'),
+    approvalPolicy: 'never', approvalsReviewer: 'user', permissions: PROFILE, ephemeral: true, environments: [], dynamicTools: [] });
+  threadId = started.thread.id;
+  phase = 'pre_inference';
+  const deadline = Date.now() + 5000;
+  while (mode === 'enabled' && !observations.some(event => event.status === 'ready') && !value.rpc.failure && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  if (mode === 'enabled') assert.deepEqual(observations.map(event => event.status), ['starting', 'ready']);
+  const inventory = await value.rpc.request('mcpServerStatus/list', { threadId, detail: 'full' });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const processStarted = await fs.stat(path.join(value.root, 'mcp-process-started')).then(() => true, () => false);
+  context.diagnostic(JSON.stringify({ configuredCount: Object.keys(settings.config.mcp_servers).length, observations, processStarted,
+    inventoryCount: inventory.data.length, toolCount: inventory.data.reduce((sum, server) => sum + Object.keys(server.tools).length, 0), completePage: inventory.nextCursor === null }));
+  assert.equal(value.rpc.failure, null);
+  assert.equal(Object.keys(settings.config.mcp_servers).length, mode === 'cleared' ? 0 : 1);
+  assert.equal(processStarted, mode === 'enabled');
+  assert.equal(inventory.data.length, mode === 'cleared' ? 0 : 1);
+  assert.equal(inventory.nextCursor, null);
+  if (mode === 'enabled') {
+    assert.deepEqual(observations.map(event => event.status), ['starting', 'ready']);
+    assert(observations.every(event => event.fixtureIdentity && ['thread_creation', 'pre_inference'].includes(event.phase)));
+    assert.equal(inventory.data[0].name, 'synthetic_fixture');
+    assert.equal(inventory.data[0].runtimeStatus, 'connected');
+    assert.equal(Object.keys(inventory.data[0].tools).length, 1);
+  } else {
+    assert.deepEqual(observations, []);
+    if (mode === 'disabled') {
+      assert.equal(inventory.data[0].runtimeStatus, 'disabled');
+      assert.deepEqual(inventory.data[0].tools, {});
+    }
+  }
+});
+
+const startupNotice = (params = {}) => ({ method: 'mcpServer/startupStatus/updated', params: {
+  name: 'private-server', threadId: 'synthetic-thread', status: 'starting', error: null, failureReason: null, ...params } });
+
+test('MCP diagnostics distinguish exact lifecycle, OAuth, stream and tool categories without private values', () => {
+  const cases = [
+    [startupNotice(), 'startup_status', 'server_lifecycle', 'recognized'],
+    [startupNotice({ status: 'failed', error: 'private-error', failureReason: 'reauthenticationRequired' }), 'startup_status', 'server_lifecycle', 'recognized'],
+    [{ method: 'mcpServer/oauthLogin/completed', params: { name: 'private-server', threadId: null, success: true, error: 'private-error' } }, 'oauth_completed', 'oauth_activity', 'recognized'],
+    [{ method: 'mcpServer/event/stream/notification', params: { subscriptionId: 'private-id', notification: { method: 'private-method', params: { url: 'private-url' } } } }, 'event_stream', 'server_event', 'recognized'],
+    [{ method: 'mcpServer/private-future-method', params: 'private-payload' }, 'unknown_mcp', 'unknown', 'unknown'],
+    [{ method: 'item/mcpToolCall/progress', params: { threadId: 'synthetic-thread', message: 'private-progress' } }, 'tool_progress', 'tool_activity', 'unknown'],
+    ...['item/started', 'item/completed'].map(method => [{ method, params: { threadId: 'synthetic-thread', item: { type: 'mcpToolCall', server: 'private-server', tool: 'private-tool' } } }, 'tool_item', 'tool_activity', 'unknown']),
+  ];
+  for (const [message, methodCategory, semantics, schema] of cases) {
+    const report = newReport(), evidence = new TurnEvidence('/tmp/example', report);
+    evidence.notifications.threadId = 'synthetic-thread'; evidence.notifications.setPhase('pre_inference');
+    assert.throws(() => evidence.receive(message), /RUNTIME_UNCERTAINTY/);
+    const entry = report.notificationDiagnostics[0];
+    assert.equal(entry.category, 'mcp_activity'); assert.equal(entry.phase, 'pre_inference');
+    assert.equal(entry.mcp.methodCategory, methodCategory); assert.equal(entry.mcp.semantics, semantics);
+    assert.equal(entry.mcp.schema, schema); assert.equal(entry.mcp.authorized, false);
+    assert(!JSON.stringify(report).includes('private')); assert(!JSON.stringify(report).includes('synthetic-thread'));
+  }
+});
+
+test('MCP startup scope classification never treats an app, unbound or cross-thread identity as authorized', () => {
+  for (const [threadId, bound, scope] of [[null, 'synthetic-thread', 'app'], ['synthetic-thread', undefined, 'unbound_thread'],
+    ['synthetic-thread', 'synthetic-thread', 'same_thread'], ['private-other-thread', 'synthetic-thread', 'cross_thread'], [42, 'synthetic-thread', 'invalid']]) {
+    const notice = startupNotice({ threadId }), classified = classifyMcpNotification(notice, bound);
+    assert.equal(classified.scope, scope); assert.equal(classified.authorized, false);
+    const evidence = new TurnEvidence('/tmp/example'); evidence.notifications.threadId = bound;
+    assert.throws(() => evidence.receive(notice), /RUNTIME_UNCERTAINTY/);
+  }
+});
+
+test('malformed MCP payloads cannot qualify lifecycle or invent a no-server completion', () => {
+  for (const params of [null, {}, { ...startupNotice().params, status: 'complete' }, { ...startupNotice().params, name: '' },
+    { ...startupNotice().params, threadId: undefined }, { ...startupNotice().params, failureReason: 'private-unknown' },
+    { ...startupNotice().params, error: {} }, { ...startupNotice().params, extra: 'private-value' }]) {
+    const message = { method: 'mcpServer/startupStatus/updated', params };
+    assert.equal(classifyMcpNotification(message).schema, 'invalid');
+    assert.throws(() => new TurnEvidence('/tmp/example').receive(message), /RUNTIME_UNCERTAINTY/);
+  }
+  for (const method of ['mcpServer/oauthLogin/completed', 'mcpServer/event/stream/notification']) {
+    const message = { method, params: {} };
+    assert.equal(classifyMcpNotification(message).schema, 'invalid');
+    assert.throws(() => new TurnEvidence('/tmp/example').receive(message), /RUNTIME_UNCERTAINTY/);
+  }
+});
+
+test('duplicate, out-of-order and terminal MCP startup events leave a sticky rejection in every phase', () => {
+  for (const phase of ['initialization', 'thread_creation', 'pre_inference', 'inference', 'post_inference', 'complete', 'shutdown']) {
+    for (const statuses of [['starting', 'starting'], ['ready', 'starting'], ['failed', 'ready'], ['cancelled', 'starting']]) {
+      const report = newReport(), evidence = new TurnEvidence('/tmp/example', report);
+      evidence.notifications.setPhase(phase);
+      for (const status of statuses) assert.throws(() => evidence.receive(startupNotice({ status })), /RUNTIME_UNCERTAINTY/);
+      assert.equal(report.notificationDiagnostics.length, 1);
+      assert.equal(report.outcome, 'BLOCKED'); assert.equal(report.inference, 'UNVERIFIED');
+    }
+  }
+});
+
+test('unexpected MCP startup after thread acknowledgement preserves claim and prevents any turn', async context => {
+  const value = await fixture(context, { 'mcpServerStatus/list': ({ evidence, params }) => {
+    if (params.threadId) evidence.receive(startupNotice());
+    return { data: [], nextCursor: null };
+  } });
+  await assert.rejects(value.run(), /RUNTIME_UNCERTAINTY/);
+  assert.equal(value.report.blockerPhase, 'pre_inference');
+  assert.equal(value.report.notificationDiagnostics[0].mcp.scope, 'same_thread');
+  assert.equal(value.report.modelTurnsSubmitted, 0); assert(!value.calls.some(call => call.method === 'turn/start'));
+  assert.equal((await fs.stat(path.join(value.root, 'attempt.claim'))).isFile(), true);
+  await assert.rejects(value.run());
+  assert.equal(value.calls.filter(call => call.method === 'thread/start').length, 1);
+});
+
+test('empty MCP inventory requires exact complete evidence and rejects even disabled or tools-only entries', async context => {
+  const invalid = [null, {}, { data: [], nextCursor: 'private-cursor' }, { data: [] }, { data: {}, nextCursor: null },
+    { data: [], nextCursor: null, extra: 'private-data' }, ...['connected', 'starting', 'disabled', null].map(runtimeStatus =>
+      ({ data: [{ name: 'private-server', runtimeStatus, tools: { 'private-tool': {} } }], nextCursor: null }))];
+  for (const response of invalid) {
+    assert.throws(() => validateEmptyMcpInventory(response), /MCP_(INVENTORY_UNVERIFIED|SERVER_PRESENT)/);
+    const value = await fixture(context, { 'mcpServerStatus/list': () => response });
+    await assert.rejects(value.run(), /MCP_(INVENTORY_UNVERIFIED|SERVER_PRESENT)/);
+    assert(!value.calls.some(call => ['thread/start', 'turn/start'].includes(call.method)));
+    assert(!JSON.stringify(value.report).includes('private'));
+  }
+});
+
+test('MCP inventory is checked app-wide, before inference and after completion without claiming process absence', async context => {
+  const value = await fixture(context), result = await value.run();
+  assert.deepEqual(value.calls.filter(call => call.method === 'mcpServerStatus/list').map(call => call.params),
+    [{ detail: 'full', limit: 1 }, ...Array.from({ length: 2 }, () => ({ detail: 'full', limit: 1, threadId: 'synthetic-thread' }))]);
+  assert.deepEqual(result.mcpInventorySnapshots, [['model_selection', 'app'], ['pre_inference', 'thread'], ['post_inference', 'thread']]
+    .map(([phase, scope]) => ({ phase, scope, empty: true, completePage: true })));
+  assert.equal(result.zeroActiveMcpServers, 'UNVERIFIED');
+});
+
+test('new MCP inventory entries and lost inventory evidence invalidate pre/post inference without retries', async context => {
+  for (const occurrence of [2, 3]) for (const failure of ['entry', 'missing', 'disconnect', 'timeout']) {
+    const value = await fixture(context, { 'mcpServerStatus/list': ({ calls, rpc }) => {
+      if (calls.filter(call => call.method === 'mcpServerStatus/list').length === occurrence) {
+        if (failure === 'entry') return { data: [{ name: 'private-server', tools: {} }], nextCursor: null };
+        if (failure === 'missing') return {};
+        if (failure === 'disconnect') rpc.failure = Error('private-error');
+        if (failure === 'timeout') throw Error('APP_SERVER_RPC_TIMEOUT');
+      }
+      return { data: [], nextCursor: null };
+    } });
+    await assert.rejects(value.run());
+    assert.equal(value.report.modelTurnsSubmitted, occurrence === 2 ? 0 : 1);
+    assert.equal(value.calls.filter(call => call.method === 'mcpServerStatus/list').length, occurrence);
+    assert.equal(value.report.inference, 'UNVERIFIED'); assert.equal(value.report.outcome, 'BLOCKED');
+    assert(!JSON.stringify(value.report).includes('private'));
+  }
+});
+
+test('effective MCP configuration changes before inference are rejected before the thread inventory or any turn', async context => {
+  const value = await fixture(context, { 'config/read': ({ root, calls }) => {
+    const response = config(root);
+    if (calls.filter(call => call.method === 'config/read').length === 3) response.config.mcp_servers = { 'private-server': { enabled: false } };
+    return response;
+  } });
+  await assert.rejects(value.run(), /CONFIGURATION_MISMATCH/);
+  assert.equal(value.report.modelTurnsSubmitted, 0);
+  assert.equal(value.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1);
 });

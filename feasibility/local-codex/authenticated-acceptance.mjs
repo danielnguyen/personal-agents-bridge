@@ -129,9 +129,53 @@ export function newReport() {
   return { runtime: RUNTIME, authentication: 'UNVERIFIED', inference: 'UNVERIFIED', subscriptionUsageAttribution: 'UNVERIFIED',
     apiKeyFallbackExcluded: 'UNVERIFIED', modelCommand: 'UNVERIFIED', identityBinding: 'UNVERIFIED',
     configuration: 'UNVERIFIED', standaloneBoundary: 'UNVERIFIED', modelTurnsSubmitted: 0,
-    usage: null, commandEvidence: null, notificationDiagnostics: [], outcome: 'BLOCKED', nextSandboxStage: 'BLOCKED', migrationReady: false,
+    usage: null, commandEvidence: null, notificationDiagnostics: [], mcpInventorySnapshots: [], zeroActiveMcpServers: 'UNVERIFIED',
+    outcome: 'BLOCKED', nextSandboxStage: 'BLOCKED', migrationReady: false,
     limitations: ['Usage counters are not billing attribution.', 'One read-only command is not full tool security equivalence.',
       'Runtime internal inference retries are not observable here; PAB never resubmits an uncertain turn.', 'Process-tree quiescence remains unverified.'] };
+}
+
+export function classifyMcpNotification(message, threadId) {
+  const params = message.params;
+  const result = { methodCategory: 'unknown_mcp', semantics: 'unknown', schema: 'unknown',
+    scope: 'unverified', identity: 'unverified', authorized: false };
+  const fields = (required, optional = []) => object(params) && required.every(key => Object.hasOwn(params, key)) &&
+    Object.keys(params).every(key => required.includes(key) || optional.includes(key));
+  if (message.method === 'mcpServer/startupStatus/updated' || message.method === 'mcpServer/oauthLogin/completed') {
+    result.scope = params?.threadId === null ? 'app' : !nonempty(params?.threadId) ? 'invalid' :
+      !threadId ? 'unbound_thread' : params.threadId === threadId ? 'same_thread' : 'cross_thread';
+    result.identity = nonempty(params?.name) ? 'unauthorized_server' : 'missing_server';
+    let valid;
+    if (message.method === 'mcpServer/startupStatus/updated') {
+      result.methodCategory = 'startup_status'; result.semantics = 'server_lifecycle';
+      result.status = ['starting', 'ready', 'failed', 'cancelled'].includes(params?.status) ? params.status : 'unknown';
+      valid = fields(['threadId', 'name', 'status', 'error', 'failureReason']) && result.status !== 'unknown' &&
+        (params.error === null || typeof params.error === 'string') && [null, 'reauthenticationRequired'].includes(params.failureReason);
+    } else {
+      result.methodCategory = 'oauth_completed'; result.semantics = 'oauth_activity';
+      valid = fields(['name', 'threadId', 'success'], ['error']) && typeof params.success === 'boolean' &&
+        (!Object.hasOwn(params, 'error') || typeof params.error === 'string');
+    }
+    result.schema = valid && result.scope !== 'invalid' && result.identity === 'unauthorized_server' ? 'recognized' : 'invalid';
+  } else if (message.method === 'mcpServer/event/stream/notification') {
+    result.methodCategory = 'event_stream'; result.semantics = 'server_event';
+    result.identity = 'unauthorized_subscription';
+    result.schema = fields(['subscriptionId', 'notification']) && nonempty(params.subscriptionId) && object(params.notification) &&
+      isDeepStrictEqual(Object.keys(params.notification).sort(), ['method', 'params']) && nonempty(params.notification.method) ? 'recognized' : 'invalid';
+  } else if (message.method === 'item/mcpToolCall/progress' ||
+      (['item/started', 'item/completed'].includes(message.method) && params?.item?.type === 'mcpToolCall')) {
+    result.methodCategory = message.method === 'item/mcpToolCall/progress' ? 'tool_progress' : 'tool_item';
+    result.semantics = 'tool_activity'; result.identity = 'unauthorized_tool';
+    result.scope = !nonempty(params?.threadId) ? 'invalid' : !threadId ? 'unbound_thread' :
+      params.threadId === threadId ? 'same_thread' : 'cross_thread';
+  }
+  return result;
+}
+
+export function validateEmptyMcpInventory(response) {
+  if (!object(response) || !isDeepStrictEqual(Object.keys(response).sort(), ['data', 'nextCursor']) ||
+      !Array.isArray(response.data) || response.nextCursor !== null) fail('MCP_INVENTORY_UNVERIFIED');
+  if (response.data.length) fail('MCP_SERVER_PRESENT');
 }
 
 export class NotificationGuard {
@@ -176,7 +220,13 @@ export class NotificationGuard {
       this.updates.push(hash(JSON.stringify({ authMode: params.authMode, planType: params.planType })));
       return true;
     }
-    const category = method === 'error' ? 'runtime_error' : method?.startsWith('hook/') ? 'hook_activity' : method?.startsWith('mcpServer/') ? 'mcp_activity' : null;
+    if (method?.startsWith('mcpServer/') || method === 'item/mcpToolCall/progress' ||
+        (['item/started', 'item/completed'].includes(method) && message.params?.item?.type === 'mcpToolCall')) {
+      this.record('mcp_activity');
+      this.report.notificationDiagnostics.at(-1).mcp = classifyMcpNotification(message, this.threadId);
+      this.reject('RUNTIME_UNCERTAINTY');
+    }
+    const category = method === 'error' ? 'runtime_error' : method?.startsWith('hook/') ? 'hook_activity' : null;
     if (category) { this.record(category); this.reject('RUNTIME_UNCERTAINTY'); }
     if (this.readOnly && /^(thread\/|turn\/|item\/)/.test(method)) { this.record('model_activity'); this.reject('DIAGNOSTIC_MODEL_ACTIVITY'); }
     return false;
@@ -265,6 +315,15 @@ export async function runProtocol(options) {
 
 async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, claim, validateFiles, inference = true, diagnostic = false, timeoutMs = 90000 }) {
   const notifications = evidence.notifications;
+  const checkMcpInventory = async threadId => {
+    notifications.check();
+    const inventory = await rpc.request('mcpServerStatus/list', { detail: 'full', limit: 1, ...(threadId ? { threadId } : {}) });
+    notifications.check();
+    if (rpc.failure) fail('TRANSPORT_UNCERTAIN');
+    validateEmptyMcpInventory(inventory);
+    if (report.mcpInventorySnapshots.length >= 3) fail('MCP_INVENTORY_UNVERIFIED');
+    report.mcpInventorySnapshots.push({ phase: notifications.phase, scope: threadId ? 'thread' : 'app', empty: true, completePage: true });
+  };
   notifications.locked = !(inference || diagnostic);
   notifications.readOnly = diagnostic;
   notifications.setPhase('initialization');
@@ -298,6 +357,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
     return report;
   }
   notifications.setPhase('model_selection');
+  await checkMcpInventory();
   const models = await rpc.request('model/list', { includeHidden: false });
   const defaults = models?.data?.filter(model => model.isDefault === true && model.hidden === false);
   if (models?.nextCursor !== null || defaults?.length !== 1 || !/^[a-zA-Z0-9_.-]{1,100}$/.test(defaults[0].model)) fail('MODEL_SELECTION_UNVERIFIED');
@@ -311,11 +371,13 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
   if (!ledger.beginOperation('create', 'thread/start', start).dispatch) fail('ATTEMPT_ALREADY_CLAIMED');
   const thread = await rpc.request('thread/start', start);
   validateThread(thread, root, model);
+  notifications.threadId = thread.thread.id;
   ledger.acknowledgeOperation('create'); ledger.bind('implementer', thread.thread.id, thread.thread.sessionId, 'acceptance');
   notifications.setPhase('pre_inference');
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   await validateFiles();
+  await checkMcpInventory(thread.thread.id);
   notifications.check();
   notifications.setPhase('inference');
   const input = { threadId: thread.thread.id, input: [{ type: 'text', text: 'Run cat fixture.txt once, then reply exactly PAB_AUTH_ACCEPTANCE_OK. Do nothing else.' }],
@@ -337,6 +399,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   await validateFiles();
+  await checkMcpInventory(thread.thread.id);
   notifications.check();
   ledger.turnCompleted('implementer', 'acceptance', { threadId: thread.thread.id, turn: { id: turn.turn.id, status: 'completed' } });
   Object.assign(report, observed, { inference: 'VERIFIED', identityBinding: 'VERIFIED', modelCommand: 'VERIFIED', apiKeyFallbackExcluded: 'VERIFIED',

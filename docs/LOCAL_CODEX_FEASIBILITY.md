@@ -15,20 +15,23 @@ section. The previous unauthenticated probe remains unchanged. The original norm
 checkout, dirty files, private predecessor history, production login and backend
 are untouched.
 
-**Current disposition: blocked on an unresolved pre-inference notification.** The
+**Current disposition: blocked on an unresolved pre-inference MCP notification.** The
 operator reports completing fresh isolated device login, followed by an attempt
 with configuration and standalone boundary VERIFIED, authentication UNVERIFIED,
-zero model turns submitted, and `RUNTIME_UNCERTAINTY`. The notification category
-was not recorded by the original harness, so the precise cause is unknown. The
-coding agent has not inspected the operator's private authentication state or
-rerun that attempt. The following are actual acceptance
+zero model turns submitted, and `RUNTIME_UNCERTAINTY`. The latest report from head
+`fc311b60a7a389db884fc58ddc2c3822bad05b3c` identifies `account_updated` during
+authentication, then `mcp_activity` during pre-inference. That identifies the
+rejecting MCP branch, **not the exact MCP method, server, source or activity**.
+The existing root is claimed and is off limits: do not access, diagnose, reset,
+delete, reuse or attempt inference in it. The coding agent has not inspected the
+operator's private authentication state or rerun that attempt. The following are actual acceptance
 statuses, not predictions based on synthetic tests:
 
 | Criterion | Status | Evidence / outstanding work |
 | --- | --- | --- |
 | Disposable configuration verified | VERIFIED | New private Codex home; effective config/layers/requirements checked against controller pins; no inherited nonempty layer accepted |
 | Narrow standalone boundary verified | VERIFIED | Actual `command/exec`: fixture readable, worktree creation denied, private Codex-home sentinel read denied, loopback connection denied |
-| Authentication verified | UNVERIFIED | Fresh login reported by operator; the first acceptance attempt failed before qualification |
+| Authentication verified | UNVERIFIED | Fresh login reported; the later MCP blocker revokes any intermediate local-account qualification |
 | Inference verified | UNVERIFIED | Requires one correlated, successfully completed model turn with the exact fixture response and validated usage |
 | Subscription usage attribution verified | UNVERIFIED | Neither auth type nor token counters prove subscription billing attribution |
 | API-key fallback excluded for live execution | UNVERIFIED | Offline exclusion checks pass; fresh file auth and runtime identity/config must pass before and after a real turn |
@@ -101,8 +104,10 @@ the next stage or production migration by itself.
 
 ### Running this gate
 
-**The reported failure supersedes the normal sequence below. Only `diagnose-auth`
-is requested now; do not submit another turn or reset/reuse an uncertain claim.**
+**The reported failure supersedes the normal sequence below. The operator commands
+are retained as future, separately authorized procedures, not instructions to run
+now. Do not access the claimed root, including through `diagnose-auth`. A fresh
+authenticated inference attempt is not yet justified. Offline tests may run.**
 
 Use Node 24+ and the existing checksum-pinned binary on a Linux host that permits
 the required namespaces. Do not update Codex, restart daemons, launch PAB, or use
@@ -132,7 +137,7 @@ browser/device interaction yourself; do not paste codes, credentials, auth files
 account details into the PR/chat. Do not fall back to copied auth caches, API keys,
 external tokens or a different provider. If device login is unavailable, stop and
 report that blocker. The wrapper does not run inference after login. Once the
-operator confirms completion, the already-authorized minimal acceptance is:
+operator confirms completion and separately authorizes a future attempt, the minimal acceptance is:
 
 ```bash
 node feasibility/local-codex/authenticated-acceptance.mjs run "$pab_auth_root"
@@ -147,7 +152,8 @@ account usage/billing evidence, if available, must be assessed separately for th
 specific attempt; general account activity or simultaneous other sessions cannot
 establish attribution. Do not publish screenshots or raw account responses.
 
-After evidence review, the operator may remove this disposable home as a unit.
+For a future home, after evidence review the operator may authorize its removal as a unit.
+This does not authorize deletion of the currently claimed root.
 No cleanup command should touch the existing Codex home. `/tmp` is not durable
 retention; preserve any required private evidence before host cleanup. On the
 validation machine Node requires its existing `libatomic.so.1` compatibility path;
@@ -201,8 +207,10 @@ The historical blocker remains unresolved; new diagnostics cannot reconstruct it
 lost event history. Errors/hooks/MCP remain unconditional failures. Post-reconciliation
 account notifications also retain `RUNTIME_UNCERTAINTY`.
 
-`notificationDiagnostics` contains at most 32 entries, each containing **only** a
-fixed recognized category and controller execution phase. Unknown method names map
+`notificationDiagnostics` contains at most 32 entries, each containing a
+fixed recognized category and controller execution phase. MCP entries now also have
+the fixed, payload-free classification described in the next correction section.
+Unknown method names map
 to `unsupported_notification`; names and payloads are never copied into diagnostics.
 No account values, IDs, tokens, event payloads, raw errors or timestamps are retained
 there. Overflow fails closed instead of discarding evidence. Additional categories
@@ -240,14 +248,15 @@ which event occurred in the failed operator attempt.
 
 #### Operator-only read-only diagnostic
 
-From this PR's updated checkout, the operator may run:
+Historical interface, **not authorized for the currently claimed root**:
 
 ```bash
 node feasibility/local-codex/authenticated-acceptance.mjs diagnose-auth "$pab_auth_root"
 ```
 
-Use the **existing** isolated root. Do not log in again, reset/delete a claim, or run
-`run` as part of this diagnosis. This mode never calls `model/list`, `thread/start`,
+The earlier request permitted inspecting the existing root; the latest request
+revokes that access. Do not run this command on it. The mode's restrictions are
+preserved, not relaxed to bypass startup failure. It never calls `model/list`, `thread/start`,
 `turn/start`, `command/exec`, login, logout, token refresh or any mutation RPC. It
 does not open the acceptance ledger or create/reset a claim, and prints only the
 sanitized report without writing a result file into the root.
@@ -281,8 +290,9 @@ syscall checks observed denied startup writes beneath `codex/tmp/arg0` and
 `codex/installation_id`. Redirecting SQLite bookkeeping removed an earlier
 read-only SQLite prerequisite but did not establish successful initialization.
 Those are synthetic startup findings, **not evidence about the operator's original
-`RUNTIME_UNCERTAINTY`**. The mode remains safely available for operator diagnosis,
-but may stop at this earlier boundary and produce no notification categories.
+`RUNTIME_UNCERTAINTY`**. The mode remains implemented, but may stop at this earlier
+boundary and produce no notification categories; it is not currently authorized
+against the claimed root.
 An empty diagnostic list means no captured notifications, not absence of a problem.
 
 Do not make the private root writable to bypass that blocker. A supported way to
@@ -311,6 +321,134 @@ a captured notification. Unknown raw exceptions are collapsed to
   inspection were performed for this correction. Only the three authorized PR
   files change. Authenticated acceptance still requires independent evidence review;
   no further sandbox stage, migration, deployment or merge is authorized.
+
+### PR #3 MCP investigation: pinned protocol, not a telemetry allowance
+
+This correction starts at `fc311b60a7a389db884fc58ddc2c3822bad05b3c` and retains
+Codex 0.157.1 and its existing executable checksum. No production configuration,
+authentication, dependencies, daemon or backend changes. Only the three authorized
+feasibility files change. The existing claimed operator root was never accessed.
+
+#### Established notification semantics
+
+The pinned runtime's generated `ServerNotification.ts` and v2 payload schemas
+contain exactly three `mcpServer/` notification methods:
+
+| Exact method | Established meaning | Zero-server policy |
+| --- | --- | --- |
+| `mcpServer/startupStatus/updated` | A named server's lifecycle: `starting`, `ready`, `failed`, `cancelled`; thread ID or null app scope; error and failure-reason fields | Reject every state. Not a global empty-startup completion, not proof of a tool invocation |
+| `mcpServer/oauthLogin/completed` | A named server's OAuth completion, scoped to an app or thread | Reject; no MCP OAuth operation was authorized |
+| `mcpServer/event/stream/notification` | Notification on a subscribed server event stream, with subscription identity and nested method/params | Reject; no stream subscription was authorized |
+
+The [app-server reference](https://learn.chatgpt.com/docs/app-server) documents these
+distinct operations. Model tool use is separately represented by `mcpToolCall`
+items and `item/mcpToolCall/progress`; those are now classified as tool activity
+and rejected too. An unknown method is not promoted to a known lifecycle event.
+No pinned v2 method establishes a benign, identity-free “zero servers started”
+notification. The legacy raw `mcp_startup_complete` event is not one of these
+methods and supplies no authorization to ignore this family.
+
+The new MCP diagnostic projection records only fixed method-category, semantics,
+schema-recognition, scope/binding, identity-presence/authorization and startup-state
+enums/booleans, plus the existing phase/category. It retains no names, URLs, IDs,
+error text, nested methods, credentials, payloads or hashes of private names.
+“Recognized” means the checked shape, **not trust or permission**. The allowed
+server/subscription/tool identity set is empty; authorization is always false.
+App-scoped, matching-thread, cross-thread and not-yet-bound events all reject.
+Duplicate/out-of-order/terminal events cannot clear the first failure. This is
+diagnostic refinement and additional checks, **not a correction that permits the
+reported event**; its precise semantics/source remain unknown.
+
+#### Effective configuration and source prevention
+
+An empty `config.toml` MCP table alone does not prove zero runtime servers. Layers,
+managed policy, plugins/apps and the live inventory must also be considered.
+Existing CLI pins, empty plugin configuration, disabled apps/remote-plugin features,
+owned-layer validation and repeated file/configuration checks remain unchanged.
+No guessed server name or unverified feature flag has been added.
+
+The pinned `mcpServerStatus/list` accepts app-wide or thread-scoped requests and
+returns server records, runtime state, tools/resources and pagination. Empty tools
+alone are insufficient: a server may be starting, disabled, failed or have discovery
+errors. Acceptance now demands exactly `{data: [], nextCursor: null}` for a full
+app inventory before creating a claim/thread, then the bound thread before and after
+inference. Any record (even disabled), malformed/missing response, further page,
+transport failure or notification blocks without retries. Diagnostic/preflight modes
+do not acquire these extra RPCs. Reports contain at most three fixed empty-inventory
+snapshots, not server records. `zeroActiveMcpServers` deliberately stays UNVERIFIED:
+these are point-in-time runtime observations, not process-tree confinement or proof
+that a server cannot start between checks. Inventory checks can detect a violation;
+they do not prevent a subprocess that already started.
+
+The [managed-configuration interface](https://learn.chatgpt.com/docs/enterprise/managed-configuration)
+documents an empty **requirements.toml** MCP allowlist as disabling all servers;
+that is different from an empty ordinary configuration table. Its documented local
+Linux location is `/etc/codex/requirements.toml`, not a dedicated `CODEX_HOME` file.
+The pinned requirements RPC schema does not expose that allowlist for this harness
+to attest. We did not alter host policy or invent a disposable requirements override.
+A supported, isolated and attestable deny-all source policy remains necessary before
+claiming universal startup prevention. Explicit `enabled=false` with a complete
+synthetic transport definition prevented that fixture from starting; it is not an
+allowance to accept unexpected configured/disabled servers in this harness.
+
+#### Reproducible offline runtime evidence
+
+The added tests create only new disposable homes, verify the executable hash,
+remove inherited environment, disable networking for the **entire app-server and
+its descendants** using an outer kernel sandbox, and allow writes only to synthetic
+state. A separate outer profile avoids conflating this experiment with the unchanged
+read-only diagnostic. The real RPC allowlist excludes `turn/start`, tool invocation,
+login, refresh, config mutation and stream/OAuth operations. `model/list` reads the
+bundled catalog; `thread/start` creates an ephemeral thread without a model turn.
+Synthetic cached auth uses deliberately non-service-valid fixture strings, never
+copied operator credentials; it proves no live authentication or entitlement.
+
+| Synthetic fixture | Effective MCP entries | Observed notifications | Process marker / inventory tools |
+| --- | --- | --- | --- |
+| Empty configuration, no auth | 0 | None | Empty app/thread inventories |
+| Empty configuration, synthetic cached ChatGPT identity | 0 | None | Empty app/thread inventories |
+| User-file server, overridden by CLI empty table | 0 | None | No fixture process marker; no server/tool entries |
+| Explicitly enabled stdio fixture | 1 | Thread-bound `starting`, then `ready`, before inference | Fixture process starts; inventory exposes one synthetic tool |
+| Same fixture explicitly disabled | 1 | None | No process marker; one disabled record, zero tools |
+
+The enabled fixture waits for both startup notifications **before** calling status
+list, demonstrating that `thread/start` itself initiates this startup. The fixture
+records process execution, implements MCP initialization/tool discovery locally,
+and never submits a model turn. This proves that pre-inference lifecycle telemetry
+can accompany real server process startup and tool exposure. It does **not** prove
+which of the three methods occurred in the operator attempt. In this pinned simple
+configuration case, CLI `{}` does clear the user-file table; we did not observe an
+unexpected merge retaining that server. Neither that result nor a short event-free
+window establishes absence of other authenticated/cloud/plugin startup sources.
+
+Reproduce all checks without authenticating:
+
+```bash
+node --test test/local-codex-feasibility.test.mjs test/local-codex-authenticated.test.mjs
+npm test
+git diff --check
+```
+
+The validation host needs the previously documented Node compatibility library and
+kernel namespace permissions. Tests do not weaken a boundary or skip on failure.
+The focused suite passed **69/69** (~19 seconds); `npm test` passed **195/195**
+(~108 seconds), both with zero failures/skips. `git diff --check` passed.
+Negative cases cover unexpected startup,
+duplicates/order, cross-thread/unbound identities, malformed payloads, OAuth/stream/
+tool activity, changed config/inventory, missing/paginated evidence and transport loss;
+existing auth, hooks/errors, uncertainty, claim and read-only tests remain in place.
+
+**Disposition:** zero configured/listed servers is demonstrated only for controlled
+synthetic snapshots, and prevention only for the known fixture sources. Zero active
+MCP servers for the operator's authenticated execution is UNVERIFIED. The conservative
+diagnostic/inventory correction preserves isolation but does not resolve the runtime
+blocker. A fresh authenticated **inference acceptance attempt is not justified yet**.
+Before separately authorizing a new disposable no-inference investigation, establish
+a supported way to identify/deny every effective server source without exposing
+private identities or relaxing app-server isolation. Never reuse the claimed root.
+Authentication, inference, subscription attribution and live API-key fallback
+exclusion remain UNVERIFIED. Independent acceptance evidence review is still required;
+the next sandbox stage and full migration remain BLOCKED.
 
 ## Scope and reproducibility
 
