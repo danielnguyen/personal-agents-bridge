@@ -47,7 +47,10 @@ the catalog default, not proof of account entitlement or successful inference.
 
 `run({prompt, allowedFiles, threadId?, signal?})` starts a thread or resumes the
 explicit ID, reapplies workspace-write/on-request/user-review policy, disables command
-networking and returns `completed`, `failed`, `interrupted` or `uncertain`. Persist
+networking and returns `completed`, `failed`, `interrupted` or `uncertain`.
+File scopes containing `TASK.md`, `.codex` or `.git` path components are rejected
+before any task RPC, along with absolute paths and traversal. This validates the
+requested scope; it does not add a model-process filesystem enforcement boundary. Persist
 the returned thread ID in the caller; a new backend instance can resume it using
 the same Codex home. One turn per instance is allowed. There is no automatic retry
 of uncertain submissions. `cancel()` requests interruption; await the `run()` result
@@ -84,24 +87,30 @@ npm test
 git diff --check
 ```
 
-Model-selection validation: **31/31 focused tests and 176/176 full offline tests passed**;
+Prototype closeout validation: **33/33 focused tests and 178/178 full offline tests passed**;
 `git diff --check` passed. Offline tests do not establish live authentication or billing.
 
 ### Operator-only fixture acceptance
 
-The operator subsequently reported successful authentication preflight and a failed
-turn with no commands because configured `gpt-6.1-sol` was unavailable; the reported
-catalog default was `gpt-6-astra`. The model-selection correction is offline-tested
-only; no additional live turn is submitted for this correction.
+The operator reports successful live fixture acceptance after the model-selection fix:
 
-The coding-agent attempt on Codex 0.157.1 stopped during initialization with
-`CODEX_DISCONNECTED`, before authentication qualification or any model turn.
-The underlying startup cause is unknown; no privileged retry or authentication
-workaround was attempted. Live start/resume, command evidence and cancellation
-remain unverified, as do live authentication and subscription usage attribution.
-To test separately in the owner's ordinary shell, from this
-checkout, the following creates a fresh disposable workspace and may consume Codex
-subscription allowance. It neither logs in nor runs PAB's paid live tests:
+- Model: `gpt-6-astra`.
+- Turn completed and terminal observed.
+- Fixture contents verified.
+- One validation command with successful execution evidence.
+- No reported failure codes.
+
+These are operator-reported results, not a new live run by the coding agent.
+**Subscription billing attribution remains independently unverified.** This single
+fixture does not verify live resume, cancellation or security equivalence with PAB.
+Earlier attempts encountered `CODEX_DISCONNECTED` in the coding-agent environment
+and an operator-reported unavailable configured model (`gpt-6.1-sol`); the subsequent
+operator acceptance above establishes success for the bounded fixture, not those
+other environments or capabilities. No additional live turn is run for this closeout.
+
+For future operator-authorized reproduction only, from this checkout in the owner's
+ordinary shell, the following creates a fresh disposable workspace and may consume
+Codex subscription allowance. It neither logs in nor runs PAB's paid live tests:
 
 ```bash
 node --input-type=module <<'JS'
@@ -127,7 +136,8 @@ JS
 ```
 
 Inspect the private command evidence as well as the fixture; do not publish raw logs
-or rerun an uncertain turn automatically. No live success is claimed by this PR.
+or rerun an uncertain turn automatically. The reported live success is limited to
+the bounded fixture acceptance above.
 The next small step is independent review, then a separate opt-in controller adapter
 that persists thread/turn IDs, bridges human approvals and maps native evidence
 without changing existing review/publication gates. No production switch is included.

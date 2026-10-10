@@ -77,6 +77,33 @@ test('explicit environment excludes API keys, tokens, provider/proxy overrides a
   assert.equal(env.CODEX_HOME, '/tmp/home/.codex');
 });
 
+test('protected paths and traversal are rejected before any task RPC, including when already connected', async context => {
+  const paths = ['TASK.md', 'nested/TASK.md', '.codex', '.codex/config.toml', '.codex/nested/policy',
+    'nested/.codex/config.toml', '.git', '.git/config', 'nested/.git/config', '../fixture.py',
+    'src/../TASK.md', './fixture.py', '/tmp/fixture.py', 'src//fixture.py', 'src\\fixture.py'];
+  for (const connected of [false, true]) {
+    const value = await fixture(context);
+    if (connected) await value.backend.connect();
+    const initialRequests = value.requests.slice();
+    for (const file of paths) {
+      for (const threadId of [undefined, 'thread-fixture']) {
+        await assert.rejects(value.run({ allowedFiles: ['fixture.py', file], threadId }), { code: 'INVALID_TASK_SCOPE' });
+      }
+    }
+    assert.deepEqual(value.requests, initialRequests);
+    assert.equal(value.launches.length, connected ? 1 : 0);
+    assert(!value.requests.some(request => request.method.startsWith('thread/') || request.method.startsWith('turn/')));
+  }
+});
+
+test('ordinary file scopes and non-protected lookalike names remain accepted', async context => {
+  const value = await fixture(context);
+  const result = await value.run({ allowedFiles: ['fixture.py', 'src/file.mjs', 'TASK.md.example', '.codex-example/config.toml', '.gitignore'] });
+  assert.equal(result.status, 'completed');
+  assert.equal(value.requests.filter(request => request.method === 'thread/start').length, 1);
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+});
+
 test('start and resume use the same thread, ordinary sandbox and structured command provenance', async context => {
   const progress = [];
   const value = await fixture(context, {}, { onProgress: message => progress.push(message.method) });

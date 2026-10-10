@@ -161,7 +161,7 @@ export class LocalCodexBackend {
   async run({ prompt, allowedFiles, threadId, signal } = {}) {
     if (this.busy) throw error('EXECUTION_ALREADY_ACTIVE');
     if (!text(prompt) || !Array.isArray(allowedFiles) || !allowedFiles.length || allowedFiles.some(file =>
-      !text(file) || path.isAbsolute(file) || file.includes('\\') || file.split('/').some(part => !part || ['..', '.', '.git'].includes(part)))) throw error('INVALID_TASK_SCOPE');
+      !text(file) || path.isAbsolute(file) || file.includes('\\') || file.split('/').some(part => !part || ['..', '.', '.git', '.codex', 'TASK.md'].includes(part)))) throw error('INVALID_TASK_SCOPE');
     if (threadId !== undefined && !text(threadId)) throw error('INVALID_THREAD_ID');
     this.busy = true;
     let timer, abort;
