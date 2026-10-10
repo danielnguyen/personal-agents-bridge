@@ -37,6 +37,14 @@ an explicit environment allowlist, not API keys/tokens/proxy overrides. Apps, pl
 hooks, web search and subagents are disabled. Existing authentication/config files
 are not edited by this module; Codex itself manages its ordinary state/token refresh.
 
+Before each execution, `model/list` must return exactly one visible default across
+all pages. That model is recorded in `result.model` and explicitly sent to thread
+creation/resume and turn execution; the configured model is not a fallback.
+Resume first checks the stored thread model matches the selected default, and the
+thread response must confirm the same model. Missing/ambiguous catalogs, model
+mismatches and unavailable models fail without trying another model. This selects
+the catalog default, not proof of account entitlement or successful inference.
+
 `run({prompt, allowedFiles, threadId?, signal?})` starts a thread or resumes the
 explicit ID, reapplies workspace-write/on-request/user-review policy, disables command
 networking and returns `completed`, `failed`, `interrupted` or `uncertain`. Persist
@@ -76,10 +84,15 @@ npm test
 git diff --check
 ```
 
-Prototype validation: **24/24 focused tests and 169/169 full offline tests passed**;
+Model-selection validation: **31/31 focused tests and 176/176 full offline tests passed**;
 `git diff --check` passed. Offline tests do not establish live authentication or billing.
 
 ### Operator-only fixture acceptance
+
+The operator subsequently reported successful authentication preflight and a failed
+turn with no commands because configured `gpt-6.1-sol` was unavailable; the reported
+catalog default was `gpt-6-astra`. The model-selection correction is offline-tested
+only; no additional live turn is submitted for this correction.
 
 The coding-agent attempt on Codex 0.157.1 stopped during initialization with
 `CODEX_DISCONNECTED`, before authentication qualification or any model turn.

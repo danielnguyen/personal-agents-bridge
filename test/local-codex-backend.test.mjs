@@ -6,10 +6,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { LocalCodexBackend, childEnvironment, APPROVAL_LIMITATION } from '../local-codex-backend.mjs';
 
 const account = () => ({ account: { type: 'chatgpt', email: 'fixture@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true });
-const configuration = () => ({ model_provider: 'openai', model_providers: {}, chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+const configuration = () => ({ model: 'gpt-6.1-sol', model_provider: 'openai', model_providers: {}, chatgpt_base_url: 'https://chatgpt.com/backend-api/',
   sandbox_mode: 'workspace-write', sandbox_workspace_write: { network_access: false }, approval_policy: 'on-request', approvals_reviewer: 'user',
   shell_environment_policy: { inherit: 'none', set: { PATH: '/usr/local/bin:/usr/bin:/bin' } },
   web_search: 'disabled', features: { apps: false, plugins: false, hooks: false, multi_agent: false, remote_control: false, api_key_model_discovery: false } });
+const model = (name = 'gpt-6-astra', isDefault = true) => ({ id: name, model: name, hidden: false, isDefault });
 
 async function fixture(context, overrides = {}, options = {}) {
   const cwd = await mkdtemp('/tmp/pab-local-backend-test-');
@@ -40,7 +41,9 @@ async function fixture(context, overrides = {}, options = {}) {
           initialize: () => ({ codexHome: config.env.CODEX_HOME }),
           'config/read': () => ({ config: configuration() }),
           'account/read': account,
-          'thread/start': () => ({ thread: { id: 'thread-fixture', turns: [] }, cwd, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', networkAccess: false } }),
+          'model/list': () => ({ data: [model(), model('gpt-6-sol', false)], nextCursor: null }),
+          'thread/read': () => ({ thread: { id: 'thread-fixture', model: 'gpt-6-astra' } }),
+          'thread/start': () => ({ thread: { id: 'thread-fixture', turns: [] }, model: 'gpt-6-astra', cwd, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', networkAccess: false } }),
           'thread/resume': () => handlers['thread/start'](),
           'turn/start': () => {
             turnCount++;
@@ -328,5 +331,95 @@ test('unbound item and terminal notifications cannot qualify execution evidence'
     const result = await value.run();
     assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
     assert.equal(result.commands.length, 0);
+  }
+});
+
+test('unavailable configured model is replaced explicitly by the catalog default for start, resume and turns', async context => {
+  const value = await fixture(context);
+  assert.equal(configuration().model, 'gpt-6.1-sol');
+  const first = await value.run(), resumed = await value.run({ threadId: first.threadId });
+  for (const result of [first, resumed]) {
+    assert.equal(result.status, 'completed'); assert.equal(result.model, 'gpt-6-astra');
+  }
+  for (const request of value.requests.filter(request => ['thread/start', 'thread/resume', 'turn/start'].includes(request.method))) {
+    assert.equal(request.params.model, 'gpt-6-astra');
+  }
+  assert.equal(value.requests.filter(request => request.method === 'model/list').length, 2);
+  assert(value.requests.findIndex(request => request.method === 'thread/read') < value.requests.findIndex(request => request.method === 'thread/resume'));
+  assert(!value.requests.some(request => ['config/value/write', 'config/batchWrite', 'account/login/start'].includes(request.method)));
+});
+
+test('model selection traverses the complete catalog and uses the model slug rather than picker id', async context => {
+  const value = await fixture(context, { 'model/list': ({ params }) => params.cursor === null
+    ? { data: [model('gpt-6-sol', false)], nextCursor: 'next' }
+    : { data: [{ ...model(), id: 'picker-entry' }], nextCursor: null } });
+  assert.equal((await value.run()).model, 'gpt-6-astra');
+  assert.deepEqual(value.requests.filter(request => request.method === 'model/list').map(request => request.params), [
+    { cursor: null, limit: 100, includeHidden: false }, { cursor: 'next', limit: 100, includeHidden: false },
+  ]);
+});
+
+test('missing, ambiguous, hidden, malformed and incomplete model catalogs fail before thread creation', async context => {
+  const invalid = [
+    { data: [], nextCursor: null },
+    { data: [model('gpt-6-sol', false)], nextCursor: null },
+    { data: [model(), model('gpt-6-sol')], nextCursor: null },
+    { data: [{ ...model(), hidden: true }], nextCursor: null },
+    { data: [{ ...model(), model: '' }], nextCursor: null },
+    { data: [{ ...model(), isDefault: 'true' }], nextCursor: null },
+    { data: [model(), model()], nextCursor: null },
+    { data: [model()] }, { data: null, nextCursor: null },
+  ];
+  for (const response of invalid) {
+    const value = await fixture(context, { 'model/list': () => response });
+    const result = await value.run();
+    assert.equal(result.status, 'failed'); assert.equal(result.turnSubmissionAttempted, false);
+    assert(!value.requests.some(request => request.method.startsWith('thread/') || request.method === 'turn/start'));
+  }
+  for (const cyclic of [false, true]) {
+    let pages = 0;
+    const value = await fixture(context, { 'model/list': () => ({ data: [model(`model-${++pages}`, pages === 1)], nextCursor: cyclic ? 'cycle' : `cursor-${pages}` }) });
+    const result = await value.run();
+    assert.equal(result.status, 'failed'); assert.equal(pages, cyclic ? 2 : 10);
+    assert(!value.requests.some(request => request.method === 'thread/start'));
+  }
+});
+
+test('a second default on a later page is rejected rather than selecting the first', async context => {
+  const value = await fixture(context, { 'model/list': ({ params }) => params.cursor === null
+    ? { data: [model()], nextCursor: 'next' }
+    : { data: [model('gpt-6-sol')], nextCursor: null } });
+  assert.equal((await value.run()).status, 'failed');
+  assert(!value.requests.some(request => request.method === 'thread/start'));
+});
+
+test('resume rejects missing or different persisted models instead of silently changing them', async context => {
+  for (const previousModel of [null, undefined, 'gpt-6.1-sol', 'gpt-6-sol']) {
+    const value = await fixture(context, { 'thread/read': () => ({ thread: { id: 'thread-fixture', model: previousModel } }) });
+    const result = await value.run({ threadId: 'thread-fixture' });
+    assert.equal(result.status, 'failed'); assert(result.uncertainties.includes('RESUME_MODEL_MISMATCH'));
+    assert(!value.requests.some(request => ['thread/resume', 'turn/start'].includes(request.method)));
+  }
+});
+
+test('thread start and resume model substitutions are rejected before a turn', async context => {
+  for (const method of ['thread/start', 'thread/resume']) {
+    for (const selected of [undefined, 'gpt-6-sol']) {
+      const value = await fixture(context, { [method]: ({ defaults }) => ({ ...defaults['thread/start'](), model: selected }) });
+      const result = await value.run(method === 'thread/resume' ? { threadId: 'thread-fixture' } : {});
+      assert.equal(result.status, 'failed'); assert(result.uncertainties.includes('THREAD_MODEL_MISMATCH'));
+      assert(!value.requests.some(request => request.method === 'turn/start'));
+    }
+  }
+});
+
+test('model catalog errors and rejected inference never trigger a model fallback or retry', async context => {
+  for (const method of ['model/list', 'turn/start']) {
+    const value = await fixture(context, { [method]: () => { throw Error('synthetic unavailable model'); } });
+    const result = await value.run();
+    assert.equal(result.status, method === 'model/list' ? 'failed' : 'uncertain');
+    assert.equal(value.requests.filter(request => request.method === method).length, 1);
+    if (method === 'model/list') assert(!value.requests.some(request => request.method === 'thread/start'));
+    else assert.equal(value.requests.find(request => request.method === method).params.model, 'gpt-6-astra');
   }
 });

@@ -137,6 +137,27 @@ export class LocalCodexBackend {
     if (this.identity && identity !== this.identity) throw error('CHATGPT_ACCOUNT_CHANGED');
     this.identity = identity;
   }
+  async defaultModel() {
+    const models = new Set(), cursors = new Set(), defaults = [];
+    let cursor = null;
+    for (let page = 0; page < 10; page++) {
+      const response = await this.rpc.request('model/list', { cursor, limit: 100, includeHidden: false });
+      if (!Array.isArray(response?.data) || response.data.length > 100 ||
+          (response.nextCursor !== null && !text(response.nextCursor))) throw error('MODEL_CATALOG_INVALID');
+      for (const entry of response.data) {
+        if (!text(entry?.model) || entry.hidden !== false || typeof entry.isDefault !== 'boolean' || models.has(entry.model)) throw error('MODEL_CATALOG_INVALID');
+        models.add(entry.model);
+        if (entry.isDefault) defaults.push(entry.model);
+      }
+      if (response.nextCursor === null) {
+        if (defaults.length !== 1) throw error('UNIQUE_DEFAULT_MODEL_REQUIRED');
+        return defaults[0];
+      }
+      if (!response.data.length || cursors.has(response.nextCursor)) throw error('MODEL_CATALOG_INVALID');
+      cursor = response.nextCursor; cursors.add(cursor);
+    }
+    throw error('MODEL_CATALOG_INCOMPLETE');
+  }
   async run({ prompt, allowedFiles, threadId, signal } = {}) {
     if (this.busy) throw error('EXECUTION_ALREADY_ACTIVE');
     if (!text(prompt) || !Array.isArray(allowedFiles) || !allowedFiles.length || allowedFiles.some(file =>
@@ -150,9 +171,15 @@ export class LocalCodexBackend {
     try {
       await this.connect(); await this.checkRoute(); result.authentication = 'chatgpt';
       if (signal?.aborted) { result.status = 'interrupted'; return result; }
-      const options = { cwd: this.cwd, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: 'workspace-write',
+      result.model = await this.defaultModel();
+      if (threadId) {
+        const previous = await this.rpc.request('thread/read', { threadId, includeTurns: false });
+        if (previous?.thread?.id !== threadId || previous.thread.model !== result.model) throw error('RESUME_MODEL_MISMATCH');
+      }
+      const options = { cwd: this.cwd, model: result.model, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: 'workspace-write',
         developerInstructions: `${INSTRUCTIONS}\nApproved files: ${JSON.stringify(allowedFiles)}` };
       const started = await this.rpc.request(threadId ? 'thread/resume' : 'thread/start', { ...options, ...(threadId ? { threadId } : {}) });
+      if (started?.model !== result.model) throw error('THREAD_MODEL_MISMATCH');
       if (!text(started?.thread?.id) || (threadId && started.thread.id !== threadId) || started.modelProvider !== 'openai' ||
           started.cwd !== this.cwd || started.approvalPolicy !== 'on-request' || started.approvalsReviewer !== 'user' ||
           started.sandbox?.type !== 'workspaceWrite' || started.sandbox.networkAccess !== false) throw error('THREAD_POLICY_MISMATCH');
@@ -167,7 +194,7 @@ export class LocalCodexBackend {
       timer = setTimeout(abort, this.timeoutMs);
       if (signal?.aborted) { this.finish('interrupted', 'CANCELLED_BEFORE_TURN'); return await done; }
       result.turnSubmissionAttempted = true;
-      const turn = await this.rpc.request('turn/start', { threadId: result.threadId, input: [{ type: 'text', text: prompt, text_elements: [] }],
+      const turn = await this.rpc.request('turn/start', { threadId: result.threadId, model: result.model, input: [{ type: 'text', text: prompt, text_elements: [] }],
         approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: { type: 'workspaceWrite', writableRoots: [this.cwd], networkAccess: false,
           excludeTmpdirEnvVar: true, excludeSlashTmp: true } });
       if (!text(turn?.turn?.id)) throw error('TURN_START_UNCERTAIN');
@@ -182,6 +209,7 @@ export class LocalCodexBackend {
       return result;
     } catch (failure) {
       result.status = result.turnSubmissionAttempted ? 'uncertain' : 'failed'; result.uncertainties.push(failure.code || 'EXECUTION_UNCERTAIN');
+      this.finish(result.status);
       await this.close(); return result;
     } finally {
       clearTimeout(timer); signal?.removeEventListener('abort', abort); this.active = null; this.busy = false;
