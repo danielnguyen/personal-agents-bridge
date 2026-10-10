@@ -6,6 +6,171 @@ turns, paid Agents API sessions, or PAB live tests were invoked. Production
 credentials/configuration were neither read by the probes nor changed. No
 production controller, MCP schema, sandbox, review gate, or publisher is replaced.
 
+## Follow-up gate: authenticated acceptance harness
+
+This follow-up starts from public main
+`7bc0e6fefdbd36e935e866d71db50f0a0239a233` (merged PR #2). It adds only
+`feasibility/local-codex/authenticated-acceptance.mjs`, its offline tests, and this
+section. The previous unauthenticated probe remains unchanged. The original normal
+checkout, dirty files, private predecessor history, production login and backend
+are untouched.
+
+**Current disposition: blocked on fresh operator authentication.** The new real
+unauthenticated preflight passed with the pinned 0.157.1 runtime. No authenticated
+model turn has been submitted for this gate. The following are actual acceptance
+statuses, not predictions based on synthetic tests:
+
+| Criterion | Status | Evidence / outstanding work |
+| --- | --- | --- |
+| Disposable configuration verified | VERIFIED | New private Codex home; effective config/layers/requirements checked against controller pins; no inherited nonempty layer accepted |
+| Narrow standalone boundary verified | VERIFIED | Actual `command/exec`: fixture readable, worktree creation denied, private Codex-home sentinel read denied, loopback connection denied |
+| Authentication verified | UNVERIFIED | Requires fresh operator device login and unambiguous `account/read` |
+| Inference verified | UNVERIFIED | Requires one correlated, successfully completed model turn with the exact fixture response and validated usage |
+| Subscription usage attribution verified | UNVERIFIED | Neither auth type nor token counters prove subscription billing attribution |
+| API-key fallback excluded for live execution | UNVERIFIED | Offline exclusion checks pass; fresh file auth and runtime identity/config must pass before and after a real turn |
+| Narrow model-issued command verified | UNVERIFIED | Requires paired runtime command items for the fixed `cat fixture.txt` command, expected cwd/output and exit zero |
+| Subscription authentication qualified / next model-tool stage | UNVERIFIED / BLOCKED | Do not advance on synthetic success or account-read alone |
+
+The harness uses the existing `AppServerRpc`, `SessionLedger`, environment builder
+and command observation mechanism. It connects to a new stdio app-server process,
+not a shared daemon. Its default launcher inherits no environment variables:
+`HOME`, `CODEX_HOME`, scratch, PATH, locale and Git settings are explicitly generated.
+API keys, access tokens, proxy/CA overrides and unrelated configuration are never
+forwarded. Authentication files are never copied. `login` refuses an existing
+auth file, uses only fresh ChatGPT device login with the file credential store,
+and records a private token-free identity binding after successful login. It never
+submits a turn. A login for an unsupported/unknown/free or explicitly usage-based
+plan is not enough for this subscription gate; plan naming alone also cannot prove
+usage attribution.
+
+The entire permission/configuration table is supplied at CLI precedence and checked
+through `config/read` and `configRequirements/read`. Only the known null defaults
+and the forced-ChatGPT login requirement are normalized. Nonempty system, project,
+managed or other user layers, custom providers, alternate base URLs, MCP/plugin
+configuration, unexpected requirements, or differing permissions block inference.
+The model is selected once from the single visible default returned by `model/list`
+with complete pagination, then pinned and checked in `thread/start`; the catalog is
+not treated as an entitlement check. Failure does not select another model/provider.
+
+The disposable role grants read access to the runtime's `:minimal` paths, the exact
+checksum-pinned Codex executable, and the fixture workspace, plus scratch writes.
+Both private home directories are denied to commands; network is disabled. An
+initial boundary trial failed because `:minimal` did not expose the Codex executable
+installed outside system directories. The exact executable read grant fixed that
+prerequisite; no broad host read/write grant was added. The one known warning about
+using bundled bubblewrap is accepted only verbatim and remains subject to the real
+boundary test; all other configuration warnings fail closed. Disabled remote-control
+status is checked without retaining host/account identifiers.
+
+`run` requires the wrapper's fresh-login marker, validates file ownership/modes,
+canonical directories, runtime digest, exact config and fixture bytes, and parses
+only the new home's auth file in memory. It rejects any stored API key or alternate
+authentication mode. No token or account value is printed. Before the first thread
+creation it exclusively creates and syncs `inference.claim`. SQLite persists
+operation intent before sending requests. Each root permits at most one submission;
+an error, timeout, restart or lost acknowledgement cannot replay it. A claimed root
+is never automatically reset. Codex's own internal transport retries are outside
+this harness's visibility; this does not claim exactly-once upstream inference.
+
+The single model turn asks only for `cat fixture.txt` and the fixed final marker.
+The fixture and prompt have no user-supplied content. The collector checks fresh
+thread/session identity, empty inherited instructions, the active role profile,
+turn IDs, start/completion ordering, one paired command, exact safe command/cwd,
+exit/output, exact final response, and numeric usage. It rejects other model tools,
+unexpected notifications, auth changes, incomplete/duplicate records and transport
+uncertainty. Configuration, file auth and account identity are checked again before
+reporting live API-key fallback exclusion or inference success. Runtime events are
+observations; notification validation is not a pre-execution tool enforcement hook.
+The full native-tool sandbox and process-descendant guarantees remain separate gates.
+
+The sanitized report separates all four requested auth/inference/usage/fallback
+criteria. Command evidence keeps `codex_app_server_item` provenance and substitutes
+`<disposable-workspace>` for cwd. It exposes only the fixed allowlisted command and
+fixture output, numeric usage and boolean identity binding, never account/email,
+tokens, thread/session IDs, runtime paths or raw errors. IDs and attempt state stay
+in private SQLite under the disposable root. `authentication=VERIFIED` refers to
+the preflight account snapshot; a later uncertain turn does not become verified
+inference. Upstream command completeness remains unknown. Usage counters cannot
+upgrade `subscriptionUsageAttribution`; that field deliberately remains UNVERIFIED
+until separate operator/service evidence is reviewed. The harness never authorizes
+the next stage or production migration by itself.
+
+### Running this gate
+
+Use Node 24+ and the existing checksum-pinned binary on a Linux host that permits
+the required namespaces. Do not update Codex, restart daemons, launch PAB, or use
+its paid live tests. These commands concern only the disposable acceptance home:
+
+```bash
+node --test test/local-codex-feasibility.test.mjs test/local-codex-authenticated.test.mjs
+npm test
+git diff --check
+
+pab_auth_root=$(node feasibility/local-codex/authenticated-acceptance.mjs prepare "$(command -v codex)")
+node feasibility/local-codex/authenticated-acceptance.mjs preflight "$pab_auth_root"
+```
+
+`prepare` prints an absolute `/tmp/pab-auth-acceptance-*` directory. Preserve that
+path privately. `preflight` runs no authentication flow or inference, and must show
+configuration and standalone boundary VERIFIED, with no blocker. Exit zero here
+does **not** mean the authentication gate passed. Stop for the operator to execute:
+
+```bash
+node feasibility/local-codex/authenticated-acceptance.mjs login "$pab_auth_root"
+```
+
+The wrapper rechecks preflight and launches the pinned CLI's `login --device-auth`
+with the explicit disposable environment and file credential store. Complete the
+browser/device interaction yourself; do not paste codes, credentials, auth files or
+account details into the PR/chat. Do not fall back to copied auth caches, API keys,
+external tokens or a different provider. If device login is unavailable, stop and
+report that blocker. The wrapper does not run inference after login. Once the
+operator confirms completion, the already-authorized minimal acceptance is:
+
+```bash
+node feasibility/local-codex/authenticated-acceptance.mjs run "$pab_auth_root"
+```
+
+This can consume the selected ChatGPT plan's Codex allowance. Inspect the sanitized
+report and retain private state outside Git. An uncertain outcome or unexpected
+command/response must not be retried in that root. Do not delete the claim or reuse
+the persisted session to work around a failed check. Investigate first; any newly
+authorized attempt needs another freshly prepared/login-approved home. Operator
+account usage/billing evidence, if available, must be assessed separately for this
+specific attempt; general account activity or simultaneous other sessions cannot
+establish attribution. Do not publish screenshots or raw account responses.
+
+After evidence review, the operator may remove this disposable home as a unit.
+No cleanup command should touch the existing Codex home. `/tmp` is not durable
+retention; preserve any required private evidence before host cleanup. On the
+validation machine Node requires its existing `libatomic.so.1` compatibility path;
+that library is needed by Node only and is not inherited by the Codex child.
+
+### Follow-up validation record
+
+The 23 new deterministic offline tests cover authentication/configuration rejection,
+explicit environment exclusion, fresh-login gating, session/policy validation,
+uncertain submission persistence and duplicate prevention, transport loss, timeout,
+account changes, command/response/usage validation, sanitized output, and a
+zero-inference preflight. They invoke a fake RPC transport, not Codex inference.
+The existing transport tests still exercise real synthetic subprocesses. Successful
+mock authentication or mock usage is never published as live acceptance evidence.
+
+Offline validation on 2026-10-10: the requested focused command passed **42/42**
+tests, and `npm test` passed **168/168**, with zero failures or skips. The full
+suite took approximately 91 seconds. `git diff --check` passed. These results
+include existing real kernel/subprocess checks, not any paid live tests or model
+turns. The final conservative plan-type rejection assertions were also included
+in a subsequent focused rerun.
+
+The real unauthenticated preflight passed on the pinned runtime. The surrounding
+CLI sandbox initially blocked namespace/subprocess checks; the host-permission
+run passed without disabling enforcement. A full filesystem was resolved by
+removing only the dependency copy and npm cache created for the preceding
+feasibility task, preserving source/history/evidence. No production authentication
+was inspected or changed. Live authentication and all model observations remain
+pending operator interaction.
+
 ## Scope and reproducibility
 
 Inspected on 2026-10-10:
