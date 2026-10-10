@@ -55,6 +55,7 @@ async function setup(context, mode = {}, options = {}) {
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'uncommitted owner work\n');
   const api = new FakeAPI(), executor = new FakeExecutor(), instances = [];
   const config = { stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'), executor, secrets: ['test-sensitive-value'],
+    ...(options.localValidationFactory ? { localValidationFactory: options.localValidationFactory } : {}),
     ...(options.noApi ? {} : { api }), localBackendFactory: options.localBackendFactory || (backendOptions => { const instance = new FakeLocal(backendOptions, mode); instances.push(instance); return instance; }) };
   const controller = await new Controller(config).init();
   await fs.writeFile(path.join(controller.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
@@ -62,7 +63,7 @@ async function setup(context, mode = {}, options = {}) {
   const input = { contract: contract(), request_id: 'local_start_request', repository_id: 'fixture', execution_backend: 'local_codex' };
   const start = () => controller.start(input);
   const running = async (index = 0) => {
-    for (let attempt = 0; attempt < 300; attempt++) {
+    for (let attempt = 0; attempt < 1000; attempt++) {
       if (instances[index]?.resolve) return instances[index];
       await new Promise(resolve => setTimeout(resolve, 10));
     }
@@ -144,6 +145,131 @@ test('independent local reviewer binds durable distinct identity, read-only work
   await assert.rejects(controller.continue({ task_id: task.id, request_id: 'new_turn', instruction: 'try again' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
   await assert.rejects(controller.publish({ task_id: task.id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
   assert.equal(controller._api, undefined);
+});
+
+test('controller persists independent validation before packet creation, binds the exact tree and deduplicates review', async context => {
+  const value = await setup(context, {}, { noApi: true });
+  value.input.contract.test_commands = ['test "$(cat greeting.txt)" = baseline; printf validated; printf artifact > greeting.txt'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  const { controller } = value, original = controller.packet.bind(controller);
+  let captures = 0;
+  controller.packet = async task => {
+    const durable = JSON.parse(controller.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value);
+    assert.equal(durable.local_validation.status, 'completed');
+    assert.equal(durable.local_validation.original_unchanged, true);
+    assert.equal(durable.local_validation.results[0].status, 'passed');
+    captures++; return original(task);
+  };
+  await controller.review({ task_id: started.task_id, request_id: 'independent_review' });
+  const reviewer = await value.running(1), task = controller.task(started.task_id);
+  const record = task.local_validation.results[0];
+  assert.equal(record.command, value.input.contract.test_commands[0]); assert.equal(record.exit_code, 0);
+  assert.equal(record.candidate_tree, task.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(record.stdout.text, 'validated'); assert.equal(record.independently_observed, true);
+  assert.notEqual(record.cwd, implementer.options.cwd);
+  assert.equal(await fs.readFile(path.join(implementer.options.cwd, 'greeting.txt'), 'utf8'), 'baseline\n');
+  assert.equal(await fs.readFile(path.join(value.normal, 'greeting.txt'), 'utf8'), 'uncommitted owner work\n');
+  const packet = JSON.parse(await fs.readFile(path.join(reviewer.options.cwd, 'evidence.json'), 'utf8'));
+  assert.deepEqual(packet.independent_validation, task.local_validation);
+  assert.deepEqual(packet.independent_validation.reviewed_git_state, packet.reviewed_git_state);
+  await controller.review({ task_id: started.task_id, request_id: 'independent_review' });
+  await controller.review({ task_id: started.task_id, request_id: 'different_review_request' });
+  assert.equal(captures, 1); assert.equal(value.instances.length, 2);
+  reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const result = controller.task(started.task_id).reviewer.review_result;
+  assert.deepEqual(result.controller_overrides, ['SCOPE']); assert.equal(result.overall, 'FAIL');
+  assert.equal(controller._api, undefined);
+  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+});
+
+function heldValidation() {
+  let entered, release;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const runner = { terminationConfirmed: false, calls: 0, cancelled: false,
+    async run() { this.calls++; entered(); await new Promise(resolve => { release = resolve; }); },
+    cancel() { this.cancelled = true; this.terminationConfirmed = true; release?.(); } };
+  return { runner, waiting };
+}
+
+for (const action of ['cleanup', 'shutdown']) test(`${action} stops validation before waiting and never starts a reviewer`, async context => {
+  const held = heldValidation(), value = await setup(context, {}, { localValidationFactory: () => held.runner });
+  value.input.contract.test_commands = ['sleep 60'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'held_review' }); await held.waiting;
+  assert.equal(value.controller.task(started.task_id).reviewer.local.thread_id, null);
+  if (action === 'cleanup') await value.controller.cleanup({ task_id: started.task_id }); else await value.controller.close();
+  assert.equal(held.runner.cancelled, true); assert.equal(value.instances.length, 1);
+  if (action === 'cleanup') {
+    assert.equal(value.controller.task(started.task_id).local_validation.status, 'interrupted');
+    assert.equal(value.controller.task(started.task_id).cleanup.executor_stopped, true);
+  }
+});
+
+test('restart preserves uncertain validation identity, blocks deletion, and never replays tests', async context => {
+  const held = heldValidation(), value = await setup(context, {}, { localValidationFactory: () => held.runner });
+  value.input.contract.test_commands = ['sleep 60'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'held_review' }); await held.waiting;
+  const pending = value.controller.task(started.task_id); await value.controller.close();
+  const seed = await new Controller(value.config).init(); seed.save(pending); clearInterval(seed.sweeper); seed.dbClosed = true; seed.db.close();
+  const recovered = await new Controller(value.config).init();
+  try {
+    const task = recovered.task(started.task_id);
+    assert.equal(task.local_validation.status, 'uncertain'); assert.equal(task.local_validation.termination_confirmed, false);
+    assert.equal(task.local_validation.attempt_id, pending.local_validation.attempt_id);
+    assert.equal(task.local_validation.diagnostic, 'VALIDATION_RESTART_NO_REPLAY');
+    await recovered.review({ task_id: task.id, request_id: 'held_review' });
+    await recovered.review({ task_id: task.id, request_id: 'no_replay' });
+    assert.equal(held.runner.calls, 1); assert.equal(value.instances.length, 1);
+    const cleanup = await recovered.cleanup({ task_id: task.id, delete_workspace: true });
+    assert.equal(cleanup.cleanup.workspace_deleted, false);
+    assert.match(cleanup.cleanup.cleanup_diagnostic, /VALIDATION_TERMINATION_UNCONFIRMED/);
+  } finally { await recovered.close(); }
+});
+
+test('unconfirmed validation termination prevents reviewer startup and unsafe workspace deletion', async context => {
+  const runner = { terminationConfirmed: false, run: async () => {}, cancel() {} };
+  const value = await setup(context, {}, { localValidationFactory: () => runner });
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'uncertain_validation' }); await value.drain();
+  assert.equal(value.controller.task(started.task_id).local_validation.status, 'uncertain');
+  assert.equal(value.instances.length, 1); assert.equal(value.controller.task(started.task_id).reviewer.review_result, null);
+  const result = await value.controller.cleanup({ task_id: started.task_id, delete_workspace: true });
+  assert.equal(result.cleanup.workspace_deleted, false); assert.equal(result.cleanup.executor_stopped, false);
+  assert.equal(result.cleanup.validation_termination_confirmed, false); assert.match(result.cleanup.cleanup_diagnostic, /VALIDATION_TERMINATION_UNCONFIRMED/);
+});
+
+test('candidate mutation during independent validation prevents reviewer analysis and stale packet qualification', async context => {
+  let repo;
+  const runner = { terminationConfirmed: true, async run() { await fs.writeFile(path.join(repo, 'greeting.txt'), 'changed during validation'); }, cancel() {} };
+  const value = await setup(context, {}, { localValidationFactory: () => runner });
+  const started = await value.start(), implementer = await value.running(); repo = implementer.options.cwd;
+  implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'changed_validation' }); await value.drain();
+  const task = value.controller.task(started.task_id);
+  assert.equal(task.local_validation.original_unchanged, false); assert.equal(value.instances.length, 1);
+  assert.equal(task.reviewer.review_result, null);
+  const packet = JSON.parse((await value.controller.buildPacket(task)).text);
+  assert.equal(packet.independent_validation.status, 'unavailable');
+  assert.match(packet.independent_validation.reason, /does not match/);
+});
+
+test('controller persistence failure at command start prevents independent execution and reviewer PASS', async context => {
+  const value = await setup(context);
+  value.input.contract.test_commands = ['printf must-not-run'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  const save = value.controller.save.bind(value.controller);
+  let rejected = false;
+  value.controller.save = task => {
+    if (!rejected && task.local_validation?.results.some(record => record.status === 'running')) { rejected = true; throw Error('synthetic disk failure'); }
+    return save(task);
+  };
+  await value.controller.review({ task_id: started.task_id, request_id: 'persistence_validation' });
+  const reviewer = await value.running(1), task = value.controller.task(started.task_id);
+  assert.equal(rejected, true); assert.equal(task.local_validation.status, 'unavailable');
+  assert.equal(task.local_validation.results[0].start_attempted, false);
+  reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  assert(value.controller.task(started.task_id).reviewer.review_result.controller_overrides.includes('TEST_EVIDENCE'));
 });
 
 for (const mutation of ['packet', 'worktree', 'normal_checkout', 'packet_link']) test(`local review rejects ${mutation} mutation during analysis`, async context => {
