@@ -102,6 +102,10 @@ sessions and must not run alongside the production controller. It is not part of
 
 ## Status and license
 
+The [local Codex feasibility assessment](docs/LOCAL_CODEX_FEASIBILITY.md) records
+isolated offline experiments, migration blockers, and operator validation steps.
+It does not change the production execution backend or authorize migration.
+
 See [VERIFICATION.md](VERIFICATION.md) for local coverage and limitations. Live
 GitHub publication requires a separate, explicitly authorized acceptance test.
 Licensed under the [Apache License 2.0](LICENSE). Third-party dependencies retain
