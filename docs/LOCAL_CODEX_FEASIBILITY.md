@@ -27,6 +27,13 @@ delete, reuse or attempt inference in it. The coding agent has not inspected the
 operator's private authentication state or rerun that attempt. The following are actual acceptance
 statuses, not predictions based on synthetic tests:
 
+**Managed-policy follow-up:** private Linux mount namespaces now demonstrate
+source-level prevention for the configured stdio fixture, including user, trusted
+project and CLI override attempts. This does not qualify all plugin/authenticated
+sources or authorize acceptance. The earlier CLI-empty-table clearing conclusion
+is withdrawn: corrected environment-bound tests show that it retains a user server.
+See the managed-requirements experiment below; the acceptance harness is unchanged.
+
 | Criterion | Status | Evidence / outstanding work |
 | --- | --- | --- |
 | Disposable configuration verified | VERIFIED | New private Codex home; effective config/layers/requirements checked against controller pins; no inherited nonempty layer accepted |
@@ -386,8 +393,9 @@ that is different from an empty ordinary configuration table. Its documented loc
 Linux location is `/etc/codex/requirements.toml`, not a dedicated `CODEX_HOME` file.
 The pinned requirements RPC schema does not expose that allowlist for this harness
 to attest. We did not alter host policy or invent a disposable requirements override.
-A supported, isolated and attestable deny-all source policy remains necessary before
-claiming universal startup prevention. Explicit `enabled=false` with a complete
+A supported, isolated and attestable deny-all source policy remained unestablished
+at that revision; the follow-up below establishes it for configured stdio sources,
+not universal startup prevention. Explicit `enabled=false` with a complete
 synthetic transport definition prevented that fixture from starting; it is not an
 allowance to accept unexpected configured/disabled servers in this harness.
 
@@ -407,7 +415,7 @@ copied operator credentials; it proves no live authentication or entitlement.
 | --- | --- | --- | --- |
 | Empty configuration, no auth | 0 | None | Empty app/thread inventories |
 | Empty configuration, synthetic cached ChatGPT identity | 0 | None | Empty app/thread inventories |
-| User-file server, overridden by CLI empty table | 0 | None | No fixture process marker; no server/tool entries |
+| User-file server with CLI empty table (corrected rerun) | 1 | `starting`, `ready` | Fixture process starts; one server/tool entry; earlier contrary result withdrawn |
 | Explicitly enabled stdio fixture | 1 | Thread-bound `starting`, then `ready`, before inference | Fixture process starts; inventory exposes one synthetic tool |
 | Same fixture explicitly disabled | 1 | None | No process marker; one disabled record, zero tools |
 
@@ -416,10 +424,14 @@ list, demonstrating that `thread/start` itself initiates this startup. The fixtu
 records process execution, implements MCP initialization/tool discovery locally,
 and never submits a model turn. This proves that pre-inference lifecycle telemetry
 can accompany real server process startup and tool exposure. It does **not** prove
-which of the three methods occurred in the operator attempt. In this pinned simple
-configuration case, CLI `{}` does clear the user-file table; we did not observe an
-unexpected merge retaining that server. Neither that result nor a short event-free
-window establishes absence of other authenticated/cloud/plugin startup sources.
+which of the three methods occurred in the operator attempt. The earlier conclusion
+that CLI `{}` cleared the user-file table was invalid: the outer sandbox filtered
+the child environment and the test had not bound the actual Codex home. The follow-up
+restores only the explicit disposable environment and asserts the initialization
+home. The user-file server now survives the empty-table override. The earlier
+synthetic-cached-auth result also did not establish use of the intended home; that
+case has been rerun with the home binding. Neither a short event-free window nor
+synthetic cached auth establishes absence of authenticated/cloud/plugin sources.
 
 Reproduce all checks without authenticating:
 
@@ -431,7 +443,8 @@ git diff --check
 
 The validation host needs the previously documented Node compatibility library and
 kernel namespace permissions. Tests do not weaken a boundary or skip on failure.
-The focused suite passed **69/69** (~19 seconds); `npm test` passed **195/195**
+Historical validation at `255aabe`, before correcting the test-home binding:
+the focused suite passed **69/69** (~19 seconds); `npm test` passed **195/195**
 (~108 seconds), both with zero failures/skips. `git diff --check` passed.
 Negative cases cover unexpected startup,
 duplicates/order, cross-thread/unbound identities, malformed payloads, OAuth/stream/
@@ -449,6 +462,145 @@ private identities or relaxing app-server isolation. Never reuse the claimed roo
 Authentication, inference, subscription attribution and live API-key fallback
 exclusion remain UNVERIFIED. Independent acceptance evidence review is still required;
 the next sandbox stage and full migration remain BLOCKED.
+
+### Isolated managed-requirements experiment
+
+Starting head: `255aabec09b915d4cd8b4682d5baa982a8c5c3c5`. This bounded follow-up
+changes only this document and `test/local-codex-authenticated.test.mjs`: seven
+managed-policy controls, reuse of the existing stdio fixture, and correction of the
+test launcher's disposable-home binding. No acceptance-harness or production edits.
+
+**Result: supported and enforced for the tested configured MCP sources; NO-GO for
+authenticated acceptance at present.** The pinned 0.157.1 runtime honors a private
+`/etc/codex/requirements.toml` supplied by standard Linux mount isolation. Denial is
+observed before fixture process startup, not inferred merely from parsing a file,
+an empty inventory or blocked networking. No universal MCP/plugin guarantee follows.
+
+#### Supported mechanism and isolation
+
+The [managed-configuration documentation](https://learn.chatgpt.com/docs/enterprise/managed-configuration)
+specifies a Unix requirements file, an empty MCP allowlist, and managed apps/plugins
+feature restrictions. The tested file is:
+
+```toml
+mcp_servers = {}
+[features]
+apps = false
+plugins = false
+```
+
+The test controller creates an owner-private temporary policy directory **outside**
+the app-server's writable fixture root. `unshare --user --map-root-user --mount
+--net --propagation private` creates child-only namespaces. Only there, standard
+`mount --bind` overlays the synthetic directory on `/etc`, then remounts it read-only.
+No host `/etc/codex` path is created, written, copied or inspected. No Docker daemon,
+container image, package installation, unsupported Codex flag or shared daemon is
+needed. The ordinary documented requirements path is what Codex reads.
+
+Inside that namespace, the original `pab_mcp_offline` kernel sandbox is retained:
+`:minimal` and the exact pinned executable are readable; writes are limited to the
+synthetic root; network is disabled. The model-tool `pab_auth_readonly` profile is
+unchanged. No extra filesystem grant is added for `/etc` or the backing policy path.
+Before app-server startup, in-sandbox checks require distinct mount/network namespace
+IDs, expected policy-file presence, denied policy truncation/creation through both
+namespace and backing paths, a rejected writable remount, and kernel-denied loopback
+connection. Parent namespace IDs must remain unchanged. Any failure aborts startup
+and fails the test, without skips or a fallback to a weaker boundary.
+
+The sandbox's configured shell-environment filtering previously removed the intended
+child `CODEX_HOME`. The test helper now executes `/usr/bin/env -i` with only the
+existing explicit disposable environment **inside** the unchanged sandbox, and
+checks `initialize.codexHome`. It neither inherits nor copies authentication or
+operator configuration. This corrects the test control, not the production launcher.
+The managed-policy cases use no auth files, account/login RPCs or model turns.
+
+#### Enforcement evidence, including override attempts
+
+Each source has a matched no-policy positive control and managed-denial control.
+The project is a newly created, explicitly trusted fixture; the host's trust settings
+are untouched. Each attempts `enabled=true` for the same stdio server and
+`apps=true`, `plugins=true`. User/project cases omit the corresponding CLI pins so
+that those layers are actually exercised. CLI cases supply explicit true overrides.
+Tests require the intended non-disabled layer and server entry in `config/read`.
+
+| Policy / configured source | Fixture process | Runtime inventory | Effective apps / plugins |
+| --- | --- | --- | --- |
+| No requirements / user | Starts | Connected, one tool | true / true |
+| No requirements / trusted project | Starts | Connected, one tool | true / true |
+| No requirements / CLI | Starts | Connected, one tool | true / true |
+| Deny-all + feature pins / user | Does not start | Disabled, zero tools | false / false |
+| Deny-all + feature pins / trusted project | Does not start | Disabled, zero tools | false / false |
+| Deny-all + feature pins / CLI | Does not start | Disabled, zero tools | false / false |
+| MCP deny-all only / CLI | Does not start | Disabled, zero tools | true / true |
+
+All cases retain `config/read`'s `enabled=true` server declaration. Runtime inventory
+instead reports `disabled` under requirements: configuration alone is not an
+effective-policy attestation. `configRequirements/read` returns the feature pins;
+the thread-scoped `experimentalFeature/list` independently reports both features
+off despite each override. The MCP-only case isolates the empty MCP allowlist's
+effect from disabling plugins/apps. Positive controls execute the fixture's process
+marker and expose its one tool; denial controls have neither the marker nor tools,
+nor startup notifications. Full inventory pagination and live transport are checked.
+The direct negative controls can still start in the network-disabled sandbox, so
+network denial is not the explanation for managed suppression.
+
+**Separate configuration counterexample:** with the corrected home binding, ordinary
+CLI `mcp_servers={}` retains a user-file server, which starts and exposes its tool.
+An empty configuration table is not equivalent to the requirements deny-all rule.
+This supersedes the earlier contrary PR result; it is not an explanation of the
+operator's unidentified MCP event.
+
+#### Coverage limits and remaining blockers
+
+- **Configured stdio sources:** prevention demonstrated for user, trusted-project
+  and CLI configuration, plus feature-pin precedence. This is source-level runtime
+  enforcement for that fixture, not a complete process-tree security equivalence test.
+- **Plugin/app gates:** both effective feature flags are constrained. The read-only
+  local `plugin/list` metadata endpoint remains callable and returns an empty catalog
+  with or without denial; it is not evidence of an execution bypass or universal
+  plugin disablement. No installed plugin's MCP process or hook was exercised.
+- **Other sources:** authenticated apps/connectors, remote/workspace/bundled plugins,
+  plugin-bundled MCP, HTTP transports, cloud-policy merging, reload/resume and service
+  startup paths remain UNVERIFIED. The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+  documents a separate plugin-specific MCP allowlist; do not infer coverage of all
+  plugin paths from top-level `mcp_servers={}`. No bypass of the tested deny-all rule
+  was observed, but absence of these sources in an unauthenticated fixture is not
+  negative execution evidence for them.
+- **Acceptance integration:** the existing harness has not acquired this namespace
+  launcher or policy-file attestation. Its requirements validator would reject the
+  additional feature pins, and its inventory gate intentionally rejects even a
+  disabled server record. Neither restriction is weakened here. Its read-only
+  diagnostic startup limitation also remains unchanged.
+- **Network/authentication:** these experiments disable all app-server networking;
+  they do not establish a safe subscription-service route in a networked authenticated
+  run. All live auth/inference/usage/fallback qualifications remain UNVERIFIED. The
+  claimed operator roots are untouched and must not be reused.
+
+The narrowly tested managed-policy mechanism is feasible; an authenticated attempt
+is **not yet justified**. Independent review of the namespace design, actual coverage
+of other server sources, and a separately authorized acceptance-integration design
+are still required. No inference, next sandbox stage, migration, merge or deployment
+is authorized. If the required source coverage or isolation cannot be established,
+stop at NO-GO rather than adding notification allowances or compensating diagnostics.
+
+#### Reproduction and validation
+
+Use the unchanged checksum-pinned Codex binary, Node 24+, Python 3 and standard Linux
+`unshare`/`mount`, on a host permitting unprivileged nested namespaces. The tests use
+only generated disposable fixtures and remove their own state on exit:
+
+```bash
+node --test --test-name-pattern='private managed requirements|offline configured MCP' test/local-codex-authenticated.test.mjs
+node --test test/local-codex-feasibility.test.mjs test/local-codex-authenticated.test.mjs
+npm test
+git diff --check
+```
+
+The ten targeted runtime controls passed. The requested focused suites passed
+**76/76**, and `npm test` passed **202/202** (~124 seconds), with zero failures/skips.
+`git diff --check` passed. No real model turns, metered
+API sessions, API-key usage, login changes, paid live tests, operator-root access,
+host configuration changes or changes to other repositories occurred.
 
 ## Scope and reproducibility
 

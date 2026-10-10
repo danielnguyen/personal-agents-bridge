@@ -16,7 +16,7 @@ const clone = value => structuredClone(value);
 const binary = '/opt/synthetic-codex';
 const toml = value => value && typeof value === 'object' && !Array.isArray(value)
   ? `{ ${Object.entries(value).map(([key, child]) => `${JSON.stringify(key)} = ${toml(child)}`).join(', ')} }` : JSON.stringify(value);
-async function offlineMcpRuntime(context, overrides = {}, onMessage = () => {}, cachedAuth = false, setup = async () => {}) {
+async function offlineMcpRuntime(context, overrides = {}, onMessage = () => {}, cachedAuth = false, setup = async () => {}, managedPolicy) {
   const runtime = await fs.realpath(process.env.CODEX_BINARY || path.join(homedir(), '.local/bin/codex'));
   const root = await prepare(runtime);
   let rpc;
@@ -31,17 +31,35 @@ async function offlineMcpRuntime(context, overrides = {}, onMessage = () => {}, 
   const permissions = { pab_mcp_offline: { filesystem: { ':minimal': 'read', [runtime]: 'read', [root]: 'write' }, network: { enabled: false } } };
   const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
   const launcher = path.join(root, 'offline-launch');
-  const args = ['sandbox', '-c', `permissions=${toml(permissions)}`, '-P', 'pab_mcp_offline', '-C', root, '--', runtime];
-  await fs.writeFile(launcher, `#!/bin/sh\nexec ${[runtime, ...args].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
+  const args = ['sandbox', '-c', `permissions=${toml(permissions)}`, '-P', 'pab_mcp_offline', '-C', root, '--',
+    '/usr/bin/env', '-i', ...Object.entries(environment(root)).map(([key, value]) => `${key}=${value}`), runtime];
+  let launch = [runtime, ...args];
+  if (managedPolicy !== undefined) {
+    const policyRoot = await fs.mkdtemp('/tmp/pab-managed-policy-');
+    context.after(() => fs.rm(policyRoot, { recursive: true, force: true }));
+    await fs.mkdir(path.join(policyRoot, 'codex'), { mode: 0o700 });
+    if (managedPolicy !== null) await fs.writeFile(path.join(policyRoot, 'codex', 'requirements.toml'), managedPolicy, { mode: 0o400 });
+    const hostMount = await fs.readlink('/proc/self/ns/mnt'), hostNetwork = await fs.readlink('/proc/self/ns/net');
+    context.after(async () => {
+      assert.equal(await fs.readlink('/proc/self/ns/mnt'), hostMount);
+      assert.equal(await fs.readlink('/proc/self/ns/net'), hostNetwork);
+    });
+    const boundary = `import pathlib,socket,errno,os,subprocess\nassert os.readlink('/proc/self/ns/mnt')!=${JSON.stringify(hostMount)}\nassert os.readlink('/proc/self/ns/net')!=${JSON.stringify(hostNetwork)}\nassert pathlib.Path('/etc/codex/requirements.toml').exists()==${managedPolicy !== null ? 'True' : 'False'}\nfor target in ['/etc/codex/requirements.toml','/etc/codex/must-not-create',${JSON.stringify(path.join(policyRoot, 'codex', 'requirements.toml'))}]:\n try: open(target,'w')\n except OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS,errno.ENOENT]\n else: raise RuntimeError('policy write allowed')\nassert subprocess.run(['/usr/bin/mount','-o','remount,bind,rw','/etc'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network allowed')`;
+    const child = `/usr/bin/python3 -B -c ${quote(boundary)} && exec ${quote(runtime)} "$@"`;
+    launch = ['/usr/bin/unshare', '--user', '--map-root-user', '--mount', '--net', '--propagation', 'private',
+      '/bin/sh', '-ec', `/usr/bin/mount --bind ${quote(policyRoot)} /etc; /usr/bin/mount -o remount,bind,ro /etc; exec "$@"`,
+      'pab-managed-namespace', runtime, ...args.slice(0, -1), '/bin/sh', '-ec', child, 'pab-managed-boundary'];
+  }
+  await fs.writeFile(launcher, `#!/bin/sh\nexec ${launch.map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
   const settings = { ...configuration(root, runtime), ...(typeof overrides === 'function' ? overrides(root, runtime) : overrides) };
-  rpc = new AppServerRpc(launcher, ['--strict-config', ...Object.entries(settings).flatMap(([key, value]) => ['-c', `${key}=${toml(value)}`])],
+  rpc = new AppServerRpc(launcher, ['--strict-config', ...Object.entries(settings).filter(([, value]) => value !== undefined).flatMap(([key, value]) => ['-c', `${key}=${toml(value)}`])],
     { cwd: root, env: environment(root), onMessage, timeoutMs: 15000 });
   const request = rpc.request.bind(rpc);
   rpc.request = (method, params) => {
-    assert(['initialize', 'config/read', 'model/list', 'thread/start', 'mcpServerStatus/list'].includes(method), 'Offline RPC allowlist');
+    assert(['initialize', 'config/read', 'configRequirements/read', 'experimentalFeature/list', 'plugin/list', 'model/list', 'thread/start', 'mcpServerStatus/list'].includes(method), 'Offline RPC allowlist');
     return request(method, params);
   };
-  await rpc.initialize();
+  assert.equal((await rpc.initialize()).codexHome, path.join(root, 'codex'));
   return { root, runtime, rpc };
 }
 const account = () => ({ account: { type: 'chatgpt', email: 'synthetic@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true });
@@ -485,14 +503,16 @@ for (const cachedAuth of [false, true]) test(`offline MCP startup characterizati
   validateEmptyMcpInventory(inventory);
 });
 
-for (const mode of ['cleared', 'enabled', 'disabled']) test(`offline configured MCP startup mode=${mode} characterizes server activity without inference`, async context => {
+function syntheticMcpServers(root, enabled = true) {
+  const program = `import json,sys,pathlib\npathlib.Path(${JSON.stringify(path.join(root, 'mcp-process-started'))}).write_text('started')\nfor line in sys.stdin:\n request=json.loads(line)\n if 'id' not in request: continue\n method=request.get('method')\n result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'synthetic','version':'1'}} if method=='initialize' else {'tools':[{'name':'fixture_only','description':'Synthetic offline fixture','inputSchema':{'type':'object','properties':{}}}]} if method=='tools/list' else {}\n print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)`;
+  return { synthetic_fixture: { command: '/usr/bin/python3', args: ['-B', '-u', '-c', program], enabled } };
+}
+
+for (const mode of ['empty_override', 'enabled', 'disabled']) test(`offline configured MCP startup mode=${mode} characterizes server activity without inference`, async context => {
   let phase = 'initialization', threadId;
   const observations = [];
-  const servers = root => {
-    const program = `import json,sys,pathlib\npathlib.Path(${JSON.stringify(path.join(root, 'mcp-process-started'))}).write_text('started')\nfor line in sys.stdin:\n request=json.loads(line)\n if 'id' not in request: continue\n method=request.get('method')\n result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'synthetic','version':'1'}} if method=='initialize' else {'tools':[{'name':'fixture_only','description':'Synthetic offline fixture','inputSchema':{'type':'object','properties':{}}}]} if method=='tools/list' else {}\n print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)`;
-    return { synthetic_fixture: { command: '/usr/bin/python3', args: ['-B', '-u', '-c', program], enabled: mode !== 'disabled' } };
-  };
-  const value = await offlineMcpRuntime(context, root => mode === 'cleared' ? {} : { mcp_servers: servers(root) }, message => {
+  const servers = root => syntheticMcpServers(root, mode !== 'disabled');
+  const value = await offlineMcpRuntime(context, root => mode === 'empty_override' ? {} : { mcp_servers: servers(root) }, message => {
     if (!message.method.startsWith('mcpServer/')) return;
     assert.equal(message.method, 'mcpServer/startupStatus/updated');
     const classified = classifyMcpNotification(message, threadId);
@@ -515,21 +535,21 @@ for (const mode of ['cleared', 'enabled', 'disabled']) test(`offline configured 
   threadId = started.thread.id;
   phase = 'pre_inference';
   const deadline = Date.now() + 5000;
-  while (mode === 'enabled' && !observations.some(event => event.status === 'ready') && !value.rpc.failure && Date.now() < deadline) {
+  while (mode !== 'disabled' && !observations.some(event => event.status === 'ready') && !value.rpc.failure && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
-  if (mode === 'enabled') assert.deepEqual(observations.map(event => event.status), ['starting', 'ready']);
+  if (mode !== 'disabled') assert.deepEqual(observations.map(event => event.status), ['starting', 'ready']);
   const inventory = await value.rpc.request('mcpServerStatus/list', { threadId, detail: 'full' });
   await new Promise(resolve => setTimeout(resolve, 250));
   const processStarted = await fs.stat(path.join(value.root, 'mcp-process-started')).then(() => true, () => false);
   context.diagnostic(JSON.stringify({ configuredCount: Object.keys(settings.config.mcp_servers).length, observations, processStarted,
     inventoryCount: inventory.data.length, toolCount: inventory.data.reduce((sum, server) => sum + Object.keys(server.tools).length, 0), completePage: inventory.nextCursor === null }));
   assert.equal(value.rpc.failure, null);
-  assert.equal(Object.keys(settings.config.mcp_servers).length, mode === 'cleared' ? 0 : 1);
-  assert.equal(processStarted, mode === 'enabled');
-  assert.equal(inventory.data.length, mode === 'cleared' ? 0 : 1);
+  assert.equal(Object.keys(settings.config.mcp_servers).length, 1);
+  assert.equal(processStarted, mode !== 'disabled');
+  assert.equal(inventory.data.length, 1);
   assert.equal(inventory.nextCursor, null);
-  if (mode === 'enabled') {
+  if (mode !== 'disabled') {
     assert.deepEqual(observations.map(event => event.status), ['starting', 'ready']);
     assert(observations.every(event => event.fixtureIdentity && ['thread_creation', 'pre_inference'].includes(event.phase)));
     assert.equal(inventory.data[0].name, 'synthetic_fixture');
@@ -546,6 +566,59 @@ for (const mode of ['cleared', 'enabled', 'disabled']) test(`offline configured 
 
 const startupNotice = (params = {}) => ({ method: 'mcpServer/startupStatus/updated', params: {
   name: 'private-server', threadId: 'synthetic-thread', status: 'starting', error: null, failureReason: null, ...params } });
+
+for (const { source, deny, featurePins = true } of [
+  ...['user', 'project', 'cli'].flatMap(source => [false, true].map(deny => ({ source, deny }))),
+  { source: 'cli', deny: true, featurePins: false },
+]) test(`private managed requirements source=${source} deny=${deny} featurePins=${featurePins} controls synthetic MCP startup`, async context => {
+  const notices = [];
+  const policy = deny ? 'mcp_servers = {}\n' + (featurePins ? '[features]\napps = false\nplugins = false\n' : '') : null;
+  const value = await offlineMcpRuntime(context, (root, runtime) => ({
+    mcp_servers: source === 'cli' ? syntheticMcpServers(root) : undefined,
+    features: source === 'cli' ? { ...configuration(root, runtime).features, apps: true, plugins: true } : undefined,
+    projects: { [path.join(root, 'work')]: { trust_level: 'trusted' } },
+  }), message => {
+    if (message.method.startsWith('mcpServer/')) notices.push(classifyMcpNotification(message));
+    assert(notices.length <= 4);
+  }, false, async (root, runtime) => {
+    const file = source === 'project' ? path.join(root, 'work', '.codex', 'config.toml') : path.join(root, 'codex', 'config.toml');
+    if (source === 'project') await fs.mkdir(path.dirname(file), { mode: 0o700 });
+    const settings = { ...(source === 'project' ? {} : configuration(root, runtime)),
+      mcp_servers: syntheticMcpServers(root), features: { ...configuration(root, runtime).features, apps: true, plugins: true } };
+    await fs.writeFile(file, Object.entries(settings).map(([key, child]) => `${key} = ${toml(child)}\n`).join(''), { mode: 0o600 });
+  }, policy);
+  const required = await value.rpc.request('configRequirements/read');
+  const settings = await value.rpc.request('config/read', { includeLayers: true, cwd: path.join(value.root, 'work') });
+  assert.equal(settings.config.mcp_servers.synthetic_fixture.enabled, true);
+  assert(settings.layers.some(layer => layer.name.type === (source === 'cli' ? 'sessionFlags' : source) &&
+    layer.disabledReason == null && layer.config.mcp_servers?.synthetic_fixture?.enabled === true));
+  assert.deepEqual(required.requirements?.featureRequirements ?? null, deny && featurePins ? { apps: false, plugins: false } : null);
+  const models = await value.rpc.request('model/list', { includeHidden: false });
+  const started = await value.rpc.request('thread/start', { model: models.data.find(candidate => candidate.isDefault).model,
+    modelProvider: 'openai', cwd: path.join(value.root, 'work'), approvalPolicy: 'never', approvalsReviewer: 'user',
+    permissions: PROFILE, ephemeral: true, environments: [], dynamicTools: [] });
+  const inventory = await value.rpc.request('mcpServerStatus/list', { threadId: started.thread.id, detail: 'full' });
+  const features = await value.rpc.request('experimentalFeature/list', { threadId: started.thread.id, limit: 1000 });
+  const availability = features.data.filter(feature => ['apps', 'plugins'].includes(feature.name)).map(feature => ({ name: feature.name, enabled: feature.enabled }));
+  assert.equal(features.nextCursor, null);
+  assert.deepEqual(availability, ['apps', 'plugins'].map(name => ({ name, enabled: !(deny && featurePins) })));
+  const plugins = await value.rpc.request('plugin/list', { cwds: [path.join(value.root, 'work')], marketplaceKinds: ['local'], forceRefetch: false });
+  assert.deepEqual(plugins, { marketplaces: [], marketplaceLoadErrors: [], featuredPluginIds: [] });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const processStarted = await fs.stat(path.join(value.root, 'mcp-process-started')).then(() => true, () => false);
+  context.diagnostic(JSON.stringify({ source, deny, featurePins, configuredEnabled: true, notices, features: availability,
+    inventory: inventory.data.map(server => ({ runtimeStatus: server.runtimeStatus, toolCount: Object.keys(server.tools).length })), processStarted }));
+  assert.equal(value.rpc.failure, null);
+  assert.equal(started.activePermissionProfile.id, PROFILE);
+  assert.equal(started.sandbox.networkAccess, false);
+  assert.equal(processStarted, !deny);
+  assert.equal(inventory.nextCursor, null);
+  assert.equal(inventory.data.reduce((total, server) => total + Object.keys(server.tools).length, 0), deny ? 0 : 1);
+  assert.equal(inventory.data.length, 1);
+  assert.equal(inventory.data[0].name, 'synthetic_fixture');
+  assert.equal(inventory.data[0].runtimeStatus, deny ? 'disabled' : 'connected');
+  assert.deepEqual(notices.map(notice => notice.status), deny ? [] : ['starting', 'ready']);
+});
 
 test('MCP diagnostics distinguish exact lifecycle, OAuth, stream and tool categories without private values', () => {
   const cases = [
