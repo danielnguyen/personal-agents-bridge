@@ -98,7 +98,7 @@ export function localEvidencePacket(task, required, cwd) {
     native_activity: ledger || { status: 'unavailable', reason: 'No controller-retained notification ledger; history cannot be reconstructed.', exhaustive: false },
     required_test_correlation: localTestCorrelation(ledger, required, cwd),
     independent_validation: { status: 'unavailable', results: [], reason: 'No independent validation executor is integrated for local tasks.' },
-    gates: { local_review: 'disabled', local_publication: 'disabled', pr6_live_human_routing_acceptance: 'unverified' },
+    gates: { local_review: 'analysis_only', local_publication: 'disabled', pr6_live_human_routing_acceptance: 'unverified' },
     coverage: { exhaustive_command_history: false, exhaustive_file_history: false, prohibited_operations_absence_verified: false,
       model_prose_included: false, agents_api_file_rpc_equivalence: false, descendant_termination_verified: false,
       limitations: ['Retained command output is bounded/redacted and upstream completeness is unverified.',

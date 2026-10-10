@@ -4,8 +4,9 @@ import { captureFileRpcEvidence } from './file-rpc-evidence.mjs';
 import OpenAI from 'openai';
 import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
-import { captureBefore, repositoryReviewEvidence } from './review-evidence.mjs';
+import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
+import { localReviewerInstructions, validateLocalReview } from './local-reviewer-instructions.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -217,6 +218,12 @@ export class Controller {
           this.invalidateLocalRequests(t, 'LOCAL_RESTART_CALLBACK_UNAVAILABLE');
           t.implementer.local.diagnostics = ['LOCAL_RESTART_UNRESOLVED_NO_REPLAY']; this.save(t);
         }
+        if (t.reviewer && (!t.reviewer.local.result_received || !t.reviewer.local.server_closed || ['starting', 'running', 'finishing'].includes(t.reviewer.state))) {
+          t.reviewer.state = 'needs_attention'; t.reviewer.review_result = null;
+          Object.assign(t.reviewer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true,
+            diagnostics: ['LOCAL_REVIEW_RESTART_NO_REPLAY'] });
+          this.save(t);
+        }
         continue;
       }
       if (!t.cleaned) for (const role of ['implementer', 'reviewer']) if (t[role]?.session_id && !t[role].deleted) this.observe(t.id, role).catch(() => {});
@@ -350,8 +357,9 @@ export class Controller {
         t[role].error = this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED');
         Object.assign(t[role].local, { execution_state: t[role].local.turn_submission_attempted ? 'uncertain' : 'failed', phase: 'failed', result_received: true, human_attention_required: true,
           diagnostics: [this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED')] });
-        this.invalidateLocalRequests(t, 'LOCAL_EXECUTION_FAILED');
-        this.opDone(t.request_id, 'failed');
+        if (role === 'implementer') this.invalidateLocalRequests(t, 'LOCAL_EXECUTION_FAILED');
+        else t[role].review_result = null;
+        this.opDone(role === 'implementer' ? t.request_id : t[role].request_id, 'failed');
       }
       this.save(t); } }).finally(() => this.jobs.delete(key));
     this.jobs.set(key, job);
@@ -560,10 +568,12 @@ export class Controller {
       if (closed.ok && closed.value === true) this.localRuns.delete(id);
     }
   }
-  localView(t) {
-    const ref = t.implementer, local = ref.local;
+  localView(t, role = 'implementer') {
+    const ref = t[role], local = ref.local;
     const humanRequests = local.human_requests.map(({ native_request_id, response, ...request }) => request);
     return { state: ref.state, session_id: null, turn_id: null, environment_id: null,
+      ...(role === 'reviewer' ? { review_result: ref.review_result || null, packet_hash: ref.packet_hash, reviewed_git_state: ref.reviewed_git_state,
+        ...(ref.review_result ? { overall: ref.review_result.overall, findings: ref.review_result.findings } : {}) } : {}),
       local: { ...local, human_requests: humanRequests }, pending_human_requests: humanRequests.filter(request => request.status === 'pending'),
       latest_output: local.latest_model_output || null, latest_output_source: 'model',
       clarification_required: humanRequests.some(request => request.status === 'pending' && request.expected_response === 'clarification'),
@@ -690,7 +700,13 @@ export class Controller {
     result.execution_backend = t.execution_backend || 'agents_api';
     for (const role of ['implementer', 'reviewer']) {
       if (!t[role]) continue;
-      if (t.execution_backend === 'local_codex') { result[role] = this.localView(t); continue; }
+      if (t.execution_backend === 'local_codex') {
+        if (role === 'reviewer' && refresh && t.reviewer.review_result && !t.workspace_deleted) {
+          try { await this.verifyLocalReviewPacket(t); }
+          catch { const fresh = this.task(id); fresh.reviewer.review_result = null; fresh.reviewer.state = 'needs_attention'; fresh.reviewer.error = 'LOCAL_REVIEW_INTEGRITY_CHANGED'; fresh.reviewer.local.human_attention_required = true; this.save(fresh); t = fresh; }
+        }
+        result[role] = this.localView(t, role); continue;
+      }
       if (refresh && t[role].session_id && !t[role].deleted) {
         try { await this.observe(id, role); result[role] = await this.viewRole(t, role); }
         catch (e) {
@@ -961,7 +977,7 @@ export class Controller {
   async review({ task_id: id, request_id }) {
     return this.locked(id, async () => {
       const t = this.task(id);
-      if (t.execution_backend === 'local_codex') throw new BridgeError('LOCAL_REVIEW_UNSUPPORTED');
+      if (t.execution_backend === 'local_codex') return this.reviewLocal(t, request_id);
       if (t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION'); if (t.cleaned) throw new BridgeError('TASK_CLEANED');
       if (t.reviewer && !t.reviewer.stale) return this.get(id);
       if (this.jobs.has(`${id}:implementer`)) throw new BridgeError('TASK_STARTING');
@@ -976,6 +992,115 @@ export class Controller {
       this.launch(id, 'reviewer', () => this.openSession(id, 'reviewer', packet.directory, 'Read evidence.json. Independently assess the original contract against the baseline/current files, patch and test execution records. Return the required JSON findings for every requirement and invariant plus SCOPE and TEST_EVIDENCE. Never modify files.', request_id));
       return this.get(id, false);
     });
+  }
+  async verifyLocalReviewPacket(task) {
+    const ref = task.reviewer, root = path.join(this.workspaceRoot, task.id), directory = path.join(root, ref.packet_directory);
+    if (await fs.realpath(directory) !== directory) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+    const file = path.join(directory, 'evidence.json'), stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_PACKET || stat.mode & 0o222) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+    const text = await fs.readFile(file, 'utf8');
+    if (digest(text) !== ref.packet_hash) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+    const packet = JSON.parse(text);
+    if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state) ||
+        JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+    const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
+    if (compareSnapshots(packet.controller_evidence?.normal_checkout?.at_review, normal).status !== 'unchanged') throw new BridgeError('LOCAL_REVIEW_NORMAL_CHECKOUT_CHANGED');
+    await this.repositoryEvidence(task.id);
+    return packet;
+  }
+  async reviewLocal(task, requestId) {
+    if (task.cleaned || this.closed) throw new BridgeError('TASK_CLEANED');
+    if (task.reviewer) {
+      const old = this.operation(requestId, 'review', { id: task.id }, task.id);
+      if (!old) this.opDone(requestId, 'not_started');
+      return this.get(task.id);
+    }
+    if (task.implementer.stopping) throw new BridgeError('TASK_CLEANED');
+    if (task.implementer.state !== 'completed' || task.implementer.local.execution_state !== 'completed' ||
+        !task.implementer.local.result_received || !task.implementer.local.terminal_observed) throw new BridgeError('LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION');
+    const old = this.operation(requestId, 'review', { id: task.id }, task.id);
+    if (old) return this.get(task.id);
+    const local = { phase: 'snapshot', execution_state: 'starting', thread_id: null, turn_id: null, model: null,
+      turn_submission_attempted: false, turn_submission_acknowledged: false, terminal_observed: false, result_received: false,
+      instance_started: false, server_closed: false, human_attention_required: false, human_requests: [], diagnostics: [] };
+    const packet = await this.packet(task);
+    const data = JSON.parse(await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
+    if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+    task = this.task(task.id);
+    task.reviewer = { state: 'starting', execution_backend: 'local_codex', request_id: requestId, local,
+      packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory), reviewed_git_state: data.reviewed_git_state, review_result: null };
+    task.deadline = Date.now() + this.timeoutMs; this.save(task);
+    this.launch(task.id, 'reviewer', () => this.runLocalReview(task.id));
+    return this.get(task.id, false);
+  }
+  async runLocalReview(id) {
+    let task = this.task(id);
+    if (this.closed || task.reviewer.stopping) return;
+    await this.verifyLocalReviewPacket(task);
+    if (this.closed || this.task(id).reviewer.stopping) return;
+    const key = `${id}:reviewer`, abort = new AbortController();
+    const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.timeoutMs,
+      onLifecycle: event => {
+        if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
+        const current = this.task(id), ref = current.reviewer, local = ref.local;
+        this.localIdentity(local, event); local.phase = this.bounded(event.phase, 64);
+        if (local.thread_id && local.thread_id === current.implementer.local.thread_id) {
+          ref.error = 'LOCAL_REVIEW_THREAD_NOT_INDEPENDENT'; this.save(current); throw new BridgeError(ref.error);
+        }
+        if (event.phase === 'human_request') {
+          ref.error = 'LOCAL_REVIEW_HUMAN_REQUEST_UNSUPPORTED'; local.human_attention_required = true;
+          local.diagnostics = [ref.error]; this.save(current); abort.abort(); throw new BridgeError(ref.error);
+        }
+        if (event.phase === 'turn_acknowledged') { local.execution_state = 'running'; ref.state = 'running'; }
+        if (event.phase === 'terminal_observed') { local.execution_state = event.status; ref.state = 'finishing'; }
+        this.save(current);
+        if (ref.stopping || this.closed) throw new BridgeError('LOCAL_STOP_REQUESTED');
+      }, onProgress: event => {
+        if (event.params?.item?.type === 'fileChange') {
+          const current = this.task(id); current.reviewer.error = 'LOCAL_REVIEW_WRITE_OBSERVED'; this.save(current);
+          abort.abort(); throw new BridgeError('LOCAL_REVIEW_WRITE_OBSERVED');
+        }
+      } });
+    this.localRuns.set(key, { backend, abort });
+    task = this.task(id); Object.assign(task.reviewer.local, { instance_started: true, owner_instance: this.instanceId }); this.save(task);
+    let result;
+    try {
+      result = await backend.run({ prompt: localReviewerInstructions, allowedFiles: [], signal: abort.signal });
+      if (this.dbClosed) return;
+      task = this.task(id); const ref = task.reviewer;
+      this.localIdentity(ref.local, result);
+      const confirmed = ref.local.turn_submission_acknowledged && ref.local.terminal_observed && ref.local.thread_id && ref.local.turn_id && result.authentication === 'chatgpt';
+      Object.assign(ref.local, { execution_state: result.status === 'completed' && !confirmed ? 'uncertain' : ['completed', 'failed', 'interrupted', 'uncertain'].includes(result.status) ? result.status : 'uncertain',
+        phase: 'validating', result_received: true, diagnostics: (result.uncertainties || []).slice(0, 12).map(value => this.bounded(value, 512)) });
+      ref.state = 'finishing'; this.save(task);
+    } finally {
+      const closed = await settledWithin(Promise.resolve().then(() => backend.close()));
+      if (!this.dbClosed) { task = this.task(id); task.reviewer.local.server_closed = closed.ok && closed.value === true; this.save(task); }
+      if (closed.ok && closed.value === true) this.localRuns.delete(key);
+    }
+    if (this.dbClosed) return;
+    task = this.task(id);
+    try {
+      const ref = task.reviewer, local = ref.local;
+      if (ref.stopping || ref.error || local.execution_state !== 'completed' || !local.server_closed || !local.terminal_observed ||
+          !local.turn_submission_acknowledged || !local.thread_id || !local.turn_id || local.thread_id === task.implementer.local.thread_id ||
+          result.authentication !== 'chatgpt') throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
+      const packet = await this.verifyLocalReviewPacket(task);
+      const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
+      const output = result.messages?.filter(item => item.provenance === 'model').at(-1)?.text;
+      const validated = validateLocalReview(output, contract, packet, this.bounded.bind(this));
+      task = this.task(id);
+      if (this.closed || task.reviewer.stopping) throw new BridgeError('LOCAL_REVIEW_CANCELLED');
+      task.reviewer.review_result = { ...validated, packet_hash: task.reviewer.packet_hash, reviewed_git_state: task.reviewer.reviewed_git_state,
+        thread_id: task.reviewer.local.thread_id, turn_id: task.reviewer.local.turn_id };
+      task.reviewer.state = 'completed'; task.reviewer.local.phase = 'finished';
+    } catch (error) {
+      task = this.task(id); task.reviewer.state = 'needs_attention'; task.reviewer.review_result = null;
+      task.reviewer.error ||= this.bounded(error.code || 'INVALID_LOCAL_REVIEW_OUTPUT', 128);
+      task.reviewer.local.human_attention_required = true;
+      task.reviewer.local.diagnostics.push(task.reviewer.error);
+    }
+    this.opDone(task.reviewer.request_id, task.reviewer.review_result ? 'accepted' : 'uncertain'); this.save(task);
   }
   async publish(input) {
     if (!input || Object.keys(input).some(k => !['task_id', 'title', 'body', 'draft'].includes(k)) ||
@@ -1102,23 +1227,25 @@ export class Controller {
       return this.get(id, false);
     });
   }
-  async stopLocal(id) {
-    let task = this.task(id); task.implementer.stopping = true;
-    this.invalidateLocalRequests(task, 'LOCAL_CALLBACK_CANCELLED'); this.save(task);
-    const owned = this.localRuns.get(id), diagnostics = new Set();
+  async stopLocal(id, role = 'implementer') {
+    let task = this.task(id); task[role].stopping = true;
+    if (role === 'implementer') this.invalidateLocalRequests(task, 'LOCAL_CALLBACK_CANCELLED');
+    this.save(task);
+    const key = role === 'implementer' ? id : `${id}:reviewer`;
+    const owned = this.localRuns.get(key), diagnostics = new Set();
     if (owned) {
       owned.abort.abort();
       const cancelled = await settledWithin(Promise.resolve().then(() => owned.backend.cancel()));
       if (!cancelled.ok) diagnostics.add('LOCAL_CANCEL_REQUEST_UNCONFIRMED');
     }
-    let job = await settledWithin(this.jobs.get(`${id}:implementer`));
+    let job = await settledWithin(this.jobs.get(`${id}:${role}`));
     if (owned) {
       const closed = await settledWithin(Promise.resolve().then(() => owned.backend.close()));
-      task = this.task(id); task.implementer.local.server_closed ||= closed.ok && closed.value === true; this.save(task);
-      if (closed.ok && closed.value === true) this.localRuns.delete(id);
-      if (!job.ok) job = await settledWithin(this.jobs.get(`${id}:implementer`));
+      task = this.task(id); task[role].local.server_closed ||= closed.ok && closed.value === true; this.save(task);
+      if (closed.ok && closed.value === true) this.localRuns.delete(key);
+      if (!job.ok) job = await settledWithin(this.jobs.get(`${id}:${role}`));
     }
-    task = this.task(id); const local = task.implementer.local;
+    task = this.task(id); const local = task[role].local;
     if (!local.instance_started && job.ok) local.server_closed = true;
     if (!local.server_closed) diagnostics.add(owned ? 'LOCAL_CLOSE_UNCONFIRMED' : 'LOCAL_OWNER_UNAVAILABLE');
     if (!job.ok) diagnostics.add('LOCAL_JOB_UNRESOLVED');
@@ -1127,7 +1254,7 @@ export class Controller {
     if (!local.result_received) {
       local.execution_state = local.turn_submission_attempted ? 'uncertain' : 'interrupted';
       local.phase = 'stopped'; local.result_received = job.ok;
-      task.implementer.state = local.execution_state;
+      task[role].state = local.execution_state;
     }
     if (diagnostics.size) { local.human_attention_required = true; local.diagnostics = [...new Set([...local.diagnostics, ...diagnostics])].slice(-12); }
     this.save(task);
@@ -1135,6 +1262,11 @@ export class Controller {
   }
   async cleanupLocal(id, deleteWorkspace) {
     const stopped = await this.stopLocal(id), diagnostics = new Set(stopped.diagnostics);
+    if (this.task(id).reviewer) {
+      const reviewer = await this.stopLocal(id, 'reviewer');
+      for (const field of ['server_closed', 'job_settled', 'cancellation_confirmed']) stopped[field] &&= reviewer[field];
+      for (const diagnostic of reviewer.diagnostics) diagnostics.add(`REVIEWER_${diagnostic}`);
+    }
     let task = this.task(id); const workspace = path.join(this.workspaceRoot, id);
     task.cleaned = stopped.server_closed && stopped.job_settled && stopped.cancellation_confirmed;
     task.cleanup = { execution_backend: 'local_codex', executor_stopped: stopped.server_closed && stopped.job_settled,
@@ -1176,6 +1308,7 @@ export class Controller {
     clearInterval(this.sweeper); this.closed = true;
     const tasks = this.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value));
     await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && !task.cleaned).map(task => this.stopLocal(task.id)));
+    await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && task.reviewer && !task.cleaned).map(task => this.stopLocal(task.id, 'reviewer')));
     await Promise.allSettled([...this.jobs.entries()].filter(([key]) => this.task(key.split(':')[0]).execution_backend !== 'local_codex').map(([, job]) => job));
     for (const stream of this.streams.values()) stream?.controller?.abort();
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
