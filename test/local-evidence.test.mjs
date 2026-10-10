@@ -114,7 +114,7 @@ for (const state of ['completed', 'interrupted', 'uncertain', 'failed']) test(`p
   const packet = localEvidencePacket(task, ['python3 check.py'], '/task');
   assert.equal(packet.evidence_version, LOCAL_EVIDENCE_VERSION); assert.equal(packet.execution.state, state);
   assert.equal(packet.native_activity.status, 'unavailable'); assert.equal(packet.independent_validation.status, 'unavailable');
-  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'disabled');
+  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'analysis_only');
   assert(!JSON.stringify(packet).includes('I independently verified')); assert(!JSON.stringify(packet).includes('private'));
 });
 
