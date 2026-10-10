@@ -67,6 +67,8 @@ export function observeLocalEvidence(ledger, event, identity, bound) {
       record.changes.push({ path: retained(change?.path, 1024, bound), kind,
         move_path: retained(change?.kind?.move_path, 1024, bound), diff: retained(change?.diff, 1024, bound) });
     }
+    record.start_completion_conflict = !!previous && JSON.stringify(previous.changes) !== JSON.stringify(record.changes);
+    if (record.start_completion_conflict) record.start_changes = previous.changes;
   }
   const total = ledger.commands.length + ledger.file_changes.length;
   const bytes = size([...ledger.commands, ...ledger.file_changes]) - (previous ? size(previous) + 1 : 0) + size(record) + 1;
@@ -99,11 +101,13 @@ export function localEvidencePacket(task, required, cwd, reviewedState) {
     execution: { backend: 'local_codex', task_id: task.id, thread_id: local.thread_id, turn_id: local.turn_id, model: local.model,
       state: local.execution_state, phase: local.phase, turn_submission_attempted: local.turn_submission_attempted,
       turn_submission_acknowledged: local.turn_submission_acknowledged, terminal_observed: local.terminal_observed,
-      result_received: local.result_received, app_server_closed: local.server_closed, diagnostics: local.diagnostics },
+      result_received: local.result_received, app_server_closed: local.server_closed, diagnostics: local.diagnostics,
+      authentication: local.authentication, adapter_contract: local.adapter_contract, human_attention_required: local.human_attention_required,
+      human_requests_resolved: Array.isArray(local.human_requests) && local.human_requests.every(request => request.status === 'resolved') },
     native_activity: ledger || { status: 'unavailable', reason: 'No controller-retained notification ledger; history cannot be reconstructed.', exhaustive: false },
     required_test_correlation: localTestCorrelation(ledger, required, cwd),
     independent_validation: validation,
-    gates: { local_review: 'analysis_only', local_publication: 'disabled', pr6_live_human_routing_acceptance: 'unverified' },
+    gates: { local_review: 'bounded_evidence_qualification', local_publication: 'controller_gated_exact_tree', pr6_live_human_routing_acceptance: 'unverified' },
     coverage: { exhaustive_command_history: false, exhaustive_file_history: false, prohibited_operations_absence_verified: false,
       model_prose_included: false, agents_api_file_rpc_equivalence: false, descendant_termination_verified: false,
       limitations: ['Retained command output is bounded/redacted and upstream completeness is unverified.',

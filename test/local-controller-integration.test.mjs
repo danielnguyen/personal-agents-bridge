@@ -31,7 +31,7 @@ class FakeLocal {
   finish(status = 'completed', terminal = true, output) {
     this.identity.terminalObserved = terminal;
     if (terminal) this.emit('terminal_observed', { status });
-    this.resolve({ ...this.identity, status, authentication: 'chatgpt', commands: [{ command: 'untrusted test', exitCode: 0 }], messages: output ? [{ provenance: 'model', text: output }] : [], uncertainties: ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
+    this.resolve({ ...this.identity, status, authentication: 'chatgpt', commands: [{ command: 'untrusted test', exitCode: 0 }], messages: output ? [{ provenance: 'model', text: output }] : [], uncertainties: this.options.reviewOnly ? this.mode.reviewDiagnostics || [] : ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
   }
   respondToRequest(input) {
     this.mode.onDeliver?.(input);
@@ -143,7 +143,7 @@ test('independent local reviewer binds durable distinct identity, read-only work
   assert.equal(view.reviewer.review_result.packet_hash, ref.packet_hash); assert.equal(view.reviewer.local.server_closed, true);
   await controller.review({ task_id: task.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
   await assert.rejects(controller.continue({ task_id: task.id, request_id: 'new_turn', instruction: 'try again' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
-  await assert.rejects(controller.publish({ task_id: task.id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  await assert.rejects(controller.publish({ task_id: task.id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
   assert.equal(controller._api, undefined);
 });
 
@@ -179,7 +179,7 @@ test('controller persists independent validation before packet creation, binds t
   const result = controller.task(started.task_id).reviewer.review_result;
   assert.deepEqual(result.controller_overrides, ['SCOPE']); assert.equal(result.overall, 'FAIL');
   assert.equal(controller._api, undefined);
-  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
 });
 
 function heldValidation() {
@@ -336,6 +336,15 @@ test('a reused implementer thread is rejected before reviewer turn submission', 
   assert.equal(ref.review_result, null); assert(value.instances[1].calls.includes('close'));
 });
 
+test('unresolved reviewer runtime diagnostics cannot yield a qualified result', async context => {
+  const value = await reviewing(context);
+  value.reviewer.mode.reviewDiagnostics = ['Codex reported a runtime error.'];
+  value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const ref = value.controller.task(value.started.task_id).reviewer;
+  assert.equal(ref.state, 'needs_attention'); assert.equal(ref.review_result, null);
+  assert.equal(ref.error, 'LOCAL_REVIEW_EXECUTION_UNVERIFIED');
+});
+
 test('restart preserves completed review and marks a crash during result validation uncertain without replay', async context => {
   const value = await reviewing(context); value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
   const completed = value.controller.task(value.started.task_id).reviewer.review_result;
@@ -409,8 +418,8 @@ test('local notification evidence is durable before completion and packets reuse
   assert.equal(data.command_execution_evidence, undefined); assert.equal(data.file_rpc_operation_evidence, undefined);
   assert.equal(controller.task(started.task_id).file_rpc_evidence, undefined); assert.equal(controller._api, undefined);
   assert(!packet.text.includes('Model says')); assert(!packet.text.includes('untrusted test')); assert(!packet.text.includes('token=private'));
-  assert.equal(data.gates.local_review, 'analysis_only'); assert.equal(data.gates.local_publication, 'disabled');
-  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  assert.equal(data.gates.local_review, 'bounded_evidence_qualification'); assert.equal(data.gates.local_publication, 'controller_gated_exact_tree');
+  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
 });
 
 test('packet detects changed original checkout rather than trusting local command claims', async context => {
@@ -563,6 +572,20 @@ test('cleanup during provisioning prevents execution instead of waiting for a lo
   assert.equal(result.implementer.local.turn_submission_attempted, false);
 });
 
+test('cleanup during protected-path capture cannot launch local execution afterward', async context => {
+  const value = await setup(context), original = value.controller.localProtectedState.bind(value.controller);
+  let entered, release;
+  const capturing = new Promise(resolve => { entered = resolve; }), held = new Promise(resolve => { release = resolve; });
+  value.controller.localProtectedState = async repo => { const snapshot = await original(repo); entered(); await held; return snapshot; };
+  const started = await value.start(); await capturing;
+  const pending = value.controller.cleanup({ task_id: started.task_id });
+  for (let attempt = 0; attempt < 100 && !value.controller.task(started.task_id).implementer.stopping; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+  const stopping = value.controller.task(started.task_id).implementer.stopping;
+  release(); const result = await pending;
+  assert.equal(stopping, true); assert.equal(result.state, 'cleaned'); assert.equal(value.instances.length, 0);
+  assert.equal(result.implementer.local.turn_submission_attempted, false);
+});
+
 test('unconfirmed local server closure prevents workspace deletion and remains visible', async context => {
   const value = await setup(context, { closeFails: true }), started = await value.start(); await value.running();
   const result = await value.controller.cleanup({ task_id: started.task_id, delete_workspace: true });
@@ -633,7 +656,7 @@ test('local continue, review and publish reject explicitly without downstream AP
   const value = await setup(context), started = await value.start(); await value.running();
   await assert.rejects(value.controller.continue({ task_id: started.task_id, instruction: 'answer', request_id: 'next_request' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
   await assert.rejects(value.controller.review({ task_id: started.task_id, request_id: 'review_request' }), /LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION/);
-  await assert.rejects(value.controller.publish({ task_id: started.task_id, title: 'not allowed' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  await assert.rejects(value.controller.publish({ task_id: started.task_id, title: 'not allowed' }), /TASK_EXECUTION_PENDING/);
   assert.equal(value.api.created.length, 0); assert.equal(value.controller.task(started.task_id).reviewer, undefined);
   assert.equal(value.controller.task(started.task_id).publication, undefined);
 });
@@ -860,7 +883,7 @@ test('MCP routes structured human replies and preserves unsupported review/publi
   const retry = await client.callTool({ name: 'continue_task', arguments: value.response() }); assert.equal(retry.isError, undefined);
   assert.equal(value.backend.responses.length, 1);
   await assert.rejects(value.controller.review({ task_id: value.started.task_id, request_id: 'still_no_review' }), /LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION/);
-  await assert.rejects(value.controller.publish({ task_id: value.started.task_id, title: 'No publication' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  await assert.rejects(value.controller.publish({ task_id: value.started.task_id, title: 'No publication' }), /TASK_EXECUTION_PENDING/);
 });
 
 for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real Controller and adapter route ${kind} via mocked native RPC without another turn`, async context => {
