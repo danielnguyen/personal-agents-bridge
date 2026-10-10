@@ -8,6 +8,10 @@ import { createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { DatabaseSync } from 'node:sqlite';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
+import { LocalCodexBackend } from '../local-codex-backend.mjs';
 
 class FakeLocal {
   constructor(options, mode = {}) { this.options = options; this.mode = mode; this.calls = []; }
@@ -29,6 +33,13 @@ class FakeLocal {
     if (terminal) this.emit('terminal_observed', { status });
     this.resolve({ ...this.identity, status, commands: [{ command: 'untrusted test', exitCode: 0 }], messages: [], uncertainties: ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
   }
+  respondToRequest(input) {
+    this.mode.onDeliver?.(input);
+    this.calls.push('respond'); this.responses ||= []; this.responses.push(input);
+    this.emit('human_response_submitting', { request: { id: input.requestId } });
+    if (this.mode.deliveryFails) throw Error('Synthetic transport loss');
+    this.emit('human_response_sent', { request: { id: input.requestId } });
+  }
   async cancel() { this.calls.push('cancel'); if (!this.mode.ignoreCancel && this.resolve) this.finish('interrupted'); }
   async close() { this.calls.push('close'); if (this.mode.closeFails) return false; if (this.resolve && !this.identity.terminalObserved) this.finish('interrupted', false); return true; }
 }
@@ -44,7 +55,7 @@ async function setup(context, mode = {}, options = {}) {
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'uncommitted owner work\n');
   const api = new FakeAPI(), executor = new FakeExecutor(), instances = [];
   const config = { stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'), executor, secrets: ['test-sensitive-value'],
-    ...(options.noApi ? {} : { api }), localBackendFactory: backendOptions => { const instance = new FakeLocal(backendOptions, mode); instances.push(instance); return instance; } };
+    ...(options.noApi ? {} : { api }), localBackendFactory: options.localBackendFactory || (backendOptions => { const instance = new FakeLocal(backendOptions, mode); instances.push(instance); return instance; }) };
   const controller = await new Controller(config).init();
   await fs.writeFile(path.join(controller.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   context.after(async () => { await controller.close(); await fs.rm(root, { recursive: true, force: true }); });
@@ -133,18 +144,16 @@ test('request retries do not execute twice or permit changing a task backend', a
   assert.equal(value.api.created.length, 0); assert.equal(value.controller.task(started.task_id).execution_backend, 'local_codex');
 });
 
-for (const method of ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput', 'item/permissions/requestApproval']) test(`human request ${method} cannot approve itself or become task success`, async context => {
+for (const method of ['item/permissions/requestApproval']) test(`human request ${method} cannot approve itself or become task success`, async context => {
   const value = await setup(context), started = await value.start(), backend = await value.running();
   const params = { command: 'test-sensitive-value token=private https://private.invalid ' + 'x'.repeat(5000), questions: [{ id: 'question', question: 'Which name?' }] };
-  backend.emit('human_request', { request: { method, params } });
+  backend.emit('human_request', { request: { id: 42, method, params: { ...params, threadId: 'thread-fixture', turnId: 'turn-fixture' } } });
   assert.equal(backend.input.signal.aborted, true);
-  assert.equal(backend.options.onApproval({ method, ...params }), 'decline');
-  assert.throws(() => backend.options.onQuestion(params), /LOCAL_CLARIFICATION_UNSUPPORTED/);
   backend.finish('completed'); await value.drain();
   const result = await value.controller.get(started.task_id);
   assert.equal(result.state, 'needs_attention'); assert.equal(result.implementer.human_attention_required, true);
-  assert.equal(result.implementer.local.human_requests[0].resolution, 'unsupported_no_human_answer');
-  assert(result.implementer.local.human_requests[0].summary.length <= 1024);
+  assert.equal(result.implementer.local.human_requests[0].diagnostic, 'UNSUPPORTED_HUMAN_REQUEST');
+  assert(result.implementer.local.human_requests[0].summary.length <= 4096);
   assert(!JSON.stringify(result).includes('test-sensitive-value')); assert(!JSON.stringify(result).includes('token=private'));
 });
 
@@ -235,7 +244,7 @@ test('shutdown bounds an unresponsive cancel request, closes execution, and pres
 
 test('local continue, review and publish reject explicitly without downstream API or publication work', async context => {
   const value = await setup(context), started = await value.start(); await value.running();
-  await assert.rejects(value.controller.continue({ task_id: started.task_id, instruction: 'answer', request_id: 'next_request' }), /LOCAL_CONTINUE_UNSUPPORTED/);
+  await assert.rejects(value.controller.continue({ task_id: started.task_id, instruction: 'answer', request_id: 'next_request' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
   await assert.rejects(value.controller.review({ task_id: started.task_id, request_id: 'review_request' }), /LOCAL_REVIEW_UNSUPPORTED/);
   await assert.rejects(value.controller.publish({ task_id: started.task_id, title: 'not allowed' }), /LOCAL_PUBLISH_UNSUPPORTED/);
   assert.equal(value.api.created.length, 0); assert.equal(value.controller.task(started.task_id).reviewer, undefined);
@@ -255,4 +264,286 @@ test('MCP exposes explicit local opt-in and persisted state without adding opera
   const result = await client.callTool({ name: 'get_task', arguments: { task_id: started.structuredContent.task_id } });
   assert.equal(result.structuredContent.execution_backend, 'local_codex'); assert.equal(result.structuredContent.implementer.local.model, 'gpt-6-astra');
   assert.equal(value.api.created.length, 0);
+});
+
+async function waiting(context, method = 'item/commandExecution/requestApproval', mode = {}) {
+  const value = await setup(context, mode, { noApi: true });
+  const started = await value.start(), backend = await value.running();
+  const params = { threadId: 'thread-fixture', turnId: 'turn-fixture', command: 'node --version', itemId: 'item-fixture',
+    questions: [{ id: 'scope', header: 'Scope', question: 'Which file?', isOther: false, options: [{ label: 'fixture.txt', description: 'Only the fixture' }] }] };
+  backend.emit('human_request', { request: { id: 0, method, params } });
+  const request = (await value.controller.get(started.task_id)).implementer.pending_human_requests[0];
+  const response = (answer = { decision: 'accept' }, operation = 'human_response_1', changes = {}) => ({ task_id: started.task_id, request_id: operation,
+    human_response: { request_ref: request.request_ref, thread_id: request.thread_id, turn_id: request.turn_id, ...answer, ...changes } });
+  return { ...value, started, backend, request, response };
+}
+
+for (const method of ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput']) test(`durably pending ${method} exposes exact sanitized correlation, not native IDs`, async context => {
+  const value = await waiting(context, method), { controller, started, request, backend } = value;
+  const stored = JSON.parse(controller.db.prepare('SELECT value FROM tasks WHERE id=?').get(started.task_id).value).implementer.local.human_requests[0];
+  assert.equal(stored.native_request_id, 0); assert.equal(stored.task_id, started.task_id);
+  assert.equal(stored.start_operation_id, value.input.request_id); assert.equal(stored.status, 'pending');
+  const view = await controller.get(started.task_id);
+  assert.equal(view.state, method.endsWith('requestUserInput') ? 'waiting_for_clarification' : 'waiting_for_approval');
+  assert.equal(view.implementer.human_attention_required, true); assert.equal(view.implementer.local.terminal_observed, false);
+  assert.equal(request.request_ref, stored.request_ref); assert.equal(request.thread_id, 'thread-fixture'); assert.equal(request.turn_id, 'turn-fixture');
+  assert(!JSON.stringify(view).includes('native_request_id')); assert.equal(backend.responses, undefined);
+  assert.equal(backend.options.deferHumanRequests, true); assert.equal(backend.input.signal.aborted, false);
+  assert.equal(controller._api, undefined);
+});
+
+for (const decision of ['accept', 'decline', 'cancel']) test(`explicit ${decision} persists before callback release without creating another execution`, async context => {
+  const mode = {}, value = await waiting(context, 'item/commandExecution/requestApproval', mode);
+  mode.onDeliver = input => {
+    const stored = value.controller.task(value.started.task_id).implementer.local.human_requests[0];
+    assert.equal(stored.status, 'responding'); assert.equal(stored.delivery, 'prepared'); assert.deepEqual(stored.response, { decision });
+    assert.equal(stored.operation_id, 'human_response_1');
+    assert.equal(value.controller.db.prepare('SELECT status FROM operations WHERE id=?').get(stored.operation_id).status, 'submitting');
+    assert.equal(input.requestId, 0); assert.equal(input.threadId, 'thread-fixture'); assert.equal(input.turnId, 'turn-fixture');
+  };
+  await value.controller.continue(value.response({ decision }));
+  assert.equal(value.backend.responses.length, 1); assert.equal(value.instances.length, 1);
+  assert.equal(value.backend.calls.filter(call => call === 'run').length, 1);
+  value.backend.emit('human_request_resolved', { request: { id: 0 } });
+  value.backend.finish(decision === 'cancel' ? 'interrupted' : 'completed'); await value.drain();
+  const view = await value.controller.get(value.started.task_id);
+  assert.equal(view.state, decision === 'cancel' ? 'interrupted' : 'completed');
+  assert.equal(view.implementer.local.human_requests[0].status, 'resolved');
+  assert.equal(view.implementer.local.human_requests[0].delivery, 'server_cleared');
+  assert(!Object.hasOwn(view.implementer.local.human_requests[0], 'response'));
+  assert.equal(value.controller._api, undefined);
+});
+
+test('clarifications preserve exact question IDs/options and reject malformed or additional answers', async context => {
+  const value = await waiting(context, 'item/tool/requestUserInput');
+  assert.equal(value.request.questions[0].id, 'scope'); assert.equal(value.request.questions[0].options[0].label, 'fixture.txt');
+  for (const answer of [{ decision: 'accept' }, { answers: {} }, { answers: { wrong: { answers: ['fixture.txt'] } } },
+    { answers: { scope: { answers: ['not an option'] } } }, { answers: { scope: { answers: [] } } },
+    { answers: { scope: { answers: ['fixture.txt'], extra: true } } }, { answers: { scope: { answers: ['fixture.txt'] }, extra: { answers: ['x'] } } }]) {
+    await assert.rejects(value.controller.continue(value.response(answer)), /LOCAL_HUMAN_RESPONSE_INVALID/);
+  }
+  const answers = { scope: { answers: ['fixture.txt'] } };
+  await value.controller.continue(value.response({ answers }));
+  assert.deepEqual(value.backend.responses[0].response, { answers });
+  value.backend.finish(); await value.drain();
+  assert.equal((await value.controller.get(value.started.task_id)).state, 'completed');
+});
+
+test('duplicate operation retries deliver once; conflicting and new-operation duplicate replies fail closed', async context => {
+  const value = await waiting(context), input = value.response();
+  await Promise.all([value.controller.continue(input), value.controller.continue(input)]);
+  assert.equal(value.backend.responses.length, 1);
+  await assert.rejects(value.controller.continue(value.response({ decision: 'decline' })), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+  await assert.rejects(value.controller.continue(value.response({ decision: 'accept' }, 'different_operation')), /LOCAL_PENDING_REQUEST_NOT_FOUND/);
+  value.backend.finish(); await value.drain();
+  await value.controller.continue(input); assert.equal(value.backend.responses.length, 1);
+});
+
+test('free prose, invalid decisions and wrong task/thread/turn/request identity never release approval', async context => {
+  const value = await waiting(context);
+  for (const decision of ['yes', 'sounds good', 'proceed', 'acceptForSession', true, null]) {
+    await assert.rejects(value.controller.continue(value.response({ decision })), /LOCAL_HUMAN_RESPONSE_INVALID/);
+  }
+  await assert.rejects(value.controller.continue({ ...value.response(), instruction: 'yes' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
+  for (const changes of [{ request_ref: 'wrong' }, { thread_id: 'wrong' }, { turn_id: 'wrong' }, { native_request_id: 0 }]) {
+    await assert.rejects(value.controller.continue(value.response({ decision: 'accept' }, 'identity_check', changes)), /LOCAL_(PENDING_REQUEST_NOT_FOUND|CALLBACK_IDENTITY_MISMATCH|STRUCTURED_RESPONSE_REQUIRED)/);
+  }
+  const other = await value.controller.start({ ...value.input, request_id: 'second_task_request' }); await value.running(1);
+  await assert.rejects(value.controller.continue({ ...value.response(), task_id: other.task_id }), /LOCAL_PENDING_REQUEST_NOT_FOUND/);
+  assert.equal(value.backend.responses, undefined);
+});
+
+test('transaction failure rolls back operation and authorization before any callback delivery', async context => {
+  const value = await waiting(context), save = value.controller.save.bind(value.controller);
+  value.controller.save = task => {
+    if (task.implementer.local.human_requests[0]?.response) throw Error('Storage unavailable');
+    save(task);
+  };
+  await assert.rejects(value.controller.continue(value.response()), /LOCAL_RESPONSE_PERSISTENCE_FAILED/);
+  value.controller.save = save;
+  assert.equal(value.backend.responses, undefined);
+  assert.equal(value.controller.task(value.started.task_id).implementer.local.human_requests[0].status, 'pending');
+  assert.equal(value.controller.db.prepare('SELECT * FROM operations WHERE id=?').get('human_response_1'), undefined);
+});
+
+test('failed initial request persistence cannot expose or release an unrecorded callback', async context => {
+  const value = await setup(context), started = await value.start(), backend = await value.running(), save = value.controller.save.bind(value.controller);
+  value.controller.save = task => { if (task.implementer.local.human_requests.length) throw Error('storage unavailable'); save(task); };
+  assert.throws(() => backend.emit('human_request', { request: { id: 0, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-fixture', turnId: 'turn-fixture', command: 'node --version' } } }), /storage unavailable/);
+  value.controller.save = save;
+  assert.deepEqual((await value.controller.get(started.task_id)).implementer.pending_human_requests, []);
+  assert.equal(backend.responses, undefined);
+});
+
+test('native decision limits and private question bounds fail closed', async context => {
+  const value = await waiting(context);
+  value.backend.emit('human_request', { request: { id: 1, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-fixture', turnId: 'turn-fixture', command: 'node --version', availableDecisions: ['decline', 'cancel'] } } });
+  const request = (await value.controller.get(value.started.task_id)).implementer.pending_human_requests[1];
+  assert.deepEqual(request.decisions, ['decline', 'cancel']);
+  await assert.rejects(value.controller.continue(value.response({ decision: 'accept' }, 'restricted_decision', { request_ref: request.request_ref })), /LOCAL_HUMAN_RESPONSE_INVALID/);
+  for (const question of [{ id: 'scope', question: 'Password?', isSecret: true }, { id: 'token=private', question: 'Which file?' },
+    { id: 'scope', question: 'test-sensitive-value' }, { id: 'scope', question: 'x'.repeat(2001) },
+    { id: 'scope', question: 'Which file?', options: [{ label: 'token=private' }] }]) {
+    assert.throws(() => value.backend.emit('human_request', { request: { id: 2, method: 'item/tool/requestUserInput',
+      params: { threadId: 'thread-fixture', turnId: 'turn-fixture', questions: [question] } } }), /LOCAL_QUESTION/);
+  }
+  assert.equal(value.backend.responses, undefined);
+});
+
+test('uncertain delivery is durable and never automatically resent, including identical retries', async context => {
+  const value = await waiting(context, 'item/commandExecution/requestApproval', { deliveryFails: true });
+  await assert.rejects(value.controller.continue(value.response()), /LOCAL_RESPONSE_DELIVERY_UNCERTAIN/);
+  const record = value.controller.task(value.started.task_id).implementer.local.human_requests[0];
+  assert.equal(record.status, 'uncertain'); assert.equal(record.delivery, 'attempted');
+  assert.equal(value.controller.db.prepare('SELECT status FROM operations WHERE id=?').get('human_response_1').status, 'uncertain');
+  await value.controller.continue(value.response()); assert.equal(value.backend.responses.length, 1);
+  value.backend.finish('interrupted'); await value.drain();
+  assert.equal((await value.controller.get(value.started.task_id)).state, 'needs_attention');
+});
+
+for (const event of ['server_resolved', 'completed', 'interrupted']) test(`${event} invalidates pending callbacks without fabricated human replies`, async context => {
+  const value = await waiting(context);
+  if (event === 'server_resolved') value.backend.emit('human_request_resolved', { request: { id: 0 } });
+  else { value.backend.finish(event); await value.drain(); }
+  await assert.rejects(value.controller.continue(value.response()), /LOCAL_(PENDING_REQUEST_NOT_FOUND|CALLBACK_NOT_ACTIVE)/);
+  assert.equal((await value.controller.get(value.started.task_id)).state, 'needs_attention');
+  assert.equal(value.backend.responses, undefined);
+});
+
+for (const action of ['cleanup', 'close', 'expire']) test(`${action} cancels a pending human request without waiting for an answer`, async context => {
+  const value = await waiting(context);
+  if (action === 'cleanup') await value.controller.cleanup({ task_id: value.started.task_id });
+  if (action === 'close') await value.controller.close();
+  if (action === 'expire') {
+    const task = value.controller.task(value.started.task_id); task.deadline = 0; value.controller.save(task);
+    await assert.rejects(value.controller.continue(value.response()), /LOCAL_CALLBACK_NOT_ACTIVE/);
+    await value.controller.expire();
+  }
+  assert(value.backend.calls.includes('cancel')); assert(value.backend.calls.includes('close')); assert.equal(value.backend.responses, undefined);
+  if (action !== 'close') {
+    assert.equal(value.controller.task(value.started.task_id).implementer.local.human_requests[0].status, 'interrupted');
+    await assert.rejects(value.controller.continue(value.response()), /LOCAL_CALLBACK_NOT_ACTIVE/);
+  }
+});
+
+for (const delivery of ['pending', 'prepared', 'sent_unconfirmed']) test(`restart preserves ${delivery} callback identity without replay or reattachment`, async context => {
+  const value = await waiting(context), snapshot = value.controller.task(value.started.task_id), request = snapshot.implementer.local.human_requests[0];
+  if (delivery !== 'pending') { request.status = 'responding'; request.delivery = delivery; request.response = { decision: 'accept' }; }
+  await value.controller.close();
+  const database = new DatabaseSync(path.join(value.controller.stateRoot, 'controller.sqlite'));
+  database.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(snapshot), snapshot.id); database.close();
+  const recovered = await new Controller(value.config).init();
+  try {
+    const view = await recovered.get(snapshot.id), saved = recovered.task(snapshot.id).implementer.local.human_requests[0];
+    assert.equal(view.state, 'needs_attention'); assert.equal(saved.native_request_id, 0); assert.equal(saved.request_ref, request.request_ref);
+    assert.equal(saved.status, delivery === 'pending' ? 'interrupted' : 'uncertain');
+    assert.equal(saved.diagnostic, 'LOCAL_RESTART_CALLBACK_UNAVAILABLE');
+    await assert.rejects(recovered.continue(value.response()), /LOCAL_PENDING_REQUEST_NOT_FOUND/);
+    assert.equal(value.instances.length, 1); assert.equal(value.backend.responses, undefined);
+  } finally { await recovered.close(); }
+});
+
+test('redacted/truncated approval descriptions cannot authorize hidden operations', async context => {
+  const value = await waiting(context);
+  value.backend.emit('human_request', { request: { id: 'private-token=private', method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-fixture', turnId: 'turn-fixture', command: 'test-sensitive-value token=private https://private.invalid ' + 'x'.repeat(5000) } } });
+  const view = await value.controller.get(value.started.task_id), request = view.implementer.pending_human_requests[1];
+  assert.equal(request.description_incomplete, true); assert(!JSON.stringify(view).includes('token=private'));
+  assert(!JSON.stringify(view).includes('private-token'));
+  await assert.rejects(value.controller.continue(value.response({ decision: 'accept' }, 'second_response', { request_ref: request.request_ref })), /LOCAL_APPROVAL_DESCRIPTION_INCOMPLETE/);
+  await value.controller.continue(value.response({ decision: 'decline' }, 'second_response', { request_ref: request.request_ref }));
+  assert.equal(value.backend.responses[0].requestId, 'private-token=private');
+});
+
+test('MCP routes structured human replies and preserves unsupported review/publication gates', async context => {
+  const value = await waiting(context), server = createServer(value.controller, async () => {});
+  const client = new Client({ name: 'human-response-test', version: '1' }), [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport); await client.connect(clientTransport);
+  context.after(async () => { await client.close(); await server.close(); });
+  const get = await client.callTool({ name: 'get_task', arguments: { task_id: value.started.task_id } });
+  assert.equal(get.structuredContent.state, 'waiting_for_approval');
+  assert(!JSON.stringify(get).includes('native_request_id'));
+  for (const answer of [{ decision: 'proceed' }, { decision: 'accept', answers: {} }, { native_request_id: 0, decision: 'accept' }]) {
+    const invalid = await client.callTool({ name: 'continue_task', arguments: value.response(answer) }); assert.equal(invalid.isError, true);
+  }
+  const continued = await client.callTool({ name: 'continue_task', arguments: value.response() });
+  assert.equal(continued.isError, undefined); assert.equal(value.backend.responses.length, 1);
+  const retry = await client.callTool({ name: 'continue_task', arguments: value.response() }); assert.equal(retry.isError, undefined);
+  assert.equal(value.backend.responses.length, 1);
+  await assert.rejects(value.controller.review({ task_id: value.started.task_id, request_id: 'still_no_review' }), /LOCAL_REVIEW_UNSUPPORTED/);
+  await assert.rejects(value.controller.publish({ task_id: value.started.task_id, title: 'No publication' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+});
+
+for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real Controller and adapter route ${kind} via mocked native RPC without another turn`, async context => {
+  const calls = [], replies = [];
+  let controller, taskId, child;
+  const native = 'private-native-request';
+  const method = kind === 'file' ? 'item/fileChange/requestApproval' : kind === 'question' ? 'item/tool/requestUserInput' : 'item/commandExecution/requestApproval';
+  const value = await setup(context, {}, { noApi: true, localBackendFactory: options => new LocalCodexBackend({ ...options,
+    spawnProcess: (binary, args, config) => {
+      child = new EventEmitter(); child.stdout = new PassThrough();
+      const send = message => child.stdout.write(JSON.stringify(message) + '\n');
+      child.kill = () => { if (!child.dead) { child.dead = true; queueMicrotask(() => child.emit('close', 0)); } };
+      child.stdin = new Writable({ write(chunk, encoding, callback) {
+        const message = JSON.parse(String(chunk));
+        if (!message.method) {
+          const saved = controller.task(taskId).implementer.local.human_requests[0];
+          assert.equal(saved.status, 'responding'); assert.equal(saved.delivery, 'attempted');
+          assert.deepEqual(saved.response, message.result); assert.equal(saved.native_request_id, message.id);
+          replies.push(message);
+          if (kind === 'transport_loss') child.kill();
+          else {
+            send({ method: 'serverRequest/resolved', params: { threadId: 'native-thread', requestId: native } });
+            send({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn', status: 'completed' } } });
+          }
+          callback(); return;
+        }
+        if (message.id !== undefined) {
+          calls.push(message.method);
+          queueMicrotask(() => {
+            let result;
+            if (message.method === 'initialize') result = { codexHome: config.env.CODEX_HOME };
+            else if (message.method === 'config/read') result = { config: { model_provider: 'openai', chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+              sandbox_mode: 'workspace-write', sandbox_workspace_write: { network_access: false }, approval_policy: 'on-request', approvals_reviewer: 'user', web_search: 'disabled',
+              shell_environment_policy: { inherit: 'none', set: { PATH: '/usr/local/bin:/usr/bin:/bin' } },
+              features: { apps: false, plugins: false, hooks: false, multi_agent: false, remote_control: false, api_key_model_discovery: false } } };
+            else if (message.method === 'account/read') result = { account: { type: 'chatgpt', email: 'fixture@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true };
+            else if (message.method === 'model/list') result = { data: [{ id: 'model', model: 'gpt-6-astra', isDefault: true, hidden: false }], nextCursor: null };
+            else if (message.method === 'thread/start') result = { thread: { id: 'native-thread', turns: [] }, model: 'gpt-6-astra', cwd: options.cwd, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', networkAccess: false } };
+            else if (message.method === 'turn/start') {
+              result = { turn: { id: 'native-turn', status: 'inProgress' } };
+              setImmediate(() => send({ id: native, method, params: { threadId: 'native-thread', turnId: 'native-turn', command: 'node --version', reason: 'Write fixture.txt',
+                questions: [{ id: 'scope', question: 'Which file?', options: [{ label: 'fixture.txt' }], isOther: false }] } }));
+            } else assert.fail(`Unexpected RPC ${message.method}`);
+            send({ id: message.id, result });
+          });
+        }
+        callback();
+      } });
+      return child;
+    } }) });
+  controller = value.controller;
+  taskId = (await value.start()).task_id;
+  let request;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    request = (await controller.get(taskId)).implementer.pending_human_requests[0];
+    if (request) break;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert(request); assert.equal(replies.length, 0);
+  const input = { task_id: taskId, request_id: 'real_adapter_response', human_response: { request_ref: request.request_ref,
+    thread_id: request.thread_id, turn_id: request.turn_id, ...(kind === 'question' ? { answers: { scope: { answers: ['fixture.txt'] } } } : { decision: 'accept' }) } };
+  await controller.continue(input); await value.drain();
+  const view = await controller.get(taskId);
+  assert.equal(view.implementer.local.thread_id, 'native-thread'); assert.equal(view.implementer.local.turn_id, 'native-turn');
+  assert.equal(view.state, kind === 'transport_loss' ? 'needs_attention' : 'completed');
+  assert.equal(view.implementer.local.human_requests[0].status, kind === 'transport_loss' ? 'uncertain' : 'resolved');
+  assert.equal(view.implementer.local.terminal_observed, kind !== 'transport_loss');
+  assert.equal(replies.length, 1); assert.equal(replies[0].id, native);
+  await controller.continue(input); assert.equal(replies.length, 1);
+  assert.equal(calls.filter(method => method === 'thread/start').length, 1); assert.equal(calls.filter(method => method === 'turn/start').length, 1);
+  assert.equal(controller._api, undefined); assert.equal(value.executor.started.length, 0);
+  assert.equal(view.implementer.local.server_closed, true);
 });
