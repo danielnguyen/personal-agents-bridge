@@ -36,7 +36,8 @@ is constructed lazily; local-only controller operation does not require an infer
 `OPENAI_API_KEY`. Existing tunnel authorization credentials are still independently
 required and unchanged.
 
-This slice supports **start → get → cleanup only**. `get_task` reports persisted
+This slice supports **start → get → native human response → same turn → cleanup**.
+`get_task` reports persisted
 `execution_backend` and `implementer.local` observations: phase/execution state,
 thread/turn IDs, model, submission-attempt/acknowledgement flags, terminal observation,
 bounded diagnostics and human-attention requirements. Codex IDs are not Agents API
@@ -50,13 +51,68 @@ attention, with known IDs retained and **no automatic replay**. Completed record
 are retained. A process surviving a controller crash is not automatically reattached
 or killed: unknown ownership/termination remains a cleanup blocker.
 
-Native approval/clarification requests are bounded and redacted in task state,
-never automatically approved or answered, and trigger interruption. Such tasks
-cannot become successful merely because the model later completes. Local
-`continue_task`, `review_task`, and `publish_task` fail explicitly with
-`LOCAL_CONTINUE_UNSUPPORTED`, `LOCAL_REVIEW_UNSUPPORTED`, and
-`LOCAL_PUBLISH_UNSUPPORTED`. Human delivery/resumption is deferred to PR #6;
-independent review and publication need separate evidence integration.
+### Durable native human requests
+
+Command/file approvals and `item/tool/requestUserInput` requests remain pending in
+the original live turn. The synchronous lifecycle callback saves each request in
+the existing SQLite task record before exposing it. Raw JSON-RPC request IDs and
+accepted response contents remain private. MCP exposes an opaque `request_ref`,
+task/thread/turn IDs, request method, bounded description, expected response type,
+available decisions or exact question IDs/options, status and delivery diagnostics.
+Model prose never creates an authoritative pending request.
+
+`get_task` returns `waiting_for_approval` or `waiting_for_clarification`, with
+`human_attention_required: true` and `implementer.pending_human_requests`.
+Obtain the human's explicit response, then call the existing `continue_task`:
+
+```json
+{
+  "task_id": "task_<returned UUID>",
+  "request_id": "unique_human_response_operation",
+  "human_response": {
+    "request_ref": "<returned request UUID>",
+    "thread_id": "<returned thread ID>",
+    "turn_id": "<returned turn ID>",
+    "decision": "accept"
+  }
+}
+```
+
+Approvals require `accept`, `decline` or `cancel` (also constrained by native
+available decisions); prose such as "yes" is not a decision. For clarification,
+replace `decision` with `"answers":{"<exact question ID>":{"answers":["human answer"]}}`.
+Every question must be answered, with no extra IDs. Advertised options are required
+unless the question allows free text. Do not send `instruction` for local replies;
+Agents API continuation still uses its existing `instruction` input unchanged.
+
+The Controller records the response, original native identity and operation
+fingerprint atomically before releasing the callback. The adapter sends exactly
+one JSON-RPC response to that request, not another `turn/start` or thread. Identical
+operation retries return current state without redelivery; conflicting input or a
+new operation answering an already handled request fails. Responses cannot change
+task ownership or thread/turn binding. Waiting never extends the task deadline.
+
+Delivery states distinguish durable preparation, attempted write, unconfirmed
+write, and server clearing. **SQLite commit and pipe delivery are not atomic.** A
+crash or transport/storage failure between them leaves uncertain delivery, never
+an automatic resend. Pipe writes are not remote acknowledgements. As documented
+by [Codex app-server](https://developers.openai.com/codex/app-server),
+`serverRequest/resolved` can mean answered **or cleared**; a clear before a human
+response invalidates the request, not an implicit approval. A server-side clear
+can also race a response already being written; no exactly-once remote-consumption
+guarantee is claimed. Only a real terminal observation completes execution.
+
+Restart retains request identity and marks pending/intermediate delivery for
+attention; persisted JSON cannot recreate a native callback. Cleanup, expiration
+and shutdown invalidate requests and stop execution without waiting for human
+answers. Unsupported request types, secret-input questions, unrepresentable
+questions/options and overflow fail closed. Approvals with incomplete/redacted
+descriptions cannot be accepted (decline/cancel remain available). There are at
+most 32 requests per turn, eight questions per request and 20 options per question.
+
+Post-completion/new-turn continuation and restart reattachment remain unsupported.
+Local `review_task` and `publish_task` still reject with `LOCAL_REVIEW_UNSUPPORTED`
+and `LOCAL_PUBLISH_UNSUPPORTED`; separate evidence integration is required.
 
 Cleanup initiates cancellation before waiting on a local job, closes the owned
 app-server, and bounds each wait. Shutdown does the same. Files remain unless
@@ -117,6 +173,12 @@ pre-dispatch submission intent, turn acknowledgement, terminal observation and
 human requests. It exposes no account credentials; human request payloads remain
 private and must be bounded/redacted by the receiver. Throwing or returning a
 promise fails closed rather than allowing unsaved identity to advance.
+The Controller sets `deferHumanRequests: true`: supported callbacks remain in the
+adapter until `respondToRequest({requestId, threadId, turnId, response})`, cancellation
+or terminal completion. This synchronous method accepts only the original active
+native callback identity. Lifecycle events include the native ID, response dispatch
+and server clearing. Standalone `onApproval`/`onQuestion` behavior remains available
+when deferral is disabled; no pending controller callback promises are introduced.
 
 **Accepted limitation:** native approvals do not intercept every in-sandbox action.
 File scope, asking before dependency changes/destruction/secret reads/network or

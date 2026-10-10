@@ -8,6 +8,26 @@ const text = value => typeof value === 'string' && value.length > 0;
 const limit = 1024 * 1024;
 const endpoint = 'https://chatgpt.com/backend-api/';
 const features = { apps: false, plugins: false, hooks: false, multi_agent: false, remote_control: false, api_key_model_discovery: false };
+export const humanRequestMethods = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput'];
+const nativeId = value => (text(value) && value.length <= 200) || Number.isSafeInteger(value);
+export function validateHumanResponse(method, questions, response, decisions = ['accept', 'decline', 'cancel']) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!object(response)) throw error('INVALID_HUMAN_RESPONSE');
+  if (humanRequestMethods.slice(0, 2).includes(method)) {
+    if (Object.keys(response).length !== 1 || !['accept', 'decline', 'cancel'].includes(response.decision) || !Array.isArray(decisions) || !decisions.includes(response.decision)) throw error('INVALID_APPROVAL_DECISION');
+  } else if (method === 'item/tool/requestUserInput') {
+    const answers = response.answers;
+    if (Object.keys(response).length !== 1 || !object(answers) || !Array.isArray(questions) || !questions.length || questions.length > 8 ||
+        new Set(questions.map(question => question.id)).size !== questions.length || Object.keys(answers).length !== questions.length ||
+        questions.some(question => !text(question.id) || !Object.hasOwn(answers, question.id) || !object(answers[question.id]) ||
+          Object.keys(answers[question.id]).length !== 1 || !Array.isArray(answers[question.id].answers) ||
+          !answers[question.id].answers.length || answers[question.id].answers.length > 10 ||
+          answers[question.id].answers.some(answer => !text(answer) || !answer.trim() || answer.length > 4000 ||
+            (question.options?.length && question.isOther !== true && !question.options.some(option => option.label === answer)))) ||
+        JSON.stringify(response).length > 16000) throw error('INVALID_CLARIFICATION_ANSWER');
+  } else throw error('UNSUPPORTED_HUMAN_REQUEST');
+  return response;
+}
 export const APPROVAL_LIMITATION = 'Native approval requests are handled; in-sandbox sensitive operations and file scope are behavioral restrictions, not universal pre-execution enforcement.';
 export const INSTRUCTIONS = `Work only in the approved repository and file scope. Read code, edit approved files and run ordinary tests, builds and linters autonomously.
 Before dependency installation or updates, destructive operations, credential or secret access, network access beyond the model service (including LAN/Tailscale), or changes outside the approved scope, ask the human and wait. If no approval channel is available, stop and explain the requested operation. Never assume approval.
@@ -109,11 +129,12 @@ class Rpc {
 
 export class LocalCodexBackend {
   constructor({ cwd, codexPath = 'codex', codexHome, env = process.env, onApproval, onQuestion, onProgress, onLifecycle,
-    timeoutMs = 180000, spawnProcess = spawn } = {}) {
+    timeoutMs = 180000, spawnProcess = spawn, deferHumanRequests = false } = {}) {
     if (!path.isAbsolute(cwd || '')) throw error('ABSOLUTE_WORKSPACE_REQUIRED');
     this.cwd = cwd; this.binary = codexPath; this.env = childEnvironment(env, codexHome);
     this.onApproval = onApproval; this.onQuestion = onQuestion; this.onProgress = onProgress;
     this.onLifecycle = onLifecycle;
+    this.deferHumanRequests = deferHumanRequests;
     this.timeoutMs = timeoutMs; this.spawnProcess = spawnProcess; this.busy = false; this.closed = false;
   }
   async connect() {
@@ -200,7 +221,7 @@ export class LocalCodexBackend {
       await this.checkRoute();
       let resolve;
       const done = new Promise(callback => { resolve = callback; });
-      this.active = { result, resolve, items: new Map(), requests: new Set(), early: [], settled: false, eventCount: 0 };
+      this.active = { result, resolve, items: new Map(), requests: new Set(), humanRequests: new Map(), early: [], settled: false, eventCount: 0 };
       abort = () => { this.cancel().catch(() => {}); };
       signal?.addEventListener('abort', abort, { once: true });
       timer = setTimeout(abort, this.timeoutMs);
@@ -247,10 +268,18 @@ export class LocalCodexBackend {
     }
     if (params.threadId && params.threadId !== active.result.threadId) return this.rpc.fail('EVENT_THREAD_MISMATCH');
     if (params.turnId && params.turnId !== active.result.turnId) return this.rpc.fail('EVENT_TURN_MISMATCH');
-    if (message.method === 'serverRequest/resolved') active.requests.delete(params.requestId);
+    if (message.method === 'serverRequest/resolved') {
+      if (params.threadId !== active.result.threadId || !nativeId(params.requestId) || !active.humanRequests.has(params.requestId)) return this.rpc.fail('REQUEST_RESOLUTION_MISMATCH');
+      active.requests.delete(params.requestId);
+      try { this.lifecycle('human_request_resolved', active.result, { request: { id: params.requestId } }); }
+      catch { return this.rpc.fail('LIFECYCLE_HANDLER_FAILED'); }
+    }
     if (message.id !== undefined) {
-      if (active.requests.has(message.id)) return this.rpc.fail('DUPLICATE_SERVER_REQUEST');
+      if (!nativeId(message.id)) return this.rpc.fail('INVALID_SERVER_REQUEST_ID');
+      if (active.humanRequests.has(message.id)) return this.rpc.fail('DUPLICATE_SERVER_REQUEST');
+      if (active.humanRequests.size >= 32) return this.rpc.fail('HUMAN_REQUEST_LIMIT');
       active.requests.add(message.id);
+      active.humanRequests.set(message.id, structuredClone(message));
       this.approve(message, active).catch(() => {
         active.result.uncertainties.push('Approval or clarification handler failed.');
         if (this.active === active && !active.settled) this.cancel().catch(() => {});
@@ -304,8 +333,9 @@ export class LocalCodexBackend {
   async approve(message, active) {
     const { id, method, params } = message;
     if (params.threadId !== active.result.threadId || params.turnId !== active.result.turnId) return this.rpc.fail('APPROVAL_IDENTITY_MISMATCH');
-    try { this.lifecycle('human_request', active.result, { request: { method, params } }); }
+    try { this.lifecycle('human_request', active.result, { request: { id, method, params, item: active.items.get(params.itemId)?.item } }); }
     catch { return this.rpc.fail('LIFECYCLE_HANDLER_FAILED'); }
+    if (this.deferHumanRequests && humanRequestMethods.includes(method)) return;
     let result;
     if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(method)) {
       let decision = 'decline';
@@ -324,6 +354,22 @@ export class LocalCodexBackend {
       await this.cancel(); return;
     }
     if (this.active === active && !active.settled && active.requests.delete(id)) this.rpc.send({ id, result });
+  }
+  respondToRequest({ requestId, threadId, turnId, response }) {
+    const active = this.active;
+    if (!this.deferHumanRequests || this.closed || this.rpc?.failure || !active || active.settled || active.cancelling ||
+        threadId !== active.result.threadId || turnId !== active.result.turnId || !active.requests.has(requestId)) throw error('NATIVE_REQUEST_UNAVAILABLE');
+    const request = active.humanRequests.get(requestId);
+    validateHumanResponse(request.method, request.params.questions, response, request.params.availableDecisions ?? undefined);
+    try {
+      this.lifecycle('human_response_submitting', active.result, { request: { id: requestId } });
+      active.requests.delete(requestId);
+      this.rpc.send({ id: requestId, result: response });
+      this.lifecycle('human_response_sent', active.result, { request: { id: requestId } });
+    } catch {
+      this.rpc.fail('HUMAN_RESPONSE_DELIVERY_UNCERTAIN');
+      throw error('HUMAN_RESPONSE_DELIVERY_UNCERTAIN');
+    }
   }
   finish(status, reason) {
     const active = this.active;
