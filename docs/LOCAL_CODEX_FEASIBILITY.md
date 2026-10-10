@@ -15,8 +15,13 @@ section. The previous unauthenticated probe remains unchanged. The original norm
 checkout, dirty files, private predecessor history, production login and backend
 are untouched.
 
-**Current disposition: blocked on an unresolved pre-inference MCP notification.** The
-operator reports completing fresh isolated device login, followed by an attempt
+**Current disposition: NO-GO for authenticated qualification or inference.** The
+networked managed-launcher candidate fails its OS-facility attestation before
+app-server initialization (`MANAGED_OS_FACILITIES_UNVERIFIED`). See the integration
+experiment below. `login` and `run` are now explicitly disabled before root access;
+there is no authorized authenticated zero-inference qualification mode. The earlier
+operator attempt remains blocked on an unidentified pre-inference MCP notification.
+The operator reports completing fresh isolated device login, followed by an attempt
 with configuration and standalone boundary VERIFIED, authentication UNVERIFIED,
 zero model turns submitted, and `RUNTIME_UNCERTAINTY`. The latest report from head
 `fc311b60a7a389db884fc58ddc2c3822bad05b3c` identifies `account_updated` during
@@ -32,7 +37,9 @@ source-level prevention for the configured stdio fixture, including user, truste
 project and CLI override attempts. This does not qualify all plugin/authenticated
 sources or authorize acceptance. The earlier CLI-empty-table clearing conclusion
 is withdrawn: corrected environment-bound tests show that it retains a user server.
-See the managed-requirements experiment below; the acceptance harness is unchanged.
+See the managed-requirements experiment and subsequent integration attempt below.
+The following table preserves the **earlier operator report**, not a successful
+run of the new launcher.
 
 | Criterion | Status | Evidence / outstanding work |
 | --- | --- | --- |
@@ -50,7 +57,8 @@ and command observation mechanism. It connects to a new stdio app-server process
 not a shared daemon. Its default launcher inherits no environment variables:
 `HOME`, `CODEX_HOME`, scratch, PATH, locale and Git settings are explicitly generated.
 API keys, access tokens, proxy/CA overrides and unrelated configuration are never
-forwarded. Authentication files are never copied. `login` refuses an existing
+forwarded. Authentication files are never copied. The retained, currently disabled
+login implementation refuses an existing
 auth file, uses only fresh ChatGPT device login with the file credential store,
 and records a private token-free identity binding after successful login. It never
 submits a turn. A login for an unsupported/unknown/free or explicitly usage-based
@@ -59,7 +67,9 @@ usage attribution.
 
 The entire permission/configuration table is supplied at CLI precedence and checked
 through `config/read` and `configRequirements/read`. Only the known null defaults
-and the forced-ChatGPT login requirement are normalized. Nonempty system, project,
+and the forced-ChatGPT login requirement are normalized. The integrated validator
+additionally requires exactly `featureRequirements:{apps:false,plugins:false}`;
+missing, enabled or additional feature requirements fail closed. Nonempty system, project,
 managed or other user layers, custom providers, alternate base URLs, MCP/plugin
 configuration, unexpected requirements, or differing permissions block inference.
 The model is selected once from the single visible default returned by `model/list`
@@ -76,7 +86,8 @@ using bundled bubblewrap is accepted only verbatim and remains subject to the re
 boundary test; all other configuration warnings fail closed. Disabled remote-control
 status is checked without retaining host/account identifiers.
 
-`run` requires the wrapper's fresh-login marker, validates file ownership/modes,
+The retained inference protocol (currently reachable only in synthetic tests) requires
+the wrapper's fresh-login marker, validates file ownership/modes,
 canonical directories, runtime digest, exact config and fixture bytes, and parses
 only the new home's auth file in memory. It rejects any stored API key or alternate
 authentication mode. No token or account value is printed. Before the first thread
@@ -111,8 +122,9 @@ the next stage or production migration by itself.
 
 ### Running this gate
 
-**The reported failure supersedes the normal sequence below. The operator commands
-are retained as future, separately authorized procedures, not instructions to run
+**The reported failures supersede the historical sequence below. The login/run
+commands now fail with authorization blockers before accessing a root. They
+are retained as design history, not working procedures or instructions to run
 now. Do not access the claimed root, including through `diagnose-auth`. A fresh
 authenticated inference attempt is not yet justified. Offline tests may run.**
 
@@ -602,6 +614,145 @@ The ten targeted runtime controls passed. The requested focused suites passed
 API sessions, API-key usage, login changes, paid live tests, operator-root access,
 host configuration changes or changes to other repositories occurred.
 
+### Managed launcher integration attempt: NO-GO
+
+Starting head: `e687e670a48b8dc2f5782a80c5e8995824d5b156`. Only the authenticated
+feasibility harness, its offline tests and this document change. The previous
+managed-requirements section records the earlier experiment, not the current
+launcher's qualification. No operator root was accessed or reused.
+
+#### Implemented gates, not a qualified launcher
+
+The candidate reuses exactly the earlier `requirements.toml` bytes and documented
+`/etc/codex/requirements.toml` mechanism. The controller owns a separate private
+temporary directory outside the app-server's writable root. It checks policy,
+launcher and bootstrap bytes, root manifest, pinned runtime and parent namespace
+identities; unexpected changes fail closed. This file attestation alone is **not**
+evidence that Codex applied the policy.
+
+Unlike the offline controls' empty `/etc`, the candidate creates a child-only mount
+namespace and a private `/etc` mirror of read-only bind mounts of host entries,
+excluding `codex`. It neither copies their contents nor modifies host mounts/files.
+The private `codex` directory contains only the controller's requirements. The
+model-parent sandbox retains host networking and minimal OS/runtime reads, with
+writes only to the fresh fixture and read-only policy/bootstrap storage.
+The existing model-command permission profile is unchanged: no network, private
+home/auth directories denied, fixture read-only, scratch writable. Parent networking
+is not a tool-network grant. No credential or environment inheritance is added.
+
+Before any app-server initialization the candidate checks the effective namespace,
+requirements digest, preservation of hosts/NSS/resolver/CA-bundle bytes, default CA
+availability, localhost resolution, denied policy writes and rejected writable
+remount. It repeats this bootstrap on each child launch. `verifyStartup()` first
+attempts only `--version`; uncertainty prevents even creating `AppServerRpc`.
+Only a sanitized fixed blocker is emitted; bootstrap stderr is never published.
+
+If startup were to succeed, protocol gates would additionally require the exact
+managed feature requirements, independently disabled apps/plugins from a complete
+`experimentalFeature/list`, controller attestation and a fully empty server/tool
+inventory. Rechecks bracket the retained synthetic inference protocol. Missing,
+malformed, duplicate, paginated or enabled feature records and changed transport
+fail closed. Feature order is immaterial; duplicate identities are not. Known null
+requirements defaults remain normalized; arbitrary managed fields are not accepted.
+
+The existing inventory validator still rejects **every** server record, including
+`disabled` records. A configured-but-denied record proves the negative control's
+suppression, not conformity to an acceptance home with no configured sources.
+No MCP notification allowance was added. Configuration and notification identity
+checks, independent account reconciliation and one-time claims remain intact.
+
+#### Observed startup incompatibility
+
+**Actual candidate result: `MANAGED_OS_FACILITIES_UNVERIFIED`, initialization phase,
+zero threads/turns/claims, authentication and managed application UNVERIFIED.**
+Fresh synthetic fixtures reproduce it without credentials. Controller file
+attestation passes, but the sandbox-visible OS files do not all match the preserved
+host view. Bounded characterization identified differences for `/etc/hosts` and
+`/etc/nsswitch.conf`; explicit read grants did not establish byte preservation and
+were not retained. No file contents, account information or raw errors are evidence
+artifacts. The final test retains the strict comparison and expects the blocker.
+
+This is an **attestation incompatibility**, not proof that DNS or TLS is intrinsically
+broken in Codex. The failure occurs before the functional CA/localhost checks and
+app-server startup. No external DNS lookup, TLS handshake, subscription-service
+request or networked policy-application result was established. Secure coexistence
+under this candidate is therefore UNVERIFIED, not demonstrated impossible for all
+supported designs. We stopped rather than drop the check, broaden permissions or
+invent an alternate launcher. The retained candidate is a reproducible negative
+experiment, **not a safely qualified authenticated execution path**.
+
+The diagnostic still cannot initialize the pinned app-server with its original
+root read-only. Moving the new preflight into a user namespace exposed an old
+warm-cache assumption in the synthetic diagnostic test: outer sandbox setup could
+create UID-specific scratch files in the root. Its outer shell environment now
+points only to the diagnostic's existing separate scratch directory. Root and
+network permissions are unchanged, and the byte/mode snapshot test still requires
+no changes to the synthetic auth root or uncertain claim. Its result remains
+`APP_SERVER_DISCONNECTED`, not successful authentication. Do not use this diagnostic
+on any claimed operator root.
+
+#### Execution-source coverage and authorization
+
+| Source or guarantee | Evidence / status |
+| --- | --- |
+| User, trusted-project and CLI stdio MCP configuration | VERIFIED only in the network-disabled controls: matched fixture startup/tool exposure without policy, no process marker/tools/events with denial; overrides fail |
+| Managed apps/plugins feature pins | VERIFIED effective false in those controls despite true overrides; networked candidate application UNVERIFIED |
+| Networked launcher startup, DNS/TLS preservation and managed application | UNVERIFIED; OS-file attestation blocks before initialization |
+| Plugin-bundled MCP, installed hooks, bundled/remote/workspace plugins | UNVERIFIED; no installed execution fixture qualified |
+| Authenticated apps/connectors, HTTP MCP, cloud policy merge, reload/resume | UNVERIFIED; empty unauthenticated inventory is not coverage |
+| Authentication, inference, subscription usage attribution, live API-key exclusion | All UNVERIFIED; no authenticated execution performed |
+| Complete model-tool sandbox/process/evidence equivalence | UNVERIFIED; unchanged standalone controls are insufficient |
+
+The [managed policy documentation](https://learn.chatgpt.com/docs/enterprise/managed-configuration)
+distinguishes plugin-bundled MCP identity policies under
+`plugins.<plugin>.mcp_servers.<server>` and warns that bundled/workspace plugins are
+separate from curated Git marketplace restrictions. The
+[requirements reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+also describes a plugin allowlist. These rolling capabilities do not constitute
+enforcement evidence for pinned 0.157.1. No untested plugin allowlist, marketplace
+restriction or authenticated integration control was added. The original managed
+feature pins are the only reused proven plugin/app controls; their flags are not
+universal execution-source proof.
+
+`login` fails `AUTHENTICATED_QUALIFICATION_NOT_AUTHORIZED`; `run` and every real
+thread/turn RPC fail `INFERENCE_NOT_AUTHORIZED`. Both CLI entry-point guards run
+before root access. Even a future successful unauthenticated startup/preflight
+must stop at `EXECUTION_SOURCE_COVERAGE_UNVERIFIED`. There is no new authenticated
+zero-inference mode: its startup/isolation prerequisites were not established.
+No claim is created or reset by this experiment. Full mocked inference tests remain
+offline regression tests, not permission to execute their protocol against a model.
+
+**Fresh operator authentication/qualification is not justified. A subsequent single
+inference cannot be authorized.** A reviewed, reproducibly safe DNS/TLS-compatible
+namespace composition and negative execution evidence for the remaining sources
+must precede any separately authorized fresh-home qualification. Billing attribution,
+model-tool validation and independent acceptance review remain later gates. PAB is
+not ready for migration; no merge, deployment or next sandbox stage is authorized.
+
+#### Reproduction
+
+Use the same pinned runtime, Node 24+, Python 3 and Linux namespace prerequisites
+as the previous controls. These commands create only their own synthetic disposable
+fixtures; the managed candidate test is explicitly a **negative** startup result.
+They never submit real model turns or authenticate:
+
+```bash
+node --test --test-name-pattern='managed|diagnostic|preflight|effective feature|changed policy|CLI inference' test/local-codex-authenticated.test.mjs
+node --test test/local-codex-feasibility.test.mjs test/local-codex-authenticated.test.mjs
+npm test
+git diff --check
+```
+
+Validation on the pinned host: **20/20** targeted checks (~25 seconds), **82/82**
+focused tests (~46 seconds), **208/208** full offline tests (~132 seconds), no
+failures/skips, and `git diff --check` passed. The initial focused run exposed the
+diagnostic scratch regression described above; the final rerun preserves the full
+snapshot assertion. Passing the candidate's negative test proves the blocker is
+retained, not successful startup. There were zero real model turns, login flows,
+API-key inference, Agents API calls, paid live tests or operator-root accesses.
+Host configuration, production PAB, dependencies, shared daemons and other
+repositories are unchanged.
+
 ## Scope and reproducibility
 
 Inspected on 2026-10-10:
@@ -891,6 +1042,9 @@ reported one existing high-severity dependency advisory; dependencies are unchan
 and that advisory was not remediated as part of this backend study.
 
 ## Operator-authenticated acceptance (not executed)
+
+**Historical future design only: the current managed-launcher NO-GO supersedes
+these procedures. Do not run login or inference commands below.**
 
 Use a dedicated disposable OS account/VM with no production credentials, a fresh
 Codex home, and a disposable PAB repository fixture. Authenticate there through

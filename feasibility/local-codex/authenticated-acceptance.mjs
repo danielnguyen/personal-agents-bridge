@@ -12,6 +12,7 @@ export const RUNTIME = { version: 'codex-cli 0.157.1', sha256: '3e2584f3f3829a43
 export const FIXTURE = 'PAB_AUTH_ACCEPTANCE_FIXTURE\n';
 export const RESPONSE = 'PAB_AUTH_ACCEPTANCE_OK';
 export const PROFILE = 'pab_auth_readonly';
+export const MANAGED_REQUIREMENTS = 'mcp_servers = {}\n[features]\napps = false\nplugins = false\n';
 const controlledFailure = Symbol('controlledFailure');
 const fail = code => { throw Object.assign(new Error(code), { code, [controlledFailure]: true }); };
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -35,7 +36,7 @@ export function configuration(root, binary) {
       [path.join(root, 'work')]: 'read', [path.join(root, 'scratch')]: 'write',
       [path.join(root, 'codex')]: 'deny', [path.join(root, 'home')]: 'deny' }, network: { enabled: false } } },
     web_search: 'disabled', mcp_servers: {}, plugins: {},
-    features: { apps: false, multi_agent: false, memories: false, hooks: false, remote_plugin: false, shell_snapshot: false, goals: false,
+    features: { apps: false, plugins: false, multi_agent: false, memories: false, hooks: false, remote_plugin: false, shell_snapshot: false, goals: false,
       api_key_model_discovery: false, auth_elicitation: false, background_paginated_rollout_migration: false,
       codex_apps_mcp_2026_07_28: false, mcp_2026_07_28: false, mentions_v2: false, remote_control: false, tool_suggest: false, windows_sandbox_service: false },
     shell_environment_policy: { inherit: 'none', set: { PATH: '/usr/bin:/bin', HOME: path.join(root, 'scratch'), TMPDIR: path.join(root, 'scratch') } },
@@ -95,7 +96,7 @@ async function loginBinding(root) {
 }
 export function validateConfiguration(response, requirements, root, binary) {
   if (!object(response?.config) || !Array.isArray(response.layers) || !response.layers.length || !object(requirements)) fail('CONFIGURATION_UNVERIFIED');
-  same(withoutNulls(requirements.requirements), { allowedLoginMethods: ['chatgpt'] }, 'MANAGED_CONFIGURATION_UNVERIFIED');
+  same(withoutNulls(requirements.requirements), { allowedLoginMethods: ['chatgpt'], featureRequirements: { apps: false, plugins: false } }, 'MANAGED_CONFIGURATION_UNVERIFIED');
   for (const [key, value] of Object.entries(configuration(root, binary))) same(withoutNulls(response.config[key]), value, 'CONFIGURATION_MISMATCH');
   for (const key of ['openai_base_url', 'model', 'model_instructions_file', 'instructions', 'developer_instructions', 'compact_prompt',
     'experimental_compact_prompt_file', 'model_catalog_json', 'profile', 'hooks', 'oss_provider', 'environments', 'forced_chatgpt_workspace_id']) {
@@ -128,7 +129,7 @@ export function validateThread(response, root, model) {
 export function newReport() {
   return { runtime: RUNTIME, authentication: 'UNVERIFIED', inference: 'UNVERIFIED', subscriptionUsageAttribution: 'UNVERIFIED',
     apiKeyFallbackExcluded: 'UNVERIFIED', modelCommand: 'UNVERIFIED', identityBinding: 'UNVERIFIED',
-    configuration: 'UNVERIFIED', standaloneBoundary: 'UNVERIFIED', modelTurnsSubmitted: 0,
+    configuration: 'UNVERIFIED', managedPolicy: 'UNVERIFIED', executionSourceCoverage: 'UNVERIFIED', standaloneBoundary: 'UNVERIFIED', modelTurnsSubmitted: 0,
     usage: null, commandEvidence: null, notificationDiagnostics: [], mcpInventorySnapshots: [], zeroActiveMcpServers: 'UNVERIFIED',
     outcome: 'BLOCKED', nextSandboxStage: 'BLOCKED', migrationReady: false,
     limitations: ['Usage counters are not billing attribution.', 'One read-only command is not full tool security equivalence.',
@@ -313,8 +314,21 @@ export async function runProtocol(options) {
   catch (error) { options.evidence.notifications.reject(safeCode(error)); }
 }
 
-async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, claim, validateFiles, inference = true, diagnostic = false, timeoutMs = 90000 }) {
+async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, claim, validateFiles, attestManaged, inference = true, diagnostic = false, timeoutMs = 90000 }) {
   const notifications = evidence.notifications;
+  const checkManaged = async () => {
+    report.managedPolicy = 'UNVERIFIED';
+    if (typeof attestManaged !== 'function') fail('MANAGED_ATTESTATION_UNVERIFIED');
+    same(await attestManaged(), { policySha256: hash(MANAGED_REQUIREMENTS), runtimeSha256: RUNTIME.sha256 }, 'MANAGED_ATTESTATION_UNVERIFIED');
+    const features = await rpc.request('experimentalFeature/list', { limit: 1000 });
+    if (!Array.isArray(features?.data) || features.nextCursor !== null) fail('MANAGED_FEATURES_UNVERIFIED');
+    if (features.data.some(feature => !feature || typeof feature.name !== 'string' || typeof feature.enabled !== 'boolean')) fail('MANAGED_FEATURES_UNVERIFIED');
+    same(features.data.filter(feature => ['apps', 'plugins'].includes(feature.name)).map(({ name, enabled }) => ({ name, enabled })).sort((left, right) => left.name.localeCompare(right.name)),
+      [{ name: 'apps', enabled: false }, { name: 'plugins', enabled: false }], 'MANAGED_FEATURES_UNVERIFIED');
+    notifications.check();
+    if (rpc.failure) fail('TRANSPORT_UNCERTAIN');
+    report.managedPolicy = 'VERIFIED';
+  };
   const checkMcpInventory = async threadId => {
     notifications.check();
     const inventory = await rpc.request('mcpServerStatus/list', { detail: 'full', limit: 1, ...(threadId ? { threadId } : {}) });
@@ -332,6 +346,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
   notifications.setPhase('configuration');
   const config = await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') });
   validateConfiguration(config, await rpc.request('configRequirements/read'), root, binary); report.configuration = 'VERIFIED';
+  if (!diagnostic) await checkManaged();
   if (!diagnostic) {
     notifications.setPhase('boundary');
     const command = `import pathlib,socket,errno\nassert pathlib.Path('fixture.txt').read_text()==${JSON.stringify(FIXTURE)}\nfor target,mode in [(${JSON.stringify(path.join(root, 'work', 'must-not-create'))},'w'),(${JSON.stringify(path.join(root, 'codex', 'boundary-sentinel'))},'r')]:\n try: open(target,mode)\n except OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS]\n else: raise RuntimeError('boundary')\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network')\nprint('PAB_BOUNDARY_OK')`;
@@ -339,7 +354,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
     if (boundary?.exitCode !== 0 || boundary.stdout !== 'PAB_BOUNDARY_OK\n' || boundary.stderr !== '') fail('STANDALONE_BOUNDARY_FAILED');
     report.standaloneBoundary = 'VERIFIED';
   }
-  if (!inference && !diagnostic) return report;
+  if (!inference && !diagnostic) { await checkMcpInventory(); return report; }
   notifications.setPhase('authentication');
   await validateFiles();
   const account = accountBinding(await rpc.request('account/read', { refreshToken: false }));
@@ -357,6 +372,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
     return report;
   }
   notifications.setPhase('model_selection');
+  await checkManaged();
   await checkMcpInventory();
   const models = await rpc.request('model/list', { includeHidden: false });
   const defaults = models?.data?.filter(model => model.isDefault === true && model.hidden === false);
@@ -377,6 +393,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   await validateFiles();
+  await checkManaged();
   await checkMcpInventory(thread.thread.id);
   notifications.check();
   notifications.setPhase('inference');
@@ -399,6 +416,7 @@ async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, cl
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   await validateFiles();
+  await checkManaged();
   await checkMcpInventory(thread.thread.id);
   notifications.check();
   ledger.turnCompleted('implementer', 'acceptance', { threadId: thread.thread.id, turn: { id: turn.turn.id, status: 'completed' } });
@@ -419,7 +437,9 @@ export async function diagnosticLauncher({ root, binary }) {
     const env = environment(control), childEnv = { ...environment(root), TMPDIR: path.join(control, 'scratch'), CODEX_SQLITE_HOME: path.join(control, 'scratch', 'sqlite') };
     const permissions = { [PROFILE]: { filesystem: { ':minimal': 'read', [binary]: 'read', [root]: 'read',
       [sentinel]: 'read', [path.join(control, 'scratch')]: 'write' }, network: { enabled: false } } };
-    const args = ['sandbox', ...launchArgs(root, binary).slice(1), '-c', `permissions=${toml(permissions)}`, '-P', PROFILE, '-C', root, '--'];
+    const shellEnvironment = { inherit: 'none', set: { PATH: '/usr/bin:/bin', HOME: path.join(control, 'scratch'), TMPDIR: path.join(control, 'scratch') } };
+    const args = ['sandbox', ...launchArgs(root, binary).slice(1), '-c', `permissions=${toml(permissions)}`,
+      '-c', `shell_environment_policy=${toml(shellEnvironment)}`, '-P', PROFILE, '-C', root, '--'];
     const check = `import os,socket,errno\ntry: descriptor=os.open(${JSON.stringify(sentinel)},os.O_WRONLY)\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS]\nelse: os.close(descriptor); raise RuntimeError('write allowed')\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network allowed')\nprint('PAB_DIAGNOSTIC_BOUNDARY_OK')`;
     const runCheck = program => promisify(execFile)(binary, [...args, '/usr/bin/python3', '-B', '-c', program], { cwd: control, env, timeout: 10000, maxBuffer: 4096 });
     let result;
@@ -435,11 +455,65 @@ export async function diagnosticLauncher({ root, binary }) {
   } catch (error) { await close(); throw error; }
 }
 
+export async function managedLauncher({ root, binary }) {
+  same((await loadFixture(root)).binary, binary, 'RUNTIME_MISMATCH');
+  const control = await fs.mkdtemp('/tmp/pab-managed-launch-');
+  const close = () => fs.rm(control, { recursive: true, force: true });
+  try {
+    await fs.mkdir(path.join(control, 'etc', 'codex'), { recursive: true, mode: 0o700 });
+    const policy = path.join(control, 'etc', 'codex', 'requirements.toml');
+    await privateFile(policy, MANAGED_REQUIREMENTS);
+    const facilities = {};
+    for (const filename of ['/etc/hosts', '/etc/nsswitch.conf', '/etc/resolv.conf', '/etc/ssl/certs/ca-certificates.crt']) {
+      const bytes = await fs.readFile(filename);
+      if (!bytes.length) fail('OS_FACILITIES_UNVERIFIED');
+      facilities[filename] = hash(bytes);
+    }
+    const mountId = await fs.readlink('/proc/self/ns/mnt'), networkId = await fs.readlink('/proc/self/ns/net');
+    const namespace = `import os,pathlib,subprocess,sys\nmirror=pathlib.Path(${JSON.stringify(path.join(control, 'etc'))})\nassert os.readlink('/proc/self/ns/mnt')!=${JSON.stringify(mountId)}\nfor entry in os.scandir('/etc'):\n if entry.name=='codex': continue\n target=mirror/entry.name\n if entry.is_dir(): target.mkdir()\n elif entry.is_file(): target.touch()\n elif entry.is_symlink(): target.symlink_to(os.readlink(entry.path)); continue\n else: raise RuntimeError('unsupported etc entry')\n subprocess.run(['/usr/bin/mount','--bind',entry.path,str(target)],check=True)\n subprocess.run(['/usr/bin/mount','-o','remount,bind,ro',str(target)],check=True)\nsubprocess.run(['/usr/bin/mount','--bind',str(mirror),'/etc'],check=True)\nsubprocess.run(['/usr/bin/mount','-o','remount,bind,ro','/etc'],check=True)\nos.execv(sys.argv[1],sys.argv[1:])\n`;
+    const check = `import os,pathlib,hashlib,ssl,socket,subprocess,errno\nassert os.readlink('/proc/self/ns/mnt')!=${JSON.stringify(mountId)}\nassert os.readlink('/proc/self/ns/net')==${JSON.stringify(networkId)}\nassert hashlib.sha256(pathlib.Path('/etc/codex/requirements.toml').read_bytes()).hexdigest()==${JSON.stringify(hash(MANAGED_REQUIREMENTS))}\nassert all(hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()==digest for name,digest in ${JSON.stringify(facilities)}.items()),'PAB_OS_FACILITIES_UNVERIFIED'\nassert ssl.create_default_context().cert_store_stats()['x509_ca']>0\nassert socket.getaddrinfo('localhost',443)\nfor name in ['/etc/codex/requirements.toml',${JSON.stringify(policy)}]:\n try: open(name,'w')\n except OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS,errno.ENOENT]\n else: raise RuntimeError('policy writable')\nassert subprocess.run(['/usr/bin/mount','-o','remount,bind,rw','/etc'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0\n`;
+    const namespaceFile = path.join(control, 'namespace.py'), checkFile = path.join(control, 'check.py');
+    await privateFile(namespaceFile, namespace); await privateFile(checkFile, check);
+    const permissions = { pab_model_transport: { filesystem: { ':minimal': 'read', [binary]: 'read', [root]: 'write', [control]: 'read' }, network: { enabled: true } } };
+    const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+    const command = ['/usr/bin/unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
+      '/usr/bin/python3', '-B', namespaceFile, binary, 'sandbox', '-c', `permissions=${toml(permissions)}`, '-P', 'pab_model_transport', '-C', root, '--',
+      '/usr/bin/env', '-i', ...Object.entries(environment(root)).map(([key, value]) => `${key}=${value}`),
+      '/bin/sh', '-ec', `/usr/bin/python3 -B ${quote(checkFile)} && exec ${quote(binary)} "$@"`, 'pab-managed-launch'];
+    const launcher = path.join(control, 'launch'), contents = `#!/bin/sh\nexec ${command.map(quote).join(' ')} "$@"\n`;
+    await privateFile(launcher, contents); await fs.chmod(launcher, 0o700);
+    const attest = async () => {
+      await loadFixture(root);
+      for (const [filename, expected] of [[policy, MANAGED_REQUIREMENTS], [namespaceFile, namespace], [checkFile, check], [launcher, contents]]) {
+        same(await checkedFile(filename), expected, 'MANAGED_LAUNCH_CHANGED');
+      }
+      same(await fs.readlink('/proc/self/ns/mnt'), mountId, 'CONTROLLER_NAMESPACE_CHANGED');
+      same(await fs.readlink('/proc/self/ns/net'), networkId, 'CONTROLLER_NAMESPACE_CHANGED');
+      return { policySha256: hash(MANAGED_REQUIREMENTS), runtimeSha256: RUNTIME.sha256 };
+    };
+    await attest();
+    const verifyStartup = async () => {
+      await attest();
+      let result;
+      try { result = await promisify(execFile)(launcher, ['--version'], { cwd: root, env: environment(root), timeout: 15000, maxBuffer: 8192 }); }
+      catch (error) { fail(String(error.stderr ?? '').includes('AssertionError: PAB_OS_FACILITIES_UNVERIFIED') ? 'MANAGED_OS_FACILITIES_UNVERIFIED' : 'MANAGED_LAUNCH_UNVERIFIED'); }
+      same(result.stdout.trim(), RUNTIME.version, 'MANAGED_LAUNCH_UNVERIFIED');
+      return attest();
+    };
+    return { binary: launcher, env: environment(root), close, attest, verifyStartup };
+  } catch (error) { await close(); throw error; }
+}
+
 async function execute(root, inference, diagnostic = false) {
+  if (inference) fail('INFERENCE_NOT_AUTHORIZED');
   const fixture = await loadFixture(root), report = newReport(), evidence = new TurnEvidence(root, report);
   let rpc, ledger, launcher, fingerprint;
   try {
     let binding;
+    if (!diagnostic) {
+      launcher = await managedLauncher(fixture);
+      await launcher.verifyStartup();
+    }
     if (inference || diagnostic) {
       const login = JSON.parse(await checkedFile(path.join(root, 'operator-login.json')));
       binding = await loginBinding(root);
@@ -451,13 +525,20 @@ async function execute(root, inference, diagnostic = false) {
     }
     rpc = new AppServerRpc(launcher?.binary ?? fixture.binary, launchArgs(root, fixture.binary), { cwd: root, env: launcher?.env ?? environment(root),
       onMessage: message => { try { evidence.receive(message); } catch (error) { report.blocker = safeCode(error); throw error; } }, timeoutMs: 15000 });
+    const request = rpc.request.bind(rpc);
+    rpc.request = (method, params) => {
+      if (/^(thread\/|turn\/)/.test(method)) fail('INFERENCE_NOT_AUTHORIZED');
+      return request(method, params);
+    };
     if (!diagnostic) ledger = new SessionLedger(path.join(root, 'acceptance.sqlite'));
     await runProtocol({ rpc, root, binary: fixture.binary, ledger, evidence, report, inference, diagnostic,
+      attestManaged: launcher?.attest,
       claim: () => privateFile(path.join(root, 'inference.claim'), 'Never replay this attempt.\n'),
       validateFiles: async () => {
         await loadFixture(root); same(await loginBinding(root), binding, 'AUTH_FILE_IDENTITY_CHANGED');
         if (diagnostic) same(hash(await checkedFile(path.join(root, 'codex', 'auth.json'))), fingerprint, 'DIAGNOSTIC_AUTH_CHANGED');
       } });
+    if (!diagnostic) fail('EXECUTION_SOURCE_COVERAGE_UNVERIFIED');
   } catch (error) {
     report.blocker ||= safeCode(error);
     report.blockerPhase ||= evidence.notifications.phase;
@@ -495,8 +576,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   try {
     const [mode, target, ...extra] = process.argv.slice(2);
     if (extra.length || !target || !['prepare', 'preflight', 'login', 'run', 'diagnose-auth'].includes(mode)) fail('USAGE_PREPARE_BINARY_OR_PREFLIGHT_LOGIN_RUN_DIAGNOSE_AUTH_ROOT');
+    if (mode === 'login') fail('AUTHENTICATED_QUALIFICATION_NOT_AUTHORIZED');
+    if (mode === 'run') fail('INFERENCE_NOT_AUTHORIZED');
     if (mode === 'prepare') process.stdout.write(await prepare(target) + '\n');
-    else if (mode === 'login') await login(target);
     else {
       const report = await execute(target, mode === 'run', mode === 'diagnose-auth');
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');

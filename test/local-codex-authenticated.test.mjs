@@ -9,8 +9,8 @@ import { createHash } from 'node:crypto';
 import { AppServerRpc } from '../feasibility/local-codex/rpc.mjs';
 import { SessionLedger } from '../feasibility/local-codex/state.mjs';
 import { configuration, environment, validateConfiguration, accountBinding, validateAuthFile, validateThread,
-  newReport, TurnEvidence, runProtocol, loadFixture, prepare, diagnosticLauncher, classifyMcpNotification, validateEmptyMcpInventory,
-  PROFILE, FIXTURE, RESPONSE } from '../feasibility/local-codex/authenticated-acceptance.mjs';
+  newReport, TurnEvidence, runProtocol, loadFixture, prepare, diagnosticLauncher, managedLauncher, MANAGED_REQUIREMENTS, classifyMcpNotification, validateEmptyMcpInventory,
+  PROFILE, FIXTURE, RESPONSE, RUNTIME } from '../feasibility/local-codex/authenticated-acceptance.mjs';
 
 const clone = value => structuredClone(value);
 const binary = '/opt/synthetic-codex';
@@ -63,7 +63,8 @@ async function offlineMcpRuntime(context, overrides = {}, onMessage = () => {}, 
   return { root, runtime, rpc };
 }
 const account = () => ({ account: { type: 'chatgpt', email: 'synthetic@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true });
-const requirements = () => ({ requirements: { allowedLoginMethods: ['chatgpt'], modelProvider: null } });
+const requirements = () => ({ requirements: { allowedLoginMethods: ['chatgpt'], modelProvider: null, featureRequirements: { apps: false, plugins: false } } });
+const managedAttestation = () => ({ policySha256: createHash('sha256').update(MANAGED_REQUIREMENTS).digest('hex'), runtimeSha256: RUNTIME.sha256 });
 const config = root => ({ config: configuration(root, binary), layers: [{ name: { type: 'user', file: path.join(root, 'codex', 'config.toml'), profile: null }, config: configuration(root, binary) }] });
 const thread = root => ({ thread: { id: 'synthetic-thread', sessionId: 'synthetic-session', forkedFromId: null, parentThreadId: null,
   ephemeral: true, modelProvider: 'openai', cwd: path.join(root, 'work'), turns: [] }, model: 'fixture-model', modelProvider: 'openai',
@@ -95,6 +96,7 @@ async function fixture(context, overrides = {}) {
       if (overrides[method]) return overrides[method]({ root, evidence, rpc, calls, params });
       if (method === 'config/read') return config(root);
       if (method === 'configRequirements/read') return requirements();
+      if (method === 'experimentalFeature/list') return { data: [{ name: 'apps', enabled: false }, { name: 'plugins', enabled: false }], nextCursor: null };
       if (method === 'command/exec') return { exitCode: 0, stdout: 'PAB_BOUNDARY_OK\n', stderr: '' };
       if (method === 'account/read') return account();
       if (method === 'mcpServerStatus/list') return { data: [], nextCursor: null };
@@ -107,6 +109,7 @@ async function fixture(context, overrides = {}) {
       throw Error('Unexpected fake method');
     } };
   const options = { rpc, root, binary, ledger, evidence, report, timeoutMs: 30,
+    attestManaged: async () => managedAttestation(),
     claim: async () => { const handle = await fs.open(path.join(root, 'attempt.claim'), 'wx'); await handle.close(); }, validateFiles: async () => {} };
   return { ...options, calls, run: changes => runProtocol({ ...options, ...changes }) };
 }
@@ -174,6 +177,65 @@ test('synthetic complete turn records separate criteria, sanitized command prove
   const turnCalls = value.calls.filter(call => call.method === 'turn/start');
   assert.equal(turnCalls.length, 1); assert.equal(turnCalls[0].params.permissions, PROFILE);
   assert.equal(value.calls.some(call => /login|logout|config\/.*write|resume/.test(call.method)), false);
+});
+
+test('managed requirements accept exactly the supported feature pins, never missing or permissive policy', () => {
+  for (const featureRequirements of [undefined, null, {}, { apps: false }, { apps: true, plugins: false },
+    { apps: false, plugins: true }, { apps: false, plugins: false, hooks: false }]) {
+    assert.throws(() => validateConfiguration(config('/tmp/example'),
+      { requirements: { ...requirements().requirements, featureRequirements } }, '/tmp/example', binary), /MANAGED_CONFIGURATION_UNVERIFIED/);
+  }
+});
+
+test('missing or changed controller attestation blocks before commands, authentication, threads and claims', async context => {
+  for (const attestManaged of [undefined, async () => ({}), async () => ({ ...managedAttestation(), policySha256: 'changed' }),
+    async () => ({ ...managedAttestation(), runtimeSha256: 'changed' })]) {
+    const value = await fixture(context);
+    await assert.rejects(value.run({ attestManaged }), /MANAGED_ATTESTATION_UNVERIFIED/);
+    assert.equal(value.report.managedPolicy, 'UNVERIFIED');
+    assert.equal(value.calls.some(call => /^(command|account|thread|turn)\//.test(call.method)), false);
+    await assert.rejects(fs.stat(path.join(value.root, 'attempt.claim')), { code: 'ENOENT' });
+  }
+});
+
+test('effective feature inventory must be complete, well-formed and deny both execution sources', async context => {
+  const disabled = [{ name: 'apps', enabled: false }, { name: 'plugins', enabled: false }];
+  for (const response of [null, {}, { data: disabled, nextCursor: 'more' }, { data: [], nextCursor: null },
+    { data: [null], nextCursor: null }, { data: [...disabled, disabled[0]], nextCursor: null },
+    ...['apps', 'plugins'].map(name => ({ data: disabled.map(feature => ({ ...feature, enabled: feature.name === name })), nextCursor: null }))]) {
+    const value = await fixture(context, { 'experimentalFeature/list': () => response });
+    await assert.rejects(value.run(), /MANAGED_FEATURES_UNVERIFIED/);
+    assert.equal(value.report.managedPolicy, 'UNVERIFIED');
+    assert.equal(value.calls.some(call => call.method === 'thread/start'), false);
+  }
+  const value = await fixture(context, { 'experimentalFeature/list': () => ({ data: [...disabled].reverse(), nextCursor: null }) });
+  assert.equal((await value.run({ inference: false })).managedPolicy, 'VERIFIED');
+  assert.equal(value.report.executionSourceCoverage, 'UNVERIFIED');
+});
+
+test('a changed policy or transport after authentication revokes managed verification before thread creation', async context => {
+  for (const transport of [false, true]) {
+    const value = await fixture(context, { 'experimentalFeature/list': ({ calls, rpc }) => {
+      const changed = calls.filter(call => call.method === 'experimentalFeature/list').length > 1;
+      if (changed && transport) rpc.failure = new Error('private transport detail');
+      return { data: [{ name: 'apps', enabled: changed && !transport }, { name: 'plugins', enabled: false }], nextCursor: null };
+    } });
+    await assert.rejects(value.run(), transport ? /TRANSPORT_UNCERTAIN/ : /MANAGED_FEATURES_UNVERIFIED/);
+    assert.equal(value.report.managedPolicy, 'UNVERIFIED');
+    assert.equal(value.report.modelTurnsSubmitted, 0);
+    assert.equal(value.calls.some(call => call.method === 'thread/start'), false);
+    assert(!JSON.stringify(value.report).includes('private transport detail'));
+  }
+});
+
+test('CLI inference authorization fails before reading even a nonexistent acceptance root', async () => {
+  const script = path.resolve('feasibility/local-codex/authenticated-acceptance.mjs');
+  await assert.rejects(promisify(execFile)(process.execPath, [script, 'run', '/nonexistent/pab-forbidden-root']), error => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /^INFERENCE_NOT_AUTHORIZED\n/);
+    return true;
+  });
 });
 
 for (const [name, overrides] of [
@@ -265,7 +327,7 @@ test('unknown warnings, live remote control, auth changes and unsupported notifi
 
 test('unauthenticated preflight mode never reads an account, selects a model, creates a thread or starts inference', async context => {
   const value = await fixture(context); await value.run({ inference: false });
-  assert.deepEqual(value.calls.map(call => call.method), ['config/read', 'configRequirements/read', 'command/exec']);
+  assert.deepEqual(value.calls.map(call => call.method), ['config/read', 'configRequirements/read', 'experimentalFeature/list', 'command/exec', 'mcpServerStatus/list']);
   assert.equal(value.report.modelTurnsSubmitted, 0); assert.equal(value.report.authentication, 'UNVERIFIED');
 });
 
@@ -431,7 +493,16 @@ test('pinned diagnostic CLI fails closed on read-only startup and preserves a wh
   const root = await prepare(runtime);
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const script = path.resolve('feasibility/local-codex/authenticated-acceptance.mjs');
-  await promisify(execFile)(process.execPath, [script, 'preflight', root], { timeout: 25000, maxBuffer: 16384 });
+  await assert.rejects(promisify(execFile)(process.execPath, [script, 'preflight', root], { timeout: 25000, maxBuffer: 16384 }), error => {
+    assert.equal(error.code, 1);
+    const report = JSON.parse(error.stdout);
+    assert.equal(report.blocker, 'MANAGED_OS_FACILITIES_UNVERIFIED');
+    assert.equal(report.blockerPhase, 'initialization');
+    for (const key of ['configuration', 'managedPolicy', 'executionSourceCoverage', 'authentication', 'inference']) assert.equal(report[key], 'UNVERIFIED');
+    assert.equal(report.modelTurnsSubmitted, 0);
+    assert.deepEqual(report.notificationDiagnostics, []);
+    return true;
+  });
   const claims = { email: 'synthetic@example.invalid', 'https://api.openai.com/auth': { chatgpt_account_id: 'synthetic-account', chatgpt_plan_type: 'free' } };
   const token = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.synthetic`;
   const auth = { auth_mode: 'chatgpt', OPENAI_API_KEY: null, tokens: { access_token: 'synthetic', refresh_token: 'synthetic', id_token: token, account_id: 'synthetic-account' } };
@@ -566,6 +637,22 @@ for (const mode of ['empty_override', 'enabled', 'disabled']) test(`offline conf
 
 const startupNotice = (params = {}) => ({ method: 'mcpServer/startupStatus/updated', params: {
   name: 'private-server', threadId: 'synthetic-thread', status: 'starting', error: null, failureReason: null, ...params } });
+
+test('networked managed launcher fails closed on pinned sandbox OS-file incompatibility before app-server startup', async context => {
+  const runtime = await fs.realpath(process.env.CODEX_BINARY || path.join(homedir(), '.local/bin/codex'));
+  const root = await prepare(runtime);
+  let launcher;
+  context.after(async () => { await launcher?.close(); await fs.rm(root, { recursive: true, force: true }); });
+  await assert.rejects(managedLauncher({ root, binary }), /RUNTIME_MISMATCH/);
+  launcher = await managedLauncher({ root, binary: runtime });
+  assert.deepEqual(await launcher.attest(), managedAttestation());
+  await assert.rejects(launcher.verifyStartup(), /MANAGED_OS_FACILITIES_UNVERIFIED/);
+  for (const name of ['inference.claim', 'acceptance.sqlite', 'codex/auth.json', 'operator-login.json']) {
+    await assert.rejects(fs.lstat(path.join(root, name)), { code: 'ENOENT' });
+  }
+  await fs.writeFile(path.join(path.dirname(launcher.binary), 'etc', 'codex', 'requirements.toml'), 'mcp_servers = {}\n');
+  await assert.rejects(launcher.verifyStartup(), /MANAGED_LAUNCH_CHANGED/);
+});
 
 for (const { source, deny, featurePins = true } of [
   ...['user', 'project', 'cli'].flatMap(source => [false, true].map(deny => ({ source, deny }))),
