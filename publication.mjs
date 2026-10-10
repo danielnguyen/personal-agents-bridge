@@ -143,7 +143,8 @@ export async function publishReviewedTask(controller, task, input) {
     } }).trim();
     if (!oid(commit)) fail('PUBLICATION_COMMIT_INVALID');
     p = task.publication = { phase: 'prepared', task_id: id, input_sha256: fingerprint, reviewed_tree_sha: reviewed.tree_sha, commit_sha: commit,
-      pushed_branch: branch, target, review_packet_sha256: task.reviewer.packet_hash, reviewer_session_id: task.reviewer.session_id,
+      pushed_branch: branch, target, review_packet_sha256: task.reviewer.packet_hash,
+      ...(task.execution_backend === 'local_codex' ? { reviewer_backend: 'local_codex', reviewer_thread_id: task.reviewer.local.thread_id, reviewer_session_id: null } : { reviewer_session_id: task.reviewer.session_id }),
       reviewer_turn_id: task.reviewer.review_result.turn_id, review_overall: 'PASS', prepared_at: timestamp, push_attempted: false, pr_attempted: false };
     controller.save(task);
   }

@@ -69,6 +69,15 @@ test('malformed, omitted and oversized file-change fields are explicit', () => {
   assert(ledger.file_changes[1].missing.includes('changes'));
 });
 
+test('a conflicting file-change completion retains the original prohibited-path indication', () => {
+  const ledger = createLocalEvidence('task');
+  const item = { id: 'file', type: 'fileChange', status: 'completed', changes: [{ path: '/task/TASK.md', kind: { type: 'update' }, diff: '+bad' }] };
+  started(ledger, item);
+  observe(ledger, notification({ ...item, changes: [{ ...item.changes[0], path: '/task/allowed.txt' }] }));
+  assert.equal(ledger.file_changes[0].start_completion_conflict, true);
+  assert.equal(ledger.file_changes[0].start_changes[0].path.value, '/task/TASK.md');
+});
+
 test('correlation uses exact commands and cwd, not substrings, shell inference, redacted or conflicting fields', () => {
   const ledger = createLocalEvidence('task'); started(ledger); observe(ledger, notification());
   assert.equal(localTestCorrelation(ledger, ['check.py', 'python3 absent.py'], '/task').tests.every(item => item.status === 'unmatched'), true);
@@ -114,7 +123,7 @@ for (const state of ['completed', 'interrupted', 'uncertain', 'failed']) test(`p
   const packet = localEvidencePacket(task, ['python3 check.py'], '/task');
   assert.equal(packet.evidence_version, LOCAL_EVIDENCE_VERSION); assert.equal(packet.execution.state, state);
   assert.equal(packet.native_activity.status, 'unavailable'); assert.equal(packet.independent_validation.status, 'unavailable');
-  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'analysis_only');
+  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'bounded_evidence_qualification');
   assert(!JSON.stringify(packet).includes('I independently verified')); assert(!JSON.stringify(packet).includes('private'));
 });
 
