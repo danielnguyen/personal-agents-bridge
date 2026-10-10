@@ -16,6 +16,17 @@ async function setup(t) {
   return { c, api, executor, root };
 }
 async function started(c) { const x = await c.start({ contract: contract(), request_id: 'request_start' }); await Promise.all([...c.jobs.values()]); return await c.get(x.task_id); }
+test('Agents API remains the default and explicit default selection preserves request fingerprints', async t => {
+  const { c, api } = await setup(t);
+  c.localBackendFactory = () => { assert.fail('Default tasks must not instantiate local Codex'); };
+  const first = await started(c);
+  assert.equal(first.execution_backend, 'agents_api'); assert.equal(c.task(first.task_id).execution_backend, 'agents_api');
+  const repeated = await c.start({ contract: contract(), request_id: 'request_start', execution_backend: 'agents_api' });
+  assert.equal(repeated.task_id, first.task_id); assert.equal(api.created.length, 1);
+  const legacy = c.task(first.task_id); delete legacy.execution_backend; c.save(legacy);
+  assert.equal((await c.get(first.task_id)).execution_backend, 'agents_api');
+  assert.equal((await c.start({ contract: contract(), request_id: 'request_start' })).task_id, first.task_id);
+});
 test('clarification uses exact same session, turn and call; retries are deduplicated', async t => {
   const { c, api } = await setup(t); const x = await started(c), id = x.implementer.session_id;
   api.pending(id); assert.equal((await c.get(x.task_id)).implementer.clarification_required, true);

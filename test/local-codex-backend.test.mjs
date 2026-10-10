@@ -450,3 +450,66 @@ test('model catalog errors and rejected inference never trigger a model fallback
     else assert.equal(value.requests.find(request => request.method === method).params.model, 'gpt-6-astra');
   }
 });
+
+test('synchronous lifecycle exposes model and identities before submission, acknowledgement and terminal completion', async context => {
+  const events = [];
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, items, complete }) => {
+    assert.equal(events.at(-1).phase, 'turn_submitting'); assert.equal(events.at(-1).turnSubmissionAttempted, true);
+    assert.equal(events.at(-1).turnSubmissionAcknowledged, false); assert.equal(events.at(-1).turnId, null);
+    nextTurn(); setImmediate(() => {
+      assert.equal(events.at(-1).phase, 'turn_acknowledged'); assert.equal(events.at(-1).turnId, 'turn-1');
+      assert.equal(events.at(-1).terminalObserved, false); items(); complete();
+    }); return { turn: { id: 'turn-1', status: 'inProgress' } };
+  } }, { onLifecycle: event => events.push(event) });
+  const result = await value.run();
+  assert.equal(result.status, 'completed'); assert.equal(result.turnSubmissionAcknowledged, true);
+  assert.deepEqual(events.map(event => event.phase), ['model_selected', 'thread_acknowledged', 'turn_submitting', 'turn_acknowledged', 'terminal_observed']);
+  assert.equal(events[1].threadId, 'thread-fixture'); assert.equal(events[1].model, 'gpt-6-astra');
+  assert.equal(events.at(-1).terminalObserved, true);
+});
+
+test('lifecycle persistence failures stop submission or retain uncertainty without replay', async context => {
+  for (const phase of ['model_selected', 'thread_acknowledged', 'turn_submitting', 'turn_acknowledged', 'terminal_observed']) {
+    const value = await fixture(context, {}, { onLifecycle: event => { if (event.phase === phase) throw Error('private storage failure'); } });
+    const result = await value.run();
+    assert.notEqual(result.status, 'completed'); assert(!JSON.stringify(result).includes('private storage failure'));
+    assert.equal(value.requests.filter(request => request.method === 'turn/start').length, ['turn_acknowledged', 'terminal_observed'].includes(phase) ? 1 : 0);
+    if (phase === 'thread_acknowledged') assert.equal(result.threadId, 'thread-fixture');
+  }
+});
+
+test('async lifecycle callbacks fail closed rather than pretending identity was durably saved', async context => {
+  const value = await fixture(context, {}, { onLifecycle: async () => { throw Error('private failure'); } });
+  assert.equal((await value.run()).status, 'failed');
+  assert(!value.requests.some(request => request.method === 'thread/start'));
+});
+
+test('unsupported human requests are observed synchronously before safe interruption', async context => {
+  const events = [];
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, send }) => {
+    nextTurn(); setImmediate(() => send({ id: 'permission', method: 'item/permissions/requestApproval', params: { threadId: 'thread-fixture', turnId: 'turn-1', reason: 'Needs permission' } }));
+    return { turn: { id: 'turn-1' } };
+  } }, { onLifecycle: event => events.push(event) });
+  assert.equal((await value.run()).status, 'interrupted');
+  const request = events.find(event => event.phase === 'human_request');
+  assert.equal(request.request.method, 'item/permissions/requestApproval'); assert.equal(request.threadId, 'thread-fixture');
+  assert(value.replies[0].error); assert.equal(await value.backend.close(), true);
+});
+
+test('closing during asynchronous connection setup prevents a late subprocess launch', async context => {
+  const value = await fixture(context);
+  const connected = value.backend.connect();
+  await value.backend.close();
+  await assert.rejects(connected, /BACKEND_CLOSED/); assert.equal(value.launches.length, 0);
+});
+
+test('failed human-request persistence cannot race a completed event into success', async context => {
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, send, complete }) => {
+    nextTurn(); setImmediate(() => {
+      send({ id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-fixture', turnId: 'turn-1' } });
+      complete();
+    }); return { turn: { id: 'turn-1' } };
+  } }, { onLifecycle: event => { if (event.phase === 'human_request') throw Error('Storage failure'); } });
+  const result = await value.run(); assert.equal(result.status, 'uncertain');
+  assert(result.uncertainties.includes('LIFECYCLE_HANDLER_FAILED')); assert.equal(value.replies.length, 0);
+});
