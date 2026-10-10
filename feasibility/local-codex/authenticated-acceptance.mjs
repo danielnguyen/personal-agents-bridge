@@ -12,12 +12,16 @@ export const RUNTIME = { version: 'codex-cli 0.157.1', sha256: '3e2584f3f3829a43
 export const FIXTURE = 'PAB_AUTH_ACCEPTANCE_FIXTURE\n';
 export const RESPONSE = 'PAB_AUTH_ACCEPTANCE_OK';
 export const PROFILE = 'pab_auth_readonly';
-const fail = code => { throw Object.assign(new Error(code), { code }); };
+const controlledFailure = Symbol('controlledFailure');
+const fail = code => { throw Object.assign(new Error(code), { code, [controlledFailure]: true }); };
 const hash = value => createHash('sha256').update(value).digest('hex');
 const same = (actual, expected, code) => { if (!isDeepStrictEqual(actual, expected)) fail(code); };
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = value => typeof value === 'string' && value.length > 0 && value.length <= 256;
-const safeCode = error => /^[A-Z_]+$/.test(error.code || error.message || '') ? error.code || error.message : 'ACCEPTANCE_UNCERTAIN';
+const subscriptionPlans = ['go', 'plus', 'pro', 'prolite', 'team', 'business', 'enterprise', 'edu', 'edu_plus', 'edu_pro'];
+const transportCodes = new Set(['APP_SERVER_START_FAILED', 'APP_SERVER_DISCONNECTED', 'APP_SERVER_WRITE_FAILED', 'APP_SERVER_PROTOCOL_FAILED',
+  'UNEXPECTED_SERVER_REQUEST', 'APP_SERVER_RPC_REJECTED', 'APP_SERVER_RPC_TIMEOUT', 'APP_SERVER_CLOSED']);
+const safeCode = error => error?.[controlledFailure] ? error.code : transportCodes.has(error?.message) ? error.message : 'ACCEPTANCE_UNCERTAIN';
 const withoutNulls = value => object(value) ? Object.fromEntries(Object.entries(value).filter(([, child]) => child !== null).map(([key, child]) => [key, withoutNulls(child)])) : value;
 const toml = value => object(value) ? `{ ${Object.entries(value).map(([key, child]) => `${JSON.stringify(key)} = ${toml(child)}`).join(', ')} }` : JSON.stringify(value);
 const configText = (root, binary) => Object.entries(configuration(root, binary)).map(([key, value]) => `${key} = ${toml(value)}\n`).join('');
@@ -107,7 +111,7 @@ export function validateConfiguration(response, requirements, root, binary) {
 }
 export function accountBinding(response) {
   try { requireSubscription(response); } catch { fail('CHATGPT_ACCOUNT_REQUIRED'); }
-  if (!nonempty(response.account.email) || !['go', 'plus', 'pro', 'prolite', 'team', 'business', 'enterprise', 'edu', 'edu_plus', 'edu_pro'].includes(response.account.planType)) fail('ACCOUNT_IDENTITY_UNVERIFIED');
+  if (!nonempty(response.account.email) || !subscriptionPlans.includes(response.account.planType)) fail('ACCOUNT_IDENTITY_UNVERIFIED');
   return hash(JSON.stringify(response.account));
 }
 export function validateThread(response, root, model) {
@@ -125,13 +129,62 @@ export function newReport() {
   return { runtime: RUNTIME, authentication: 'UNVERIFIED', inference: 'UNVERIFIED', subscriptionUsageAttribution: 'UNVERIFIED',
     apiKeyFallbackExcluded: 'UNVERIFIED', modelCommand: 'UNVERIFIED', identityBinding: 'UNVERIFIED',
     configuration: 'UNVERIFIED', standaloneBoundary: 'UNVERIFIED', modelTurnsSubmitted: 0,
-    usage: null, commandEvidence: null, outcome: 'BLOCKED', nextSandboxStage: 'BLOCKED', migrationReady: false,
+    usage: null, commandEvidence: null, notificationDiagnostics: [], outcome: 'BLOCKED', nextSandboxStage: 'BLOCKED', migrationReady: false,
     limitations: ['Usage counters are not billing attribution.', 'One read-only command is not full tool security equivalence.',
       'Runtime internal inference retries are not observable here; PAB never resubmits an uncertain turn.', 'Process-tree quiescence remains unverified.'] };
 }
 
+export class NotificationGuard {
+  constructor(report) { this.report = report; this.phase = 'initialization'; this.updates = []; this.locked = true; this.failure = null; }
+  setPhase(phase) {
+    if (!['initialization', 'configuration', 'boundary', 'authentication', 'model_selection', 'thread_creation',
+      'pre_inference', 'inference', 'post_inference', 'complete', 'shutdown'].includes(phase)) fail('INVALID_DIAGNOSTIC_PHASE');
+    this.phase = phase;
+  }
+  record(category) {
+    if (!['account_updated', 'runtime_error', 'hook_activity', 'mcp_activity', 'configuration_warning',
+      'remote_control', 'unsupported_notification', 'model_activity'].includes(category)) fail('INVALID_DIAGNOSTIC_CATEGORY');
+    if (this.report.notificationDiagnostics.length >= 32) this.reject('NOTIFICATION_DIAGNOSTICS_LIMIT');
+    this.report.notificationDiagnostics.push({ category, phase: this.phase });
+  }
+  reject(code) {
+    this.failure ||= code;
+    this.report.blocker ||= this.failure;
+    this.report.blockerPhase ||= this.phase;
+    for (const key of ['authentication', 'inference', 'identityBinding', 'apiKeyFallbackExcluded', 'modelCommand']) this.report[key] = 'UNVERIFIED';
+    this.report.outcome = 'BLOCKED';
+    fail(this.failure);
+  }
+  check() { if (this.failure) fail(this.failure); }
+  reconcile(response) {
+    this.check();
+    const expected = hash(JSON.stringify({ authMode: 'chatgpt', planType: response.account.planType }));
+    if (this.updates.some(update => update !== expected)) this.reject('AUTH_NOTIFICATION_MISMATCH');
+    this.locked = true;
+    this.updates = [];
+  }
+  receive(message) {
+    this.check();
+    const method = message.method;
+    if (method === 'account/updated') {
+      this.record('account_updated');
+      if (this.locked || !['initialization', 'configuration', 'boundary', 'authentication'].includes(this.phase)) this.reject('RUNTIME_UNCERTAINTY');
+      const params = message.params;
+      if (!object(params) || !isDeepStrictEqual(Object.keys(params).sort(), ['authMode', 'planType']) ||
+          params.authMode !== 'chatgpt' || !subscriptionPlans.includes(params.planType)) this.reject('AUTH_NOTIFICATION_UNVERIFIED');
+      if (this.updates.length >= 8) this.reject('AUTH_NOTIFICATION_LIMIT');
+      this.updates.push(hash(JSON.stringify({ authMode: params.authMode, planType: params.planType })));
+      return true;
+    }
+    const category = method === 'error' ? 'runtime_error' : method?.startsWith('hook/') ? 'hook_activity' : method?.startsWith('mcpServer/') ? 'mcp_activity' : null;
+    if (category) { this.record(category); this.reject('RUNTIME_UNCERTAINTY'); }
+    if (this.readOnly && /^(thread\/|turn\/|item\/)/.test(method)) { this.record('model_activity'); this.reject('DIAGNOSTIC_MODEL_ACTIVITY'); }
+    return false;
+  }
+}
+
 export class TurnEvidence {
-  constructor(root) { this.root = root; this.pending = []; this.started = false; this.completed = false; this.commands = new Map(); this.answer = null; this.usage = null; }
+  constructor(root, report = newReport()) { this.root = root; this.notifications = new NotificationGuard(report); this.pending = []; this.started = false; this.completed = false; this.commands = new Map(); this.answer = null; this.usage = null; }
   bind(threadId, turnId) {
     if (!nonempty(threadId) || !nonempty(turnId)) fail('TURN_IDENTITY_UNVERIFIED');
     this.binding = { threadId, turnId };
@@ -140,18 +193,22 @@ export class TurnEvidence {
   }
   receive(message) {
     const method = message.method, params = message.params;
+    if (this.notifications.receive(message)) return;
     if (method === 'configWarning') {
+      this.notifications.record('configuration_warning');
       if (params?.summary !== 'Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.' || params.details !== null) fail('CONFIG_WARNING_UNVERIFIED');
       return;
     }
     if (method === 'remoteControl/status/changed') {
+      this.notifications.record('remote_control');
       if (params?.status !== 'disabled' || params.environmentId !== null) fail('REMOTE_CONTROL_NOT_DISABLED');
       return;
     }
-    if (method === 'error' || method === 'account/updated' || method.startsWith('hook/') || method.startsWith('mcpServer/')) fail('RUNTIME_UNCERTAINTY');
     if (['thread/started', 'thread/status/changed', 'account/rateLimits/updated', 'item/agentMessage/delta',
       'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta', 'item/commandExecution/outputDelta'].includes(method)) return;
-    if (!['turn/started', 'turn/completed', 'item/started', 'item/completed', 'thread/tokenUsage/updated'].includes(method)) fail('UNSUPPORTED_NOTIFICATION');
+    if (!['turn/started', 'turn/completed', 'item/started', 'item/completed', 'thread/tokenUsage/updated'].includes(method)) {
+      this.notifications.record('unsupported_notification'); this.notifications.reject('UNSUPPORTED_NOTIFICATION');
+    }
     if (!this.binding) {
       if (this.pending.length >= 64 || Buffer.byteLength(JSON.stringify(message)) > 32768) fail('EVIDENCE_LIMIT');
       this.pending.push(message); return;
@@ -201,23 +258,52 @@ export class TurnEvidence {
   }
 }
 
-export async function runProtocol({ rpc, root, binary, ledger, evidence, report, claim, validateFiles, inference = true, timeoutMs = 90000 }) {
+export async function runProtocol(options) {
+  try { return await checkedProtocol(options); }
+  catch (error) { options.evidence.notifications.reject(safeCode(error)); }
+}
+
+async function checkedProtocol({ rpc, root, binary, ledger, evidence, report, claim, validateFiles, inference = true, diagnostic = false, timeoutMs = 90000 }) {
+  const notifications = evidence.notifications;
+  notifications.locked = !(inference || diagnostic);
+  notifications.readOnly = diagnostic;
+  notifications.setPhase('initialization');
   const initialized = await rpc.initialize();
   if (initialized?.codexHome !== path.join(root, 'codex') || initialized.platformOs !== 'linux') fail('RUNTIME_HOME_UNVERIFIED');
+  notifications.setPhase('configuration');
   const config = await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') });
   validateConfiguration(config, await rpc.request('configRequirements/read'), root, binary); report.configuration = 'VERIFIED';
-  const command = `import pathlib,socket,errno\nassert pathlib.Path('fixture.txt').read_text()==${JSON.stringify(FIXTURE)}\nfor target,mode in [(${JSON.stringify(path.join(root, 'work', 'must-not-create'))},'w'),(${JSON.stringify(path.join(root, 'codex', 'boundary-sentinel'))},'r')]:\n try: open(target,mode)\n except OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS]\n else: raise RuntimeError('boundary')\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network')\nprint('PAB_BOUNDARY_OK')`;
-  const boundary = await rpc.request('command/exec', { command: ['/usr/bin/python3', '-B', '-c', command], cwd: path.join(root, 'work'), permissionProfile: PROFILE, timeoutMs: 10000, outputBytesCap: 1024 });
-  if (boundary?.exitCode !== 0 || boundary.stdout !== 'PAB_BOUNDARY_OK\n' || boundary.stderr !== '') fail('STANDALONE_BOUNDARY_FAILED');
-  report.standaloneBoundary = 'VERIFIED';
-  if (!inference) return report;
+  if (!diagnostic) {
+    notifications.setPhase('boundary');
+    const command = `import pathlib,socket,errno\nassert pathlib.Path('fixture.txt').read_text()==${JSON.stringify(FIXTURE)}\nfor target,mode in [(${JSON.stringify(path.join(root, 'work', 'must-not-create'))},'w'),(${JSON.stringify(path.join(root, 'codex', 'boundary-sentinel'))},'r')]:\n try: open(target,mode)\n except OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS]\n else: raise RuntimeError('boundary')\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network')\nprint('PAB_BOUNDARY_OK')`;
+    const boundary = await rpc.request('command/exec', { command: ['/usr/bin/python3', '-B', '-c', command], cwd: path.join(root, 'work'), permissionProfile: PROFILE, timeoutMs: 10000, outputBytesCap: 1024 });
+    if (boundary?.exitCode !== 0 || boundary.stdout !== 'PAB_BOUNDARY_OK\n' || boundary.stderr !== '') fail('STANDALONE_BOUNDARY_FAILED');
+    report.standaloneBoundary = 'VERIFIED';
+  }
+  if (!inference && !diagnostic) return report;
+  notifications.setPhase('authentication');
   await validateFiles();
   const account = accountBinding(await rpc.request('account/read', { refreshToken: false }));
+  await validateFiles();
+  const reconciled = await rpc.request('account/read', { refreshToken: false });
+  same(accountBinding(reconciled), account, 'ACCOUNT_CHANGED');
+  validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
+  await validateFiles();
+  if (rpc.failure) fail('TRANSPORT_UNCERTAIN');
+  notifications.reconcile(reconciled);
   report.authentication = 'VERIFIED';
+  if (diagnostic) {
+    notifications.setPhase('complete');
+    report.outcome = 'READ_ONLY_AUTHENTICATION_OBSERVED_ACCEPTANCE_UNVERIFIED';
+    return report;
+  }
+  notifications.setPhase('model_selection');
   const models = await rpc.request('model/list', { includeHidden: false });
   const defaults = models?.data?.filter(model => model.isDefault === true && model.hidden === false);
   if (models?.nextCursor !== null || defaults?.length !== 1 || !/^[a-zA-Z0-9_.-]{1,100}$/.test(defaults[0].model)) fail('MODEL_SELECTION_UNVERIFIED');
   const model = defaults[0].model;
+  notifications.check();
+  notifications.setPhase('thread_creation');
   await claim();
   const start = { model, modelProvider: 'openai', cwd: path.join(root, 'work'), approvalPolicy: 'never', approvalsReviewer: 'user',
     permissions: PROFILE, ephemeral: true, environments: [], dynamicTools: [],
@@ -226,9 +312,12 @@ export async function runProtocol({ rpc, root, binary, ledger, evidence, report,
   const thread = await rpc.request('thread/start', start);
   validateThread(thread, root, model);
   ledger.acknowledgeOperation('create'); ledger.bind('implementer', thread.thread.id, thread.thread.sessionId, 'acceptance');
+  notifications.setPhase('pre_inference');
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   await validateFiles();
+  notifications.check();
+  notifications.setPhase('inference');
   const input = { threadId: thread.thread.id, input: [{ type: 'text', text: 'Run cat fixture.txt once, then reply exactly PAB_AUTH_ACCEPTANCE_OK. Do nothing else.' }],
     model, approvalPolicy: 'never', permissions: PROFILE, environments: [] };
   if (!ledger.beginOperation('infer', 'turn/start', input).dispatch) fail('ATTEMPT_ALREADY_CLAIMED');
@@ -244,37 +333,85 @@ export async function runProtocol({ rpc, root, binary, ledger, evidence, report,
   }
   if (rpc.failure) fail('TRANSPORT_UNCERTAIN');
   const observed = evidence.result();
+  notifications.setPhase('post_inference');
   same(accountBinding(await rpc.request('account/read', { refreshToken: false })), account, 'ACCOUNT_CHANGED');
   validateConfiguration(await rpc.request('config/read', { includeLayers: true, cwd: path.join(root, 'work') }), await rpc.request('configRequirements/read'), root, binary);
   await validateFiles();
+  notifications.check();
   ledger.turnCompleted('implementer', 'acceptance', { threadId: thread.thread.id, turn: { id: turn.turn.id, status: 'completed' } });
   Object.assign(report, observed, { inference: 'VERIFIED', identityBinding: 'VERIFIED', modelCommand: 'VERIFIED', apiKeyFallbackExcluded: 'VERIFIED',
     outcome: 'AUTHENTICATED_INFERENCE_OBSERVED_ATTRIBUTION_UNVERIFIED', model });
+  notifications.setPhase('complete');
   return report;
 }
 
-async function execute(root, inference) {
-  const fixture = await loadFixture(root), report = newReport(), evidence = new TurnEvidence(root);
-  let rpc, ledger;
+export async function diagnosticLauncher({ root, binary }) {
+  const control = await fs.mkdtemp('/tmp/pab-auth-diagnostic-');
+  const close = () => fs.rm(control, { recursive: true, force: true });
+  try {
+    await fs.chmod(control, 0o700);
+    for (const name of ['home', 'codex', 'scratch']) await fs.mkdir(path.join(control, name), { mode: 0o700 });
+    const sentinel = path.join(control, 'sentinel');
+    await privateFile(sentinel, 'unchanged');
+    const env = environment(control), childEnv = { ...environment(root), TMPDIR: path.join(control, 'scratch'), CODEX_SQLITE_HOME: path.join(control, 'scratch', 'sqlite') };
+    const permissions = { [PROFILE]: { filesystem: { ':minimal': 'read', [binary]: 'read', [root]: 'read',
+      [sentinel]: 'read', [path.join(control, 'scratch')]: 'write' }, network: { enabled: false } } };
+    const args = ['sandbox', ...launchArgs(root, binary).slice(1), '-c', `permissions=${toml(permissions)}`, '-P', PROFILE, '-C', root, '--'];
+    const check = `import os,socket,errno\ntry: descriptor=os.open(${JSON.stringify(sentinel)},os.O_WRONLY)\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM,errno.EROFS]\nelse: os.close(descriptor); raise RuntimeError('write allowed')\ntry: socket.socket().connect(('127.0.0.1',9))\nexcept OSError as error: assert error.errno in [errno.EACCES,errno.EPERM]\nelse: raise RuntimeError('network allowed')\nprint('PAB_DIAGNOSTIC_BOUNDARY_OK')`;
+    const runCheck = program => promisify(execFile)(binary, [...args, '/usr/bin/python3', '-B', '-c', program], { cwd: control, env, timeout: 10000, maxBuffer: 4096 });
+    let result;
+    try { result = await runCheck(check); }
+    catch { fail('DIAGNOSTIC_BOUNDARY_UNAVAILABLE'); }
+    if (result.stdout !== 'PAB_DIAGNOSTIC_BOUNDARY_OK\n' || await checkedFile(sentinel) !== 'unchanged') fail('DIAGNOSTIC_BOUNDARY_UNAVAILABLE');
+    const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+    const command = [binary, ...args, '/usr/bin/env', '-i', ...Object.entries(childEnv).map(([key, value]) => `${key}=${value}`), binary];
+    const launcher = path.join(control, 'launch');
+    await privateFile(launcher, `#!/bin/sh\nexec ${command.map(quote).join(' ')} "$@"\n`);
+    await fs.chmod(launcher, 0o700);
+    return { binary: launcher, env, close, runCheck };
+  } catch (error) { await close(); throw error; }
+}
+
+async function execute(root, inference, diagnostic = false) {
+  const fixture = await loadFixture(root), report = newReport(), evidence = new TurnEvidence(root, report);
+  let rpc, ledger, launcher, fingerprint;
   try {
     let binding;
-    if (inference) {
+    if (inference || diagnostic) {
       const login = JSON.parse(await checkedFile(path.join(root, 'operator-login.json')));
       binding = await loginBinding(root);
       same(login, { source: 'fresh-device-login', binding }, 'FRESH_OPERATOR_LOGIN_REQUIRED');
     }
-    rpc = new AppServerRpc(fixture.binary, launchArgs(root, fixture.binary), { cwd: root, env: environment(root),
+    if (diagnostic) {
+      fingerprint = hash(await checkedFile(path.join(root, 'codex', 'auth.json')));
+      launcher = await diagnosticLauncher(fixture);
+    }
+    rpc = new AppServerRpc(launcher?.binary ?? fixture.binary, launchArgs(root, fixture.binary), { cwd: root, env: launcher?.env ?? environment(root),
       onMessage: message => { try { evidence.receive(message); } catch (error) { report.blocker = safeCode(error); throw error; } }, timeoutMs: 15000 });
-    ledger = new SessionLedger(path.join(root, 'acceptance.sqlite'));
-    await runProtocol({ rpc, root, binary: fixture.binary, ledger, evidence, report, inference,
+    if (!diagnostic) ledger = new SessionLedger(path.join(root, 'acceptance.sqlite'));
+    await runProtocol({ rpc, root, binary: fixture.binary, ledger, evidence, report, inference, diagnostic,
       claim: () => privateFile(path.join(root, 'inference.claim'), 'Never replay this attempt.\n'),
-      validateFiles: async () => { await loadFixture(root); same(await loginBinding(root), binding, 'AUTH_FILE_IDENTITY_CHANGED'); } });
+      validateFiles: async () => {
+        await loadFixture(root); same(await loginBinding(root), binding, 'AUTH_FILE_IDENTITY_CHANGED');
+        if (diagnostic) same(hash(await checkedFile(path.join(root, 'codex', 'auth.json'))), fingerprint, 'DIAGNOSTIC_AUTH_CHANGED');
+      } });
   } catch (error) {
     report.blocker ||= safeCode(error);
+    report.blockerPhase ||= evidence.notifications.phase;
   } finally {
+    evidence.notifications.setPhase('shutdown');
     await rpc?.close(); ledger?.close();
+    await launcher?.close();
+    if (diagnostic && fingerprint) {
+      try { same(hash(await checkedFile(path.join(root, 'codex', 'auth.json'))), fingerprint, 'DIAGNOSTIC_AUTH_CHANGED'); }
+      catch { report.blocker ||= 'DIAGNOSTIC_AUTH_CHANGED'; }
+    }
   }
-  await privateFile(path.join(root, `result-${inference ? 'authenticated' : 'preflight'}-${Date.now()}.json`), JSON.stringify(report, null, 2) + '\n');
+  if (report.blocker) {
+    for (const key of ['authentication', 'inference', 'identityBinding', 'apiKeyFallbackExcluded', 'modelCommand']) report[key] = 'UNVERIFIED';
+    report.outcome = 'BLOCKED';
+  }
+  if (!diagnostic) await privateFile(path.join(root, `result-${inference ? 'authenticated' : 'preflight'}-${Date.now()}.json`), JSON.stringify(report, null, 2) + '\n');
   return report;
 }
 
@@ -294,11 +431,11 @@ async function login(root) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   try {
     const [mode, target, ...extra] = process.argv.slice(2);
-    if (extra.length || !target || !['prepare', 'preflight', 'login', 'run'].includes(mode)) fail('USAGE_PREPARE_BINARY_OR_PREFLIGHT_LOGIN_RUN_ROOT');
+    if (extra.length || !target || !['prepare', 'preflight', 'login', 'run', 'diagnose-auth'].includes(mode)) fail('USAGE_PREPARE_BINARY_OR_PREFLIGHT_LOGIN_RUN_DIAGNOSE_AUTH_ROOT');
     if (mode === 'prepare') process.stdout.write(await prepare(target) + '\n');
     else if (mode === 'login') await login(target);
     else {
-      const report = await execute(target, mode === 'run');
+      const report = await execute(target, mode === 'run', mode === 'diagnose-auth');
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
       if (report.blocker) process.exitCode = 1;
     }

@@ -15,16 +15,20 @@ section. The previous unauthenticated probe remains unchanged. The original norm
 checkout, dirty files, private predecessor history, production login and backend
 are untouched.
 
-**Current disposition: blocked on fresh operator authentication.** The new real
-unauthenticated preflight passed with the pinned 0.157.1 runtime. No authenticated
-model turn has been submitted for this gate. The following are actual acceptance
+**Current disposition: blocked on an unresolved pre-inference notification.** The
+operator reports completing fresh isolated device login, followed by an attempt
+with configuration and standalone boundary VERIFIED, authentication UNVERIFIED,
+zero model turns submitted, and `RUNTIME_UNCERTAINTY`. The notification category
+was not recorded by the original harness, so the precise cause is unknown. The
+coding agent has not inspected the operator's private authentication state or
+rerun that attempt. The following are actual acceptance
 statuses, not predictions based on synthetic tests:
 
 | Criterion | Status | Evidence / outstanding work |
 | --- | --- | --- |
 | Disposable configuration verified | VERIFIED | New private Codex home; effective config/layers/requirements checked against controller pins; no inherited nonempty layer accepted |
 | Narrow standalone boundary verified | VERIFIED | Actual `command/exec`: fixture readable, worktree creation denied, private Codex-home sentinel read denied, loopback connection denied |
-| Authentication verified | UNVERIFIED | Requires fresh operator device login and unambiguous `account/read` |
+| Authentication verified | UNVERIFIED | Fresh login reported by operator; the first acceptance attempt failed before qualification |
 | Inference verified | UNVERIFIED | Requires one correlated, successfully completed model turn with the exact fixture response and validated usage |
 | Subscription usage attribution verified | UNVERIFIED | Neither auth type nor token counters prove subscription billing attribution |
 | API-key fallback excluded for live execution | UNVERIFIED | Offline exclusion checks pass; fresh file auth and runtime identity/config must pass before and after a real turn |
@@ -88,14 +92,17 @@ criteria. Command evidence keeps `codex_app_server_item` provenance and substitu
 `<disposable-workspace>` for cwd. It exposes only the fixed allowlisted command and
 fixture output, numeric usage and boolean identity binding, never account/email,
 tokens, thread/session IDs, runtime paths or raw errors. IDs and attempt state stay
-in private SQLite under the disposable root. `authentication=VERIFIED` refers to
-the preflight account snapshot; a later uncertain turn does not become verified
-inference. Upstream command completeness remains unknown. Usage counters cannot
+in private SQLite under the disposable root. Any blocker now revokes authentication,
+inference, identity, fallback and model-command qualification, including a blocker
+observed during shutdown. Upstream command completeness remains unknown. Usage counters cannot
 upgrade `subscriptionUsageAttribution`; that field deliberately remains UNVERIFIED
 until separate operator/service evidence is reviewed. The harness never authorizes
 the next stage or production migration by itself.
 
 ### Running this gate
+
+**The reported failure supersedes the normal sequence below. Only `diagnose-auth`
+is requested now; do not submit another turn or reset/reuse an uncertain claim.**
 
 Use Node 24+ and the existing checksum-pinned binary on a Linux host that permits
 the required namespaces. Do not update Codex, restart daemons, launch PAB, or use
@@ -148,7 +155,7 @@ that library is needed by Node only and is not inherited by the Codex child.
 
 ### Follow-up validation record
 
-The 23 new deterministic offline tests cover authentication/configuration rejection,
+The initial 23 deterministic offline tests cover authentication/configuration rejection,
 explicit environment exclusion, fresh-login gating, session/policy validation,
 uncertain submission persistence and duplicate prevention, transport loss, timeout,
 account changes, command/response/usage validation, sanitized output, and a
@@ -168,8 +175,142 @@ CLI sandbox initially blocked namespace/subprocess checks; the host-permission
 run passed without disabling enforcement. A full filesystem was resolved by
 removing only the dependency copy and npm cache created for the preceding
 feasibility task, preserving source/history/evidence. No production authentication
-was inspected or changed. Live authentication and all model observations remain
-pending operator interaction.
+was inspected or changed. Those results preceded the operator-reported failure;
+live authentication qualification and all model observations remain unverified.
+
+### PR #3 correction: notification diagnostics and read-only auth reconciliation
+
+The original PR head `824a68274bd3bac5a4a7e99a1c8f0e956e569174` had one
+`RUNTIME_UNCERTAINTY` branch in `TurnEvidence.receive`, reached by exactly four
+notification categories:
+
+| Incoming method | New sanitized category | Original behavior |
+| --- | --- | --- |
+| `error` | `runtime_error` | Unconditionally stop |
+| `account/updated` | `account_updated` | Unconditionally stop, even before initial account qualification |
+| Any `hook/` prefix | `hook_activity` | Unconditionally stop |
+| Any `mcpServer/` prefix | `mcp_activity` | Unconditionally stop |
+
+The original callback recorded only the shared blocker; `AppServerRpc` then failed
+the transport and pending requests. The supplied statuses place the failure around
+boundary completion/initial account qualification, before the model catalog, claim,
+thread or turn paths. Asynchronous notifications can share a transport chunk with a
+request response; completed flags cannot identify the precise notification or RPC.
+`account/updated` during `account/read` is a **hypothesis**, not an observed cause.
+The historical blocker remains unresolved; new diagnostics cannot reconstruct its
+lost event history. Errors/hooks/MCP remain unconditional failures. Post-reconciliation
+account notifications also retain `RUNTIME_UNCERTAINTY`.
+
+`notificationDiagnostics` contains at most 32 entries, each containing **only** a
+fixed recognized category and controller execution phase. Unknown method names map
+to `unsupported_notification`; names and payloads are never copied into diagnostics.
+No account values, IDs, tokens, event payloads, raw errors or timestamps are retained
+there. Overflow fails closed instead of discarding evidence. Additional categories
+cover configuration warnings, remote-control status and prohibited diagnostic-mode
+model activity. The phase labels are initialization, configuration, boundary,
+authentication, model selection, thread creation, pre-inference, inference,
+post-inference, completion and shutdown (underscore-separated identifiers in JSON).
+
+Pre-inference `account/updated` is **not ignored**. Its only acceptance rule is:
+
+1. Reconciliation must be enabled, still unqualified, and in initialization,
+   configuration, boundary or authentication. The unauthenticated preflight keeps
+   its strict rejection behavior.
+2. Exactly the pinned schema's `authMode` and `planType` fields are required, with
+   managed `chatgpt` auth and an existing supported subscription-plan value. Null,
+   other auth modes, unknown fields, free/unknown plans and more than eight updates
+   fail closed. Only a non-published in-memory projection hash is retained.
+3. Two consecutive `account/read` requests with `refreshToken: false` must produce
+   identical validated account bindings. Fresh-login/file identity checks bracket
+   the reads; effective configuration/layers/requirements are checked again. Every
+   pending notification's mode/plan must match the final snapshot. Read failure,
+   transport loss, file mutation or disagreement prevents qualification; there is
+   no reconciliation retry loop.
+4. Reconciliation locks before model selection or any inference claim. **Every**
+   subsequent account update, including an apparently identical mode/plan, fails
+   closed through inference, completion and shutdown. Such notifications do not
+   carry enough identity information to prove an active account stayed unchanged.
+   A late blocker revokes reported qualification rather than leaving VERIFIED flags.
+
+This establishes only a consistent current local snapshot, not historical account
+continuity, service-side token validity, subscription billing attribution or a
+completed inference. The [official app-server auth interface](https://learn.chatgpt.com/docs/app-server)
+documents optional refresh and account-update notifications; it does not establish
+which event occurred in the failed operator attempt.
+
+#### Operator-only read-only diagnostic
+
+From this PR's updated checkout, the operator may run:
+
+```bash
+node feasibility/local-codex/authenticated-acceptance.mjs diagnose-auth "$pab_auth_root"
+```
+
+Use the **existing** isolated root. Do not log in again, reset/delete a claim, or run
+`run` as part of this diagnosis. This mode never calls `model/list`, `thread/start`,
+`turn/start`, `command/exec`, login, logout, token refresh or any mutation RPC. It
+does not open the acceptance ledger or create/reset a claim, and prints only the
+sanitized report without writing a result file into the root.
+
+A separate disposable launcher places the existing root, including auth and claim
+files, behind a kernel-enforced read-only boundary and disables **all** app-server
+networking. No auth file is copied, symlinked, chmodded or rewritten. A separate
+empty private control home and scratch hold launcher/runtime bookkeeping and are
+removed on exit. Explicit `TMPDIR` and
+[`CODEX_SQLITE_HOME`](https://learn.chatgpt.com/docs/config-file/environment-variables)
+direct temporary/SQLite runtime bookkeeping to that scratch; no inherited override
+is accepted. Original app-server configuration and model-tool policy pins remain
+unchanged. Before/after private auth-file digests must match and are never printed.
+Missing kernel support or inability to start without writes/network is a blocker,
+not permission to make the root writable, refresh auth, or retry inference.
+
+The diagnostic's `standaloneBoundary` remains UNVERIFIED: it deliberately does not
+repeat the acceptance `command/exec`. Its protective outer sandbox is not model-tool
+equivalence. Even a successful local auth reconciliation leaves inference,
+subscription usage attribution, live API-key fallback exclusion and model command
+evidence UNVERIFIED. It never authorizes the next sandbox stage. Share only the
+sanitized JSON result; no raw logs, account responses, device codes or credentials.
+
+**Additional observed blocker:** strict read-only app-server startup is not proven
+on this pinned runtime. A newly created synthetic fixture reproduced
+`APP_SERVER_DISCONNECTED` in `initialization`, before any notification or account
+response, while preserving every original file and an existing synthetic claim.
+The same result occurred after initializing that fixture with the unauthenticated
+preflight and supplying a synthetic installation ID. Separate credential-free
+syscall checks observed denied startup writes beneath `codex/tmp/arg0` and
+`codex/installation_id`. Redirecting SQLite bookkeeping removed an earlier
+read-only SQLite prerequisite but did not establish successful initialization.
+Those are synthetic startup findings, **not evidence about the operator's original
+`RUNTIME_UNCERTAINTY`**. The mode remains safely available for operator diagnosis,
+but may stop at this earlier boundary and produce no notification categories.
+An empty diagnostic list means no captured notifications, not absence of a problem.
+
+Do not make the private root writable to bypass that blocker. A supported way to
+inspect app-server authentication without its startup writes remains necessary if
+the operator reproduces this result. Current code proves the reconciliation rule
+only with synthetic RPCs and proves fail-closed read-only protection with real
+kernel checks; it does **not** prove successful live read-only authentication
+inspection. `blockerPhase` supplies the fixed controller phase for failures without
+a captured notification. Unknown raw exceptions are collapsed to
+`ACCEPTANCE_UNCERTAIN`, never exposed as error text.
+
+#### Correction validation record
+
+- Focused command: **55/55 passed**, zero failures/skips (~9 seconds).
+- `npm test`: **181/181 passed**, zero failures/skips (~96 seconds).
+- `git diff --check`: passed.
+- Thirteen added regression tests cover bounded payload-free diagnostics, stable
+  pre-qualification reconciliation, rejected mode/plan/account/file changes,
+  post-qualification invalidation, hooks/MCP/errors, unknown raw-error suppression,
+  notification flooding, transport/read uncertainty, diagnostic RPC restrictions,
+  real read-only/network enforcement and the pinned runtime's fail-closed startup.
+- The real diagnostic CLI test is a **negative compatibility result**, not a
+  successful authentication check. Its fixture is generated entirely by the test;
+  all file contents, names and modes, including its uncertain claim, remain unchanged.
+- No real model turns, metered sessions, paid live tests or operator-private-root
+  inspection were performed for this correction. Only the three authorized PR
+  files change. Authenticated acceptance still requires independent evidence review;
+  no further sandbox stage, migration, deployment or merge is authorized.
 
 ## Scope and reproducibility
 
