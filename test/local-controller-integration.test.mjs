@@ -107,6 +107,125 @@ test('local-only initialization and execution do not construct an inference API 
   } finally { if (previous === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previous; }
 });
 
+function nativeItem(backend, item, method = 'item/completed') {
+  backend.options.onProgress({ method, params: { threadId: backend.identity.threadId, turnId: backend.identity.turnId, item } });
+}
+
+test('local notification evidence is durable before completion and packets reuse controller Git snapshots without API evidence', async context => {
+  const value = await setup(context, {}, { noApi: true });
+  value.input.contract.test_commands = ['python3 check.py', 'python3 missing.py'];
+  const started = await value.start(), backend = await value.running(), { controller } = value;
+  const repo = path.join(controller.workspaceRoot, started.task_id, 'repo');
+  const item = { type: 'commandExecution', id: 'native-test', command: 'python3 check.py', cwd: repo, status: 'inProgress' };
+  nativeItem(backend, item, 'item/started');
+  let durable = JSON.parse(controller.db.prepare('SELECT value FROM tasks WHERE id=?').get(started.task_id).value);
+  assert.equal(durable.local_execution_evidence.commands[0].start_observed, true);
+  assert.equal(durable.implementer.local.terminal_observed, false);
+  await assert.rejects(controller.buildPacket(durable), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
+  nativeItem(backend, { ...item, status: 'completed', exitCode: 0, aggregatedOutput: 'ok token=private\n' });
+  nativeItem(backend, { type: 'fileChange', id: 'native-file', status: 'completed', changes: [
+    { path: path.join(repo, 'greeting.txt'), kind: { type: 'update', move_path: null }, diff: '+model claim\n' },
+  ] });
+  durable = JSON.parse(controller.db.prepare('SELECT value FROM tasks WHERE id=?').get(started.task_id).value);
+  assert.equal(durable.local_execution_evidence.commands[0].exit_code, 0);
+  assert.equal(durable.local_execution_evidence.file_changes[0].start_observed, false);
+  assert.equal(durable.implementer.local.terminal_observed, false);
+  await fs.writeFile(path.join(repo, 'greeting.txt'), 'actual controller-observed contents\n');
+  await fs.writeFile(path.join(repo, 'unauthorized.txt'), 'unauthorized\n');
+  backend.finish(); await value.drain();
+  const packet = await controller.buildPacket(controller.task(started.task_id)), data = JSON.parse(packet.text);
+  assert.equal(data.evidence_version, 'pab.local-codex-review.v1');
+  assert.equal(data.current['greeting.txt'], 'actual controller-observed contents\n');
+  assert.equal(data.baseline['greeting.txt'], 'baseline\n');
+  assert.equal(data.file_byte_evidence['greeting.txt'].provenance, 'controller');
+  assert.equal(data.baseline_commit, value.baseline); assert.equal(data.current_commit, value.baseline);
+  assert.equal(data.baseline_state.head, value.baseline);
+  assert.equal(data.current_config_hash, data.baseline_state.config_hash);
+  assert.deepEqual(data.unauthorized_files, ['unauthorized.txt']);
+  assert.equal(data.controller_evidence.normal_checkout.comparison.status, 'unchanged');
+  assert.equal(data.controller_evidence.task_worktree.status, 'validated');
+  assert.equal(data.controller_evidence.git_operations.executor_isolation.status, 'unavailable');
+  assert.equal(data.native_activity.commands[0].provenance, 'codex_app_server_notification');
+  assert.equal(data.required_test_correlation.tests[0].status, 'native_observations_only');
+  assert.equal(data.required_test_correlation.tests[1].status, 'unmatched');
+  assert.equal(data.independent_validation.status, 'unavailable');
+  assert.equal(data.command_execution_evidence, undefined); assert.equal(data.file_rpc_operation_evidence, undefined);
+  assert.equal(controller.task(started.task_id).file_rpc_evidence, undefined); assert.equal(controller._api, undefined);
+  assert(!packet.text.includes('Model says')); assert(!packet.text.includes('untrusted test')); assert(!packet.text.includes('token=private'));
+  assert.equal(data.gates.local_review, 'disabled'); assert.equal(data.gates.local_publication, 'disabled');
+  await assert.rejects(controller.review({ task_id: started.task_id, request_id: 'local_packet_review' }), /LOCAL_REVIEW_UNSUPPORTED/);
+  await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+});
+
+test('packet detects changed original checkout rather than trusting local command claims', async context => {
+  const value = await setup(context, { status: 'completed' });
+  const started = await value.start(); await value.drain();
+  await fs.writeFile(path.join(value.normal, 'greeting.txt'), 'changed after baseline capture\n');
+  const data = JSON.parse((await value.controller.buildPacket(value.controller.task(started.task_id))).text);
+  assert.equal(data.controller_evidence.normal_checkout.comparison.status, 'conflicting');
+  assert.deepEqual(data.native_activity.commands, []);
+  assert.equal(data.independent_validation.status, 'unavailable');
+});
+
+test('local packet refuses altered worktree mapping and TASK.md using existing checks', async context => {
+  const value = await setup(context, { status: 'completed' });
+  const started = await value.start(); await value.drain();
+  const task = value.controller.task(started.task_id), repo = path.join(value.controller.workspaceRoot, task.id, 'repo');
+  const taskText = await fs.readFile(path.join(repo, 'TASK.md'), 'utf8');
+  await fs.writeFile(path.join(repo, 'TASK.md'), 'tampered');
+  await assert.rejects(value.controller.buildPacket(task), /TASK_CONTRACT_CHANGED/);
+  await fs.writeFile(path.join(repo, 'TASK.md'), taskText);
+  repoGit(repo, 'checkout', '-b', 'unexpected');
+  await assert.rejects(value.controller.buildPacket(task), /TASK_BRANCH_CHANGED/);
+});
+
+test('local notification persistence failure propagates without retaining fabricated evidence', async context => {
+  const value = await setup(context), started = await value.start(), backend = await value.running();
+  const save = value.controller.save;
+  value.controller.save = () => { throw Error('synthetic write failure'); };
+  try {
+    assert.throws(() => nativeItem(backend, { type: 'commandExecution', id: 'lost', command: 'true', cwd: backend.options.cwd, status: 'completed', exitCode: 0, aggregatedOutput: '' }), /synthetic write failure/);
+  } finally { value.controller.save = save; }
+  assert.deepEqual(value.controller.task(started.task_id).local_execution_evidence.commands, []);
+  backend.finish('uncertain', false); await value.drain();
+  const data = JSON.parse((await value.controller.buildPacket(value.controller.task(started.task_id))).text);
+  assert.equal(data.execution.state, 'uncertain'); assert.equal(data.execution.terminal_observed, false);
+});
+
+for (const status of ['failed', 'interrupted', 'uncertain']) test(`local packet preserves incomplete command and ${status} lifecycle`, async context => {
+  const value = await setup(context), started = await value.start(), backend = await value.running();
+  nativeItem(backend, { type: 'commandExecution', id: 'incomplete', command: 'true', cwd: backend.options.cwd, status: 'inProgress' }, 'item/started');
+  backend.finish(status, status !== 'uncertain'); await value.drain();
+  const data = JSON.parse((await value.controller.buildPacket(value.controller.task(started.task_id))).text);
+  assert.equal(data.execution.state, status); assert(data.native_activity.commands[0].missing.includes('completion'));
+  assert.equal(data.native_activity.commands[0].exit_code, null); assert.equal(data.native_activity.exhaustive, false);
+});
+
+test('pre-ledger local tasks expose unavailable history, not a reconstructed success', async context => {
+  const value = await setup(context, { status: 'completed' }), started = await value.start(); await value.drain();
+  const task = value.controller.task(started.task_id); delete task.local_execution_evidence; value.controller.save(task);
+  const data = JSON.parse((await value.controller.buildPacket(task)).text);
+  assert.equal(data.native_activity.status, 'unavailable'); assert.equal(data.independent_validation.status, 'unavailable');
+});
+
+test('local packet overflow persists shared size diagnostics without API retrieval or section loss', async context => {
+  const value = await setup(context, { status: 'completed' }, { noApi: true }), started = await value.start(); await value.drain();
+  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(70000));
+  await assert.rejects(value.controller.buildPacket(value.controller.task(started.task_id)), error =>
+    error.code === 'EVIDENCE_SIZE_LIMIT' && error.diagnostic.required_section === 'local_packet');
+  const saved = value.controller.task(started.task_id);
+  assert.equal(saved.review_packet_diagnostic.limit_bytes, 128 * 1024);
+  assert(saved.review_packet_diagnostic.measured_bytes > 128 * 1024);
+  assert.equal(saved.reviewer, undefined); assert.equal(value.controller._api, undefined);
+});
+
+test('unconfirmed app-server closure blocks local packet preparation even after job settlement', async context => {
+  const value = await setup(context, { status: 'completed', closeFails: true }), started = await value.start(); await value.drain();
+  const saved = value.controller.task(started.task_id);
+  assert.equal(saved.implementer.local.server_closed, false);
+  await assert.rejects(value.controller.buildPacket(saved), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
+});
+
 test('invalid backend, unsupported non-repository local tasks and protected scope fail before provisioning', async context => {
   const value = await setup(context);
   for (const execution_backend of ['other', null, 1]) await assert.rejects(value.controller.start({ ...value.input, execution_backend }), /INVALID_EXECUTION_BACKEND/);
@@ -210,6 +329,8 @@ test('restart retains acknowledged identity and completed results but never repl
     assert.equal(result.state, 'needs_attention'); assert.equal(result.implementer.local.thread_id, 'thread-fixture');
     assert.equal(result.implementer.local.turn_id, 'turn-fixture'); assert.equal(result.implementer.local.execution_state, 'uncertain');
     assert.match(result.implementer.local.diagnostics.join(), /NO_REPLAY/); assert.equal(value.instances.length, 2);
+    assert.deepEqual(recovered.task(unresolved.id).local_execution_evidence, unresolved.local_execution_evidence);
+    await assert.rejects(recovered.buildPacket(recovered.task(unresolved.id)), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
     assert.equal((await recovered.start(retry)).task_id, unresolved.id); assert.equal(value.instances.length, 2);
     const cleanup = await recovered.cleanup({ task_id: unresolved.id, delete_workspace: true });
     assert.match(cleanup.cleanup.cleanup_diagnostic, /LOCAL_OWNER_UNAVAILABLE/);
