@@ -5,6 +5,7 @@ import OpenAI from 'openai';
 import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence } from './review-evidence.mjs';
+import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -486,6 +487,7 @@ export class Controller {
     if (this.closed || task.implementer.stopping) return;
     await verifyTaskWorktree(path.join(this.workspaceRoot, id), task.repository);
     if (this.closed || this.task(id).implementer.stopping) return;
+    task = this.task(id); task.local_execution_evidence = createLocalEvidence(id); this.save(task);
     const abort = new AbortController();
     const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.timeoutMs, deferHumanRequests: true, onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
@@ -518,10 +520,12 @@ export class Controller {
     }, onProgress: event => {
       if (this.dbClosed) return;
       const params = event.params || {}, current = this.task(id), local = current.implementer.local;
+      const evidenceChanged = observeLocalEvidence(current.local_execution_evidence, event, local, this.bounded.bind(this));
       let output;
       if (event.method === 'item/agentMessage/delta' && typeof params.delta === 'string') output = (local.latest_model_output || '') + params.delta;
       if (event.method === 'item/completed' && params.item?.type === 'agentMessage') output = params.item.text;
-      if (typeof output === 'string') { local.latest_model_output = this.bounded(output, 4096); local.output_truncated ||= output.length > 4096; this.save(current); }
+      if (typeof output === 'string') { local.latest_model_output = this.bounded(output, 4096); local.output_truncated ||= output.length > 4096; }
+      if (evidenceChanged || typeof output === 'string') this.save(current);
     } });
     this.localRuns.set(id, { backend, abort });
     task = this.task(id); Object.assign(task.implementer.local, { instance_started: true, owner_instance: this.instanceId, phase: 'preflight' }); this.save(task);
@@ -850,6 +854,10 @@ export class Controller {
     }
   }
   async buildPacketData(t) {
+    if (t.execution_backend === 'local_codex') {
+      t = this.task(t.id);
+      if (this.jobs.has(`${t.id}:implementer`) || this.localRuns.has(t.id) || t.implementer.local.server_closed !== true) throw new BridgeError('LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED');
+    }
     const root = path.join(this.workspaceRoot, t.id); const repo = path.join(root, 'repo');
     const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'));
     const reviewedState = t.repository ? await reviewedGitState(root, t) : null;
@@ -888,6 +896,18 @@ export class Controller {
       baseline[name] = text === null ? { encoding: 'binary', byte_length: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') } : text;
     }
     const changed = repositoryChanges || [...new Set([...git(repo, 'diff', '--name-only', t.baseline).trim().split('\n'), ...git(repo, 'ls-files', '--others').trim().split('\n')].filter(Boolean))];
+    if (t.execution_backend === 'local_codex') {
+      const data = { ...localEvidencePacket(t, contract.test_commands, repo),
+        reviewed_git_state: reviewedState, controller_evidence: await repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this)),
+        file_byte_evidence: fileBytes, baseline_state: JSON.parse(await fs.readFile(path.join(root, 'baseline-state.json'), 'utf8')),
+        current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
+        contract: contractMarkdown(contract, 'local_codex'), baseline_commit: t.baseline, current_commit: git(repo, 'rev-parse', 'HEAD').trim(),
+        staged_files: git(repo, 'diff', '--cached', '--name-only'), changed_files: changed, unauthorized_files: changed.filter(name => !contract.allowed_files.includes(name)),
+        baseline, current, diff: await this.repositoryDiff(repo, t.baseline) };
+      if (JSON.stringify(await publicationState(repo)) !== JSON.stringify(reviewedState.state)) throw new BridgeError('WORKTREE_CHANGED_DURING_REVIEW');
+      const packet = budgetLocalPacket(JSON.parse(this.safe(JSON.stringify(data))));
+      return { ...packet, hash: digest(packet.text) };
+    }
     const tests = [], commands = [], candidates = []; let count = 0, commandBytes = 0, omitted = 0, complete = true;
     let commandError = null; const matchedTests = new Set();
     try {

@@ -114,6 +114,57 @@ Post-completion/new-turn continuation and restart reattachment remain unsupporte
 Local `review_task` and `publish_task` still reject with `LOCAL_REVIEW_UNSUPPORTED`
 and `LOCAL_PUBLISH_UNSUPPORTED`; separate evidence integration is required.
 
+### Local evidence groundwork (not review authorization)
+
+The Controller synchronously retains bounded `item/started` and `item/completed`
+command/file-change notifications in `task.local_execution_evidence` in its existing
+SQLite store. Source task/thread/turn/item identity, command, cwd, status, exit code,
+output, missing fields, redaction/truncation and rejected/omitted event counts remain
+explicit. File-change claims are separate from controller-observed file bytes.
+Model prose, reasoning, human answers and raw notification logs are excluded.
+Final adapter summaries cannot reconstruct missing notification history.
+
+The internal `Controller.buildPacket(task)` path can prepare a
+`pab.local-codex-review.v1` packet after the local job is finished and the owned
+app-server is confirmed closed. This is groundwork, not a new MCP operation or an
+independent review. It reuses pinned-baseline/worktree validation, contract checks,
+controller before/after repository snapshots, current file hashes, unauthorized
+file detection and Git state checks. Agents API packet behavior is unchanged;
+native notifications never populate Agents API or file-RPC evidence structures.
+
+Limits: at most 64 command/file records together and 24 KiB of record JSON;
+commands/output are each bounded to 2048 characters, cwd to 1024, and file-change
+records to 16 entries with 1024-character paths/diffs. Overflow is counted, not
+silently treated as complete history. Packets share the existing 128 KiB UTF-8
+limit and reject overflow without dropping required sections. Sensitive text uses
+existing controller redaction; evidence remains private operational data.
+
+Required tests correlate only exact command strings at the approved cwd, not
+substrings or inferred shell wrappers. References to native records are **not
+independently verified validation**, even with exit code zero. Unmatched tests,
+incomplete starts/completions, missing output/exit codes, truncation and uncertain
+or interrupted turns remain visible. Old tasks without a ledger report unavailable
+history. Upstream output completeness and exhaustive command/file coverage remain
+unverified. Notifications cannot prove absence of prohibited operations.
+
+Snapshots are sampled state, not a syscall/network audit or immutable freeze.
+Existing Git diff enumeration can omit ignored writes; the normal-checkout snapshot
+includes ignored files. App-server closure does not attest descendant termination,
+and concurrent external changes remain a possible capture race despite before/after
+Git checks. No independent PASS or publication authorization is produced.
+
+Remaining gates: **PR #6 live human-routing acceptance remains UNVERIFIED**;
+independent local reviewer semantics/execution, validation evidence, reviewed-tree
+binding and publisher integration need separate review and authorization. Local
+`review_task`/`publish_task` remain disabled. No live turns are needed for the offline
+evidence tests:
+
+```bash
+node --test test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
+npm test
+git diff --check
+```
+
 Cleanup initiates cancellation before waiting on a local job, closes the owned
 app-server, and bounds each wait. Shutdown does the same. Files remain unless
 `delete_workspace=true`; deletion reuses the task worktree removal mechanism and
@@ -203,7 +254,7 @@ npm test
 git diff --check
 ```
 
-This controller slice passes **61 focused, 17 controller, and 207 full offline tests**,
+The initial PR #5 controller slice recorded **61 focused, 17 controller, and 207 full offline tests**,
 with **0 failures and 0 skipped tests** in each run; `git diff --check` also passes.
 Validation uses injected adapters, never real model turns. Offline tests do not
 establish live authentication, billing attribution or controller live acceptance.
@@ -257,8 +308,8 @@ Inspect the private command evidence as well as the fixture; do not publish raw 
 or rerun an uncertain turn automatically. The reported live success is limited to
 the bounded fixture acceptance above.
 This acceptance was for the standalone adapter, not this controller integration.
-PR #6 must establish durable human-response routing and safe same-thread continuation,
-including uncertain-submission reconciliation, before enabling local `continue_task`.
+PR #6 adds offline-tested durable human-response routing to the same live turn;
+its live human-routing acceptance remains unverified. Uncertain delivery is not replayed.
 Local independent review and publication remain separately blocked; this PR does not
 change their existing Agents API gates or authorize deployment.
 
