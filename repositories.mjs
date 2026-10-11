@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
 const SOURCE = path.dirname(fileURLToPath(import.meta.url));
 export const repositoryIdPattern = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -39,6 +40,41 @@ export async function readRegistry(file) {
     return value;
   } catch (e) { if (e.code === 'ENOENT') return { version: 1, repositories: {} }; throw e; }
 }
+export async function withRegistryLock(file, operation) {
+  const parent = path.dirname(file), lock = `${file}.lock`;
+  const stat = await fs.lstat(parent);
+  if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077) || await fs.realpath(parent) !== parent) fail('UNSAFE_REPOSITORY_REGISTRY');
+  try { await fs.mkdir(lock, { mode: 0o700 }); }
+  catch (error) { if (error.code === 'EEXIST') fail('REPOSITORY_REGISTRY_BUSY'); throw error; }
+  try { return await operation(); }
+  finally { await fs.rmdir(lock); }
+}
+export async function writeRegistry(file, registry) {
+  const text = JSON.stringify(registry, null, 2) + '\n';
+  if (Buffer.byteLength(text) > 65536) fail('REPOSITORY_REGISTRY_LIMIT');
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  let created = false;
+  try {
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    created = true;
+    try { await handle.writeFile(text); await handle.sync(); } finally { await handle.close(); }
+    await fs.rename(temporary, file);
+    const directory = await fs.open(path.dirname(file), 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  } finally { if (created) await fs.rm(temporary, { force: true }); }
+}
+export function verifyGitHubBinding(identity, id, binding) {
+  if (!binding || !Number.isSafeInteger(binding.repository_id) || binding.repository_id <= 0 || id !== `github_${binding.repository_id}` ||
+      !Number.isSafeInteger(binding.owner_id) || binding.owner_id <= 0 || !/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(binding.full_name || '') ||
+      !/^[a-f0-9]{40}$/.test(binding.baseline_commit || '') || typeof binding.private !== 'boolean' ||
+      typeof binding.default_branch !== 'string' || !binding.default_branch || identity.git_directory !== path.join(identity.path, '.git')) fail('GITHUB_REGISTRATION_INVALID');
+  const origin = `https://github.com/${binding.full_name}.git`;
+  let config;
+  try { config = repoGit(identity.path, 'config', '--local', '--get-regexp', '^remote[.]origin[.](url|pushurl)$').trim().split('\n'); }
+  catch { fail('GITHUB_REGISTRATION_ORIGIN_CHANGED'); }
+  if (config.length !== 1 || config[0] !== `remote.origin.url ${origin}`) fail('GITHUB_REGISTRATION_ORIGIN_CHANGED');
+  if (repoGit(identity.path, 'rev-parse', '--verify', 'HEAD^{commit}').trim() !== binding.baseline_commit) fail('GITHUB_REGISTRATION_BASELINE_CHANGED');
+}
 export async function resolveRepository(file, id, baseRef, workspaceRoot, stateRoot) {
   if (!repositoryIdPattern.test(id)) fail('INVALID_REPOSITORY_ID');
   if (typeof baseRef !== 'string' || baseRef.length > 200 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(baseRef) || baseRef.includes('..')) fail('INVALID_BASE_REF');
@@ -47,12 +83,14 @@ export async function resolveRepository(file, id, baseRef, workspaceRoot, stateR
   const saved = registry.repositories[id];
   const current = await repositoryIdentity(saved.path);
   if (JSON.stringify(current) !== JSON.stringify(saved)) fail('REPOSITORY_PATH_CHANGED');
+  const github = registry.github_repositories?.[id];
+  if (github) verifyGitHubBinding(current, id, github);
   for (const root of [workspaceRoot, stateRoot]) if (within(current.path, root) || within(root, current.path)) fail('REPOSITORY_OVERLAPS_BRIDGE_STORAGE');
   let baseline;
   try { baseline = repoGit(current.path, 'rev-parse', '--verify', `${baseRef}^{commit}`).trim(); }
   catch { fail('BASE_REF_NOT_FOUND'); }
   if (!/^[a-f0-9]{40,64}$/.test(baseline)) fail('INVALID_BASELINE');
-  return { repository_id: id, canonical_path: current.path, registered_identity: current, base_ref: baseRef, baseline_commit: baseline };
+  return { repository_id: id, canonical_path: current.path, registered_identity: current, base_ref: baseRef, baseline_commit: baseline, ...(github ? { github_identity: github } : {}) };
 }
 export async function createTaskWorktree(root, id, repository) {
   // Never share writable objects, refs, config, hooks or worktree metadata with the source.

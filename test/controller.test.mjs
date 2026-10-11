@@ -94,12 +94,12 @@ test('tunnel gate rejects missing, shared, expired, mismatched, and unsafe confi
   for (const bad of [{ personal_only: false }, { sole_authorized_user: false }, { associated_workspaces: ['workspace_personal', 'shared'] }, { expires_at: new Date(now - 1).toISOString() }, { tunnel_id: 'tunnel_wrong' }]) { await fs.writeFile(file, JSON.stringify({ ...good, ...bad })); await assert.rejects(authorizePersonalTunnel(opts)); }
   await fs.writeFile(file, JSON.stringify(good)); await fs.chmod(file, 0o644); await assert.rejects(authorizePersonalTunnel(opts));
 });
-test('MCP advertises exactly six tools; schema/authorization failures cannot execute', async t => {
+test('MCP advertises exactly eight tools; schema/authorization failures cannot execute', async t => {
   const { c, api } = await setup(t); let allowed = false;
   const server = createServer(c, async () => { if (!allowed) throw Error('private'); });
   const client = new Client({ name: 'local-test', version: '1' }); const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
   t.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'publish_task', 'review_task', 'start_task']);
+  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
   assert.equal(list.tools.find(x => x.name === 'get_task').annotations.readOnlyHint, true);
   assert.equal(list.tools.find(x => x.name === 'cleanup_task').annotations.destructiveHint, true);
   const input = { name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_request' } };

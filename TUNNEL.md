@@ -79,7 +79,8 @@ not forward that override. Consult `tunnel-client help quickstart` for CLI detai
 
 Require `process_running`, `healthy` and `ready` before discovery. Connect the
 verified tunnel from ChatGPT developer-mode plugin settings and inspect all six
-MCP tools, including `publish_task`. Discovery should not start a task.
+MCP task tools plus `list_registered_repositories` and `register_github_repository`
+(eight total). Discovery should not start a task.
 Use a disposable example repository for the first explicitly authorized execution.
 
 Before restart, inspect owned sessions/turns and executor processes. Do not stop
@@ -91,5 +92,10 @@ For controller publication, `/usr/bin/gh` must be authenticated to the intended
 GitHub account with push and PR permissions. The managed tunnel helper does not
 forward `GH_TOKEN`/`GITHUB_TOKEN`; an existing owner-controlled gh login is the
 supported managed-launch setup. Never copy that login into a task workspace.
+The same trusted `gh` login authorizes remote registration by matching numeric
+authenticated-user and repository-owner IDs; it never grants organization or
+collaborator-only registration. The existing tunnel checks protect both new tools,
+but do not prove individual conversational consent. See README for the fixed
+provisioning root, one-time deployment and interrupted-registration recovery.
 Because repository reads are broad, a dedicated host without unrelated credentials
 is essential; see [SECURITY.md](SECURITY.md).

@@ -666,7 +666,7 @@ test('MCP exposes explicit local opt-in and persisted state without adding opera
   const client = new Client({ name: 'local-integration-test', version: '1' }), [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport); await client.connect(clientTransport);
   context.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.equal(list.tools.length, 6);
+  const list = await client.listTools(); assert.equal(list.tools.length, 8);
   assert.match(client.getInstructions(), /qualified local Codex repository tasks/);
   assert.match(client.getInstructions(), /No local post-completion continuation\./);
   assert(!client.getInstructions().includes('No local post-completion continuation, review or publication'));

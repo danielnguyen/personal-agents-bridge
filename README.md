@@ -3,7 +3,7 @@
 A single-owner demonstration of **ChatGPT → MCP → Agents API → self-hosted Codex
 → sandboxed Git worktree → independent review → exact-tree draft PR publication**.
 
-ChatGPT invokes six MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
+ChatGPT invokes eight MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
 API sessions and connects a local Codex executor. For an allowlisted repository,
 implementation happens in an isolated Git worktree backed by a task-private Git
 store. Command networking is disabled; writes are confined to the task worktree
@@ -534,7 +534,7 @@ Follow [TUNNEL.md](TUNNEL.md) for the private tunnel, owner confirmation and
 self-hosted execution setup. Start the production bridge with `./run.sh` only under
 the configured tunnel; its singleton lock prevents two controllers using one store.
 
-Register a separate, explicitly approved repository locally:
+Register a separate, explicitly approved repository locally (still supported):
 
 ```bash
 node register-repository.mjs example /absolute/path/to/approved-repository
@@ -545,10 +545,116 @@ registry. It rejects this bridge's source repository. Never register the bridge 
 its own implementation target. MCP callers use only `repository_id: "example"`.
 No repository registrations or account configuration are shipped with this source.
 
+### Remote registration of owned GitHub repositories
+
+After one-time deployment and trusted GitHub authentication, eligible registrations
+require **no SSH session or per-repository host approval**. Ask ChatGPT to discover
+registrations with `list_registered_repositories`, explain the requested registration
+and obtain your consent, then call:
+
+```json
+{"repository":"danielnguyen/browser-trust-inspector"}
+```
+
+on `register_github_repository`. The result contains `status`, `repository_id`
+(`github_<numeric GitHub repository ID>`), numeric GitHub repository/owner IDs,
+canonical full name, visibility and a confirmed baseline commit. Separately
+authorize `start_task` with that returned ID, a complete contract, a unique
+`request_id`, and **`execution_backend: "local_codex"`**. Registration never starts
+a task or changes the default Agents API backend. Discovery is read-only and
+returns no local paths; legacy local registrations may lack numeric GitHub metadata.
+
+The Controller, not ChatGPT or an implementation agent, enforces authorization:
+GitHub's authenticated `/user` must be a user account whose numeric ID matches the
+repository owner's numeric ID and whose login matches the API repository identity.
+Accessible owned private repositories are supported. Organizations, collaborator-only
+access, missing access/identity and the PAB source repository are rejected. The
+source denylist pins this distribution's GitHub repository ID `1388046916` as well
+as its canonical name, so renaming that repository does not evade self-protection.
+Forked deployments must retain equivalent protection for their own source identity.
+The single-owner tunnel gate applies to both tools; conversational consent is **not**
+independently authenticated human identity. Every accepted caller has the owner's
+registration authority within this policy.
+
+Repositories are provisioned beneath the fixed, private
+`~/.local/share/personal-agents-bridge/repositories`, never a caller-selected path.
+Only generated HTTPS GitHub URLs are used. No URL, path, credential, Git option or
+shell command is accepted through MCP. The Controller obtains GitHub credentials
+through its existing `gh` login/environment; no credential value or helper setting
+is copied into a repository or task. Hooks/templates and global/system Git config
+are disabled during provisioning. Filters have no configured executable drivers;
+submodules and symlink entries are rejected rather than followed. No dependencies
+or repository code are executed. This is not a new confidentiality boundary: the
+existing broad-read limitations in [SECURITY.md](SECURITY.md) still apply.
+
+Provisioning fetches the default branch history into a staged checkout, verifies
+the API-pinned commit, checks the tree before checkout, and rechecks GitHub ownership
+and identity afterward. The existing version-1 registry retains its canonical
+path/directory/Git identities, with a separate `github_repositories` binding map.
+Task resolution verifies the origin and registered baseline; publication also checks
+GitHub numeric identity to reject repository replacement or transfer. All existing
+worktree, validation, review and exact-tree publication gates still apply.
+
+Identical requests revalidate and return `already_registered`; they do not refresh
+the baseline or alter an existing checkout. Rename, transfer, origin/identity changes
+and local ID/path collisions fail closed. An existing host-registered GitHub origin
+is discovered by its original logical ID, not silently duplicated. Empty, archived,
+disabled, oversized or unsupported-content repositories are rejected. API-reported
+repository size and checked-out file bytes are each capped at 128 MiB; at most
+20,000 entries are inspected, with bounded Git/API output. The registry remains
+capped at 64 KiB, with at most 100 discovery entries. These are admission and
+evidence limits, **not a filesystem quota** on downloaded history. API commands have
+15-second limits. Existing coreutils `/usr/bin/timeout` bounds the fetch process
+group at 120 seconds, with a 125-second parent fallback and discarded transport
+output; no network retry is automatic. Unexpected termination remains fail-closed.
+
+#### Failure recovery and deployment
+
+Both registration writers share an exclusive `repositories.json.lock` directory.
+Controller requests serialize; another process receives `REPOSITORY_REGISTRY_BUSY`.
+Registry updates use exclusive private temporary files, file synchronization, atomic
+rename and parent synchronization. Completed checkouts are published before registry
+entries. A failure cannot advertise a partial checkout as registered.
+
+A crash may leave the lock, a `.stage-github_<id>` directory, a registry temporary
+file, or an unregistered `github_<id>` checkout. Fetch failure retains its stage,
+because subprocess termination can be uncertain; retries do not reuse it. A registry
+write failure after checkout publication retains that unregistered destination.
+No startup replay, automatic lock stealing, orphan adoption, destructive replacement
+or hash repair is performed. A lost acknowledgement after a successful registry
+replacement can return the existing entry only after complete identity validation.
+`REGISTRATION_INCOMPLETE_REQUIRES_INSPECTION`, `REGISTRATION_DESTINATION_EXISTS`, or
+a persistent `REPOSITORY_REGISTRY_BUSY` require a trusted operator to stop further
+registration, establish that the original Controller/fetch/helper processes have
+exited, inspect registry identities and private artifacts, and remove **only confirmed
+unregistered** leftovers/abandoned locks before a new explicit request. Do not delete
+registered repositories. Ordinary successful registrations need no host intervention;
+uncertain filesystem/process failures deliberately do.
+
+For deployment, independently review and merge first, stage a clean release with
+locked dependencies, preserve/backup the existing registry and state, ensure the
+managed runtime has `/usr/bin/timeout` and its user has an authenticated GitHub **user** account with repository
+read access and storage available under the fixed provisioning root, and switch the
+existing launch profile only during an owner-authorized idle restart. No credential
+or registry migration is required. Use this release's local registration CLI, not
+an older writer that lacks the shared lock. The managed tunnel does not forward
+`GH_TOKEN`/`GITHUB_TOKEN`; its existing private `gh` login is the supported route.
+Do not copy credentials, acceptance state or fixtures into a release/task checkout.
+
+Post-deployment acceptance requires separate authorization: discover registrations;
+register a small, owner-owned disposable public/private GitHub fixture; verify numeric
+identity and baseline, repeat once and confirm no second checkout; verify organization
+and collaborator-only denial; then separately authorize a local task with a minimal
+contract and confirm isolated worktree execution. Validation, review and publication
+remain separate approvals. Offline mocks do not establish live credential, transport,
+or production acceptance. No live registration is part of implementation validation.
+
 ## Workflow
 
 | Tool | Purpose |
 | --- | --- |
+| `list_registered_repositories` | Discover bounded logical IDs and GitHub identity without host paths. |
+| `register_github_repository` | Controller-register an eligible GitHub user-owned repository; never starts execution. |
 | `start_task` | Start a contract in a disposable workspace or allowlisted repository worktree. |
 | `get_task` | Inspect bounded progress, clarification, review and publication state. |
 | `continue_task` | Answer clarification or explicitly request further implementation. |

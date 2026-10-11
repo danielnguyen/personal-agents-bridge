@@ -70,6 +70,7 @@ export class GitHubPublisher {
     const push = githubRepository(repoGit(repository.canonical_path, 'remote', 'get-url', '--push', 'origin').trim());
     if (fetch.toLowerCase() !== push.toLowerCase()) fail('PUBLICATION_ORIGIN_MISMATCH');
     const r = this.api(`repos/${fetch}`);
+    if (repository.github_identity && (r.id !== repository.github_identity.repository_id || r.owner?.id !== repository.github_identity.owner_id || r.owner?.type !== 'User' || r.full_name !== repository.github_identity.full_name)) fail('PUBLICATION_GITHUB_IDENTITY_CHANGED');
     if (r.full_name?.toLowerCase() !== fetch.toLowerCase() || typeof r.default_branch !== 'string' || r.archived) fail('PUBLICATION_TARGET_INVALID');
     return { repository: r.full_name, base: r.default_branch, remote: `https://github.com/${r.full_name}.git` };
   }

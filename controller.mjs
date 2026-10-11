@@ -9,6 +9,7 @@ import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetL
 import { localReviewerInstructions, validateLocalReview, localExecutionQualified } from './local-reviewer-instructions.mjs';
 import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
+import { GitHubRegistration, RegistrationError } from './github-registration.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, createHash } from 'node:crypto';
@@ -190,19 +191,45 @@ export class LocalExecutor {
   }
 }
 export class Controller {
-  constructor({ stateRoot = `${homedir()}/.local/state/personal-agents-bridge`, workspaceRoot = '/var/tmp/personal-agents-bridge', api, executor, localBackendFactory = options => new LocalCodexBackend(options), localValidationFactory = options => new LocalValidation(options), publisher = new GitHubPublisher(), secrets, model = 'gpt-6-astra', timeoutMs = 900000 } = {}) {
+  constructor({ stateRoot = `${homedir()}/.local/state/personal-agents-bridge`, workspaceRoot = '/var/tmp/personal-agents-bridge', api, executor, localBackendFactory = options => new LocalCodexBackend(options), localValidationFactory = options => new LocalValidation(options), publisher = new GitHubPublisher(), registrationFactory = options => new GitHubRegistration(options), secrets, model = 'gpt-6-astra', timeoutMs = 900000 } = {}) {
     this.stateRoot = path.resolve(stateRoot); this.workspaceRoot = path.resolve(workspaceRoot); this.model = model;
     this.secrets = secrets || ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_EXECUTOR_API_KEY', 'CONTROL_PLANE_API_KEY'].map(k => process.env[k]).filter(Boolean);
     this._api = api;
     this.localBackendFactory = localBackendFactory; this.localRuns = new Map();
     this.localValidationFactory = localValidationFactory; this.validationRuns = new Map();
     this.publisher = publisher;
+    this.registration = registrationFactory({ stateRoot: this.stateRoot, workspaceRoot: this.workspaceRoot });
     this.executor = executor || new LocalExecutor({ secrets: this.secrets });
     this.context = new AsyncLocalStorage(); this.instanceId = randomUUID();
     this.executor.onExit = status => this.executorExited(status);
     this.timeoutMs = timeoutMs; this.jobs = new Map(); this.streams = new Map(); this.cache = new Map(); this.locks = new Map(); this.closed = false;
   }
   get api() { return this._api ||= new OpenAI({ maxRetries: 0, timeout: 30000, logLevel: 'off' }).beta.agents.sessions; }
+  async registerGitHubRepository(input) {
+    return this.locked('repository-registration', async () => {
+      if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+      try {
+        const result = await this.registration.register(input);
+        const auditId = this.context.getStore();
+        if (auditId) {
+          const audit = JSON.parse(this.db.prepare('SELECT value FROM audit WHERE id=?').get(auditId).value);
+          Object.assign(audit, { repository_id: result.repository_id, github_repository_id: result.github_repository.id, registration_status: result.status });
+          this.db.prepare('UPDATE audit SET value=? WHERE id=?').run(JSON.stringify(audit), auditId);
+        }
+        return result;
+      }
+      catch (error) {
+        throw new BridgeError(error instanceof RegistrationError ? error.code :
+          ['REPOSITORY_REGISTRY_BUSY', 'UNSAFE_REPOSITORY_REGISTRY', 'REPOSITORY_REGISTRY_LIMIT', 'GITHUB_REGISTRATION_INVALID', 'GITHUB_REGISTRATION_ORIGIN_CHANGED', 'GITHUB_REGISTRATION_BASELINE_CHANGED', 'REPOSITORY_PATH_CHANGED'].includes(error.code) ? error.code : 'REPOSITORY_REGISTRATION_FAILED');
+      }
+    });
+  }
+  async listRegisteredRepositories(input = {}) {
+    if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+    if (Object.keys(input).length) throw new BridgeError('INVALID_REPOSITORY_DISCOVERY_INPUT');
+    try { return await this.registration.list(); }
+    catch { throw new BridgeError('REPOSITORY_DISCOVERY_UNAVAILABLE'); }
+  }
   async init() {
     await privateDirectory(this.stateRoot); await privateDirectory(this.workspaceRoot);
     this.db = new DatabaseSync(path.join(this.stateRoot, 'controller.sqlite'));
@@ -1441,6 +1468,7 @@ export class Controller {
   async close() {
     if (this.dbClosed) return;
     clearInterval(this.sweeper); this.closed = true;
+    await this.locks.get('repository-registration')?.catch(() => {});
     const tasks = this.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value));
     await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && !task.cleaned).map(task => this.stopLocal(task.id)));
     await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && task.reviewer && !task.cleaned).map(task => this.stopLocal(task.id, 'reviewer')));
