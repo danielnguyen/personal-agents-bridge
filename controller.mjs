@@ -7,6 +7,7 @@ import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTas
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
 import { localReviewerInstructions, validateLocalReview } from './local-reviewer-instructions.mjs';
+import { LocalValidation, VALIDATION_VERSION } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -189,11 +190,12 @@ export class LocalExecutor {
   }
 }
 export class Controller {
-  constructor({ stateRoot = `${homedir()}/.local/state/personal-agents-bridge`, workspaceRoot = '/var/tmp/personal-agents-bridge', api, executor, localBackendFactory = options => new LocalCodexBackend(options), publisher = new GitHubPublisher(), secrets, model = 'gpt-6-astra', timeoutMs = 900000 } = {}) {
+  constructor({ stateRoot = `${homedir()}/.local/state/personal-agents-bridge`, workspaceRoot = '/var/tmp/personal-agents-bridge', api, executor, localBackendFactory = options => new LocalCodexBackend(options), localValidationFactory = options => new LocalValidation(options), publisher = new GitHubPublisher(), secrets, model = 'gpt-6-astra', timeoutMs = 900000 } = {}) {
     this.stateRoot = path.resolve(stateRoot); this.workspaceRoot = path.resolve(workspaceRoot); this.model = model;
     this.secrets = secrets || ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_EXECUTOR_API_KEY', 'CONTROL_PLANE_API_KEY'].map(k => process.env[k]).filter(Boolean);
     this._api = api;
     this.localBackendFactory = localBackendFactory; this.localRuns = new Map();
+    this.localValidationFactory = localValidationFactory; this.validationRuns = new Map();
     this.publisher = publisher;
     this.executor = executor || new LocalExecutor({ secrets: this.secrets });
     this.context = new AsyncLocalStorage(); this.instanceId = randomUUID();
@@ -212,6 +214,10 @@ export class Controller {
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
       const t = JSON.parse(row.value);
       if (t.execution_backend === 'local_codex') {
+        if (t.local_validation && !['completed', 'unavailable', 'interrupted', 'uncertain'].includes(t.local_validation.status)) {
+          t.local_validation.status = 'uncertain'; t.local_validation.diagnostic = 'VALIDATION_RESTART_NO_REPLAY';
+          t.local_validation.termination_confirmed = false; this.save(t);
+        }
         if (!t.cleaned && !t.implementer.local.result_received) {
           t.implementer.state = 'needs_attention';
           Object.assign(t.implementer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true });
@@ -573,6 +579,7 @@ export class Controller {
     const humanRequests = local.human_requests.map(({ native_request_id, response, ...request }) => request);
     return { state: ref.state, session_id: null, turn_id: null, environment_id: null,
       ...(role === 'reviewer' ? { review_result: ref.review_result || null, packet_hash: ref.packet_hash, reviewed_git_state: ref.reviewed_git_state,
+        independent_validation: t.local_validation || { status: 'unavailable' },
         ...(ref.review_result ? { overall: ref.review_result.overall, findings: ref.review_result.findings } : {}) } : {}),
       local: { ...local, human_requests: humanRequests }, pending_human_requests: humanRequests.filter(request => request.status === 'pending'),
       latest_output: local.latest_model_output || null, latest_output_source: 'model',
@@ -913,7 +920,7 @@ export class Controller {
     }
     const changed = repositoryChanges || [...new Set([...git(repo, 'diff', '--name-only', t.baseline).trim().split('\n'), ...git(repo, 'ls-files', '--others').trim().split('\n')].filter(Boolean))];
     if (t.execution_backend === 'local_codex') {
-      const data = { ...localEvidencePacket(t, contract.test_commands, repo),
+      const data = { ...localEvidencePacket(t, contract.test_commands, repo, reviewedState),
         reviewed_git_state: reviewedState, controller_evidence: await repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this)),
         file_byte_evidence: fileBytes, baseline_state: JSON.parse(await fs.readFile(path.join(root, 'baseline-state.json'), 'utf8')),
         current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
@@ -1018,24 +1025,87 @@ export class Controller {
     if (task.implementer.stopping) throw new BridgeError('TASK_CLEANED');
     if (task.implementer.state !== 'completed' || task.implementer.local.execution_state !== 'completed' ||
         !task.implementer.local.result_received || !task.implementer.local.terminal_observed) throw new BridgeError('LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION');
+    if (this.jobs.has(`${task.id}:implementer`) || this.localRuns.has(task.id) || task.implementer.local.server_closed !== true) throw new BridgeError('LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED');
     const old = this.operation(requestId, 'review', { id: task.id }, task.id);
     if (old) return this.get(task.id);
-    const local = { phase: 'snapshot', execution_state: 'starting', thread_id: null, turn_id: null, model: null,
+    const local = { phase: 'independent_validation', execution_state: 'starting', thread_id: null, turn_id: null, model: null,
       turn_submission_attempted: false, turn_submission_acknowledged: false, terminal_observed: false, result_received: false,
       instance_started: false, server_closed: false, human_attention_required: false, human_requests: [], diagnostics: [] };
-    const packet = await this.packet(task);
-    const data = JSON.parse(await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
+    const reviewedState = await reviewedGitState(path.join(this.workspaceRoot, task.id), task);
+    await this.repositoryEvidence(task.id);
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
     task = this.task(task.id);
     task.reviewer = { state: 'starting', execution_backend: 'local_codex', request_id: requestId, local,
-      packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory), reviewed_git_state: data.reviewed_git_state, review_result: null };
+      reviewed_git_state: reviewedState, review_result: null };
+    task.local_validation = { version: VALIDATION_VERSION, provenance: 'controller_process_observation', attempt_id: randomUUID(),
+      request_id: requestId, task_id: task.id, reviewed_git_state: reviewedState, status: 'pending', results: [],
+      original_unchanged: false, termination_confirmed: true, diagnostic: null };
     task.deadline = Date.now() + this.timeoutMs; this.save(task);
     this.launch(task.id, 'reviewer', () => this.runLocalReview(task.id));
     return this.get(task.id, false);
   }
+  async runLocalValidation(id) {
+    let task = this.task(id);
+    if (task.local_validation.status !== 'pending') throw new BridgeError('VALIDATION_REPLAY_FORBIDDEN');
+    const root = path.join(this.workspaceRoot, id), repo = path.join(root, 'repo');
+    const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'));
+    await this.repositoryEvidence(id);
+    if (JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(task.local_validation.reviewed_git_state)) throw new BridgeError('VALIDATION_TREE_CHANGED');
+    const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
+    if (normal.status !== 'captured') throw new BridgeError('VALIDATION_NORMAL_SNAPSHOT_UNAVAILABLE');
+    if (this.closed || this.task(id).reviewer.stopping) return;
+    const runner = this.localValidationFactory({ root, timeoutMs: this.timeoutMs, bound: this.bounded.bind(this) });
+    this.validationRuns.set(id, runner);
+    task = this.task(id); task.local_validation.status = 'running'; this.save(task);
+    try {
+      await runner.run({ repo, tree: task.local_validation.reviewed_git_state.tree_sha, commands: contract.test_commands,
+        attemptId: task.local_validation.attempt_id, onRecord: record => {
+          if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
+          const current = this.task(id), validation = current.local_validation;
+          validation.results[record.command_index] = record;
+          validation.termination_confirmed = record.termination_confirmed === true && (!record.start_attempted || record.completion_observed === true);
+          this.save(current);
+        } });
+      task = this.task(id);
+      task.local_validation.status = task.reviewer.stopping || this.closed ? 'interrupted' : runner.terminationConfirmed ? 'completed' : 'uncertain';
+    } catch {
+      if (this.dbClosed) return;
+      task = this.task(id); task.local_validation.status = runner.terminationConfirmed ? 'unavailable' : 'uncertain';
+      task.local_validation.diagnostic = 'VALIDATION_EXECUTION_UNAVAILABLE';
+    } finally {
+      if (runner.terminationConfirmed) this.validationRuns.delete(id);
+    }
+    if (this.dbClosed) return;
+    task.local_validation.termination_confirmed = runner.terminationConfirmed === true;
+    this.save(task);
+    const after = await reviewedGitState(root, task), normalAfter = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
+    task = this.task(id);
+    task.local_validation.original_unchanged = JSON.stringify(after) === JSON.stringify(task.local_validation.reviewed_git_state) && compareSnapshots(normal, normalAfter).status === 'unchanged';
+    if (!task.local_validation.original_unchanged) { task.local_validation.status = 'unavailable'; task.local_validation.diagnostic = 'VALIDATION_ORIGINAL_CHANGED'; }
+    this.save(task);
+  }
   async runLocalReview(id) {
     let task = this.task(id);
     if (this.closed || task.reviewer.stopping) return;
+    try { await this.runLocalValidation(id); }
+    catch (error) {
+      if (this.dbClosed) return;
+      task = this.task(id);
+      task.local_validation.status = task.local_validation.termination_confirmed ? 'unavailable' : 'uncertain';
+      task.local_validation.diagnostic = this.bounded(error.code || 'VALIDATION_EXECUTION_UNAVAILABLE', 128);
+      this.save(task); throw error;
+    }
+    if (this.closed || this.task(id).reviewer.stopping) return;
+    task = this.task(id);
+    if (!['completed', 'unavailable'].includes(task.local_validation.status) || !task.local_validation.termination_confirmed ||
+        !task.local_validation.original_unchanged) throw new BridgeError('LOCAL_VALIDATION_UNRESOLVED');
+    const packet = await this.packet(task);
+    if (this.closed || this.task(id).reviewer.stopping) return;
+    task = this.task(id);
+    const data = JSON.parse(await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
+    if (JSON.stringify(data.reviewed_git_state) !== JSON.stringify(task.local_validation.reviewed_git_state)) throw new BridgeError('VALIDATION_TREE_CHANGED');
+    Object.assign(task.reviewer, { packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory) });
+    task.reviewer.local.phase = 'snapshot'; this.save(task);
     await this.verifyLocalReviewPacket(task);
     if (this.closed || this.task(id).reviewer.stopping) return;
     const key = `${id}:reviewer`, abort = new AbortController();
@@ -1233,6 +1303,7 @@ export class Controller {
     this.save(task);
     const key = role === 'implementer' ? id : `${id}:reviewer`;
     const owned = this.localRuns.get(key), diagnostics = new Set();
+    if (role === 'reviewer') this.validationRuns.get(id)?.cancel();
     if (owned) {
       owned.abort.abort();
       const cancelled = await settledWithin(Promise.resolve().then(() => owned.backend.cancel()));
@@ -1249,7 +1320,10 @@ export class Controller {
     if (!local.instance_started && job.ok) local.server_closed = true;
     if (!local.server_closed) diagnostics.add(owned ? 'LOCAL_CLOSE_UNCONFIRMED' : 'LOCAL_OWNER_UNAVAILABLE');
     if (!job.ok) diagnostics.add('LOCAL_JOB_UNRESOLVED');
-    const cancellationConfirmed = !local.turn_submission_attempted || local.terminal_observed;
+    let cancellationConfirmed = !local.turn_submission_attempted || local.terminal_observed;
+    if (role === 'reviewer' && task.local_validation && task.local_validation.termination_confirmed !== true) {
+      cancellationConfirmed = false; diagnostics.add('VALIDATION_TERMINATION_UNCONFIRMED');
+    }
     if (!cancellationConfirmed) diagnostics.add('LOCAL_CANCELLATION_UNCONFIRMED');
     if (!local.result_received) {
       local.execution_state = local.turn_submission_attempted ? 'uncertain' : 'interrupted';
@@ -1269,7 +1343,8 @@ export class Controller {
     }
     let task = this.task(id); const workspace = path.join(this.workspaceRoot, id);
     task.cleaned = stopped.server_closed && stopped.job_settled && stopped.cancellation_confirmed;
-    task.cleanup = { execution_backend: 'local_codex', executor_stopped: stopped.server_closed && stopped.job_settled,
+    task.cleanup = { execution_backend: 'local_codex', executor_stopped: stopped.server_closed && stopped.job_settled && (!task.local_validation || task.local_validation.termination_confirmed === true),
+      validation_termination_confirmed: task.local_validation?.termination_confirmed ?? null,
       server_closed: stopped.server_closed, cancellation_confirmed: stopped.cancellation_confirmed,
       descendant_termination_verified: false, remote_session_deleted: null,
       workspace_deletion_requested: deleteWorkspace, worktree_deletion_requested: deleteWorkspace,

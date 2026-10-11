@@ -88,8 +88,13 @@ export function localTestCorrelation(ledger, required, cwd) {
     }) };
 }
 
-export function localEvidencePacket(task, required, cwd) {
+export function localEvidencePacket(task, required, cwd, reviewedState) {
   const local = task.implementer.local, ledger = task.local_execution_evidence;
+  const validation = task.local_validation ? structuredClone(task.local_validation) :
+    { status: 'unavailable', results: [], reason: 'No controller-owned independent validation has been recorded for this task.' };
+  if (task.local_validation && (validation.task_id !== task.id || !reviewedState || JSON.stringify(validation.reviewed_git_state) !== JSON.stringify(reviewedState))) {
+    validation.status = 'unavailable'; validation.reason = 'Validation candidate tree/state does not match this evidence snapshot.';
+  }
   return { evidence_version: LOCAL_EVIDENCE_VERSION,
     execution: { backend: 'local_codex', task_id: task.id, thread_id: local.thread_id, turn_id: local.turn_id, model: local.model,
       state: local.execution_state, phase: local.phase, turn_submission_attempted: local.turn_submission_attempted,
@@ -97,7 +102,7 @@ export function localEvidencePacket(task, required, cwd) {
       result_received: local.result_received, app_server_closed: local.server_closed, diagnostics: local.diagnostics },
     native_activity: ledger || { status: 'unavailable', reason: 'No controller-retained notification ledger; history cannot be reconstructed.', exhaustive: false },
     required_test_correlation: localTestCorrelation(ledger, required, cwd),
-    independent_validation: { status: 'unavailable', results: [], reason: 'No independent validation executor is integrated for local tasks.' },
+    independent_validation: validation,
     gates: { local_review: 'analysis_only', local_publication: 'disabled', pr6_live_human_routing_acceptance: 'unverified' },
     coverage: { exhaustive_command_history: false, exhaustive_file_history: false, prohibited_operations_absence_verified: false,
       model_prose_included: false, agents_api_file_rpc_equivalence: false, descendant_termination_verified: false,
@@ -105,6 +110,9 @@ export function localEvidencePacket(task, required, cwd) {
         'File-change notifications are claims, not controller-observed file bytes or a complete write history.',
         'Git/filesystem snapshots describe sampled states, not all intervening reads, writes, or network activity.',
         'An observed completed turn or exit code zero is not an independent test PASS.',
+        'Independent validation uses fresh Git-tree blob copies per command, without Git metadata, ignored assets, installed dependencies or checkout filters; unsupported trees remain unavailable.',
+        'Validation confines writes and denies command networking using the existing native Codex sandbox policy; host reads remain broad. No exhaustive historical-operation audit is established.',
+        'Validation termination observations cover the launched process group, not descendants that deliberately escape it.',
         'Task diff enumeration follows existing Git ignore semantics; ignored writes may be absent.',
         'App-server closure does not prove every descendant exited; snapshots are not an immutable filesystem freeze.'] } };
 }

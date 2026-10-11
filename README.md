@@ -154,19 +154,20 @@ and concurrent external changes remain a possible capture race despite before/af
 Git checks. No independent PASS or publication authorization is produced.
 
 Remaining gates: **PR #6 live human-routing acceptance remains UNVERIFIED**;
-independent validation evidence, live reviewer acceptance and publisher integration
+live validation/reviewer acceptance, SCOPE qualification and publisher integration
 need separate review and authorization. Local publication remains disabled. No live
 turns are needed for the offline evidence/reviewer tests:
 
 ```bash
-node --test test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
+node --test test/local-validation.test.mjs test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
 npm test
 git diff --check
 ```
 
 ### Independent local reviewer
 
-After a confirmed completed implementation, `review_task` freezes a bounded packet
+After a confirmed completed implementation, `review_task` independently executes
+the persisted contract's required tests as described below, then freezes a bounded packet
 into a separate reviewer directory and starts a fresh `LocalCodexBackend` instance
 and thread. No implementer thread is resumed, no conversation history is supplied,
 and the implementer must already be closed. Reviewer mode requests native
@@ -199,7 +200,8 @@ malformed/incomplete output yields `needs_attention`, not PASS. Findings remain
 model analysis, not independently certified truth. Controller overrides are explicit:
 
 - Required test commands cannot obtain TEST_EVIDENCE PASS from native matches,
-  completion/exit zero or reviewer assertions: no independent test executor exists.
+  completion/exit zero or reviewer assertions. Only complete controller-owned
+  validation, bound to the exact reviewed tree/state, can remove that failure floor.
 - Current v1 evidence cannot independently establish historical compliance with
   the local contract's Git-publication/history/configuration and write-scope
   prohibitions. SCOPE is therefore FAIL for missing required proof, not an invented
@@ -219,6 +221,60 @@ without replay. There is no atomic transaction spanning app-server dispatch and
 SQLite persistence; missing acknowledgements remain uncertain. Cleanup, expiration
 and shutdown cancel/close both owned roles before any workspace deletion. Local
 post-completion implementation continuation and publication remain unsupported.
+
+### Controller-owned local validation
+
+`review_task` owns one durable validation attempt before reviewer execution. No new
+MCP operation is added. The implementer must be terminal with its app-server closed.
+The Controller checks the registered worktree, contract and `reviewedGitState()`;
+it executes **only exact `test_commands` from persisted `contract.json`**, using
+`/bin/sh -c`. Every command starts from a fresh disposable copy of that Git tree's
+blob bytes and executable modes. No checkout filters, Git metadata, `TASK.md`,
+ignored files, external dependencies or prior test artifacts are copied. Symlinks,
+submodules, invalid paths, more than 2000 files or 16 MiB make capture unavailable.
+Dependencies must already be usable without installation; unavailable tools fail.
+
+`local-validation.mjs` uses the same supported native `codex sandbox` permission
+table/profile mechanism as the repository sandbox, without its Agents API/RPC
+workers. CLI-pinned permissions allow writes only to the disposable candidate and
+scratch, protect `.git`/`.codex`, and disable command networking. HOME/CODEX_HOME
+are disposable; the child environment is an explicit allowlist with system PATH,
+no inherited API keys, tokens, credential helpers or agent sockets. There is no
+model execution or authentication. **Host filesystem reads remain broad**, as in
+the existing repository policy: this is not credential-read isolation. Use only
+trusted repositories/contracts on the dedicated host without unrelated secrets.
+
+The task's SQLite `local_validation` record is exposed under
+`get_task.reviewer.independent_validation` and copied into the local packet's
+`independent_validation` section with version `pab.controller-local-validation.v1`.
+It retains the operation/task/attempt correlation, exact candidate tree and sampled
+Git state, per-command attempt and cwd identity, start intent/observations, completion,
+exit code/signal, timeouts, termination uncertainty, and redacted stdout/stderr.
+Output is capped at 2048 bytes per stream per command; truncation or redaction
+cannot qualify as verified passing evidence. At most ten 1000-character commands
+run, with a maximum 60-second process deadline each, also bounded by task expiration.
+Existing packet-size rejection remains in force; no evidence is silently discarded.
+
+Results are synchronously saved before packet construction. Candidate and normal
+checkout snapshots are compared after execution; mismatch blocks reviewer startup.
+Absent or different-tree validation cannot satisfy TEST_EVIDENCE. Aggregate
+`completed` means the validation attempt finished, **not that its tests passed**.
+Only all required commands with observed start/completion, zero exit, complete
+output, unchanged original and confirmed termination can qualify. Test design and
+requirement sufficiency remain review questions; native notifications/model prose
+never supply independent results. **SCOPE still FAILs under the v1 historical-proof
+limitation, and local publication remains disabled.**
+
+Cancellation kills the owned process group before waiting; missing close or live
+group members leave termination unconfirmed and block workspace deletion. This
+does not prove termination of deliberately escaped descendants. Test copies are
+retained for inspection until explicit task-workspace deletion. SQLite intent and
+OS spawn/exit cannot be atomic: a crash in between is uncertain, never replayed.
+Restart retains identity/results without killing guessed PIDs or reattaching;
+unconfirmed termination requires operator reconciliation. The review operation and
+one-attempt-per-task policy deduplicate validation as well as reviewer execution.
+Before/after snapshots cannot exclude external change-and-restore races; no new
+filesystem freeze, historical audit or security infrastructure is claimed.
 
 Cleanup initiates cancellation before waiting on a local job, closes the owned
 app-server, and bounds each wait. Shutdown does the same. Files remain unless
