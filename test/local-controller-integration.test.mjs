@@ -21,17 +21,17 @@ class FakeLocal {
     this.identity = { model: 'gpt-6-astra', threadId: null, turnId: null, turnSubmissionAttempted: false, turnSubmissionAcknowledged: false, terminalObserved: false };
     const pending = new Promise(resolve => { this.resolve = resolve; });
     this.emit('model_selected');
-    this.identity.threadId = 'thread-fixture'; this.emit('thread_acknowledged');
+    this.identity.threadId = this.options.reviewOnly ? this.mode.reviewThread || 'review-thread-fixture' : 'thread-fixture'; this.emit('thread_acknowledged');
     this.identity.turnSubmissionAttempted = true; this.emit('turn_submitting');
     if (!this.mode.unacknowledged) { this.identity.turnId = 'turn-fixture'; this.identity.turnSubmissionAcknowledged = true; this.emit('turn_acknowledged'); }
     this.options.onProgress({ method: 'item/agentMessage/delta', params: { delta: 'Model says test-sensitive-value token=private https://private.invalid' } });
     if (this.mode.status) this.finish(this.mode.status, this.mode.terminal !== false);
     return pending;
   }
-  finish(status = 'completed', terminal = true) {
+  finish(status = 'completed', terminal = true, output) {
     this.identity.terminalObserved = terminal;
     if (terminal) this.emit('terminal_observed', { status });
-    this.resolve({ ...this.identity, status, commands: [{ command: 'untrusted test', exitCode: 0 }], messages: [], uncertainties: ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
+    this.resolve({ ...this.identity, status, authentication: 'chatgpt', commands: [{ command: 'untrusted test', exitCode: 0 }], messages: output ? [{ provenance: 'model', text: output }] : [], uncertainties: ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
   }
   respondToRequest(input) {
     this.mode.onDeliver?.(input);
@@ -111,6 +111,137 @@ function nativeItem(backend, item, method = 'item/completed') {
   backend.options.onProgress({ method, params: { threadId: backend.identity.threadId, turnId: backend.identity.turnId, item } });
 }
 
+const reviewOutput = () => JSON.stringify({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Packet evidence claim' })) });
+async function reviewing(context) {
+  const value = await setup(context, {}, { noApi: true }); value.input.contract.test_commands = ['python3 -B check.py'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'review_operation' });
+  const reviewer = await value.running(1);
+  return { ...value, started, implementer, reviewer };
+}
+
+test('independent local reviewer binds durable distinct identity, read-only workspace, packet and tree; findings cannot manufacture PASS', async context => {
+  const value = await reviewing(context), { controller, started, reviewer } = value;
+  const task = controller.task(started.task_id), ref = task.reviewer;
+  assert.equal(ref.execution_backend, 'local_codex'); assert.equal(ref.local.thread_id, 'review-thread-fixture');
+  assert.notEqual(ref.local.thread_id, task.implementer.local.thread_id); assert.equal(ref.local.turn_id, 'turn-fixture');
+  assert.equal(ref.local.turn_submission_acknowledged, true); assert.equal(ref.local.terminal_observed, false);
+  const durable = JSON.parse(controller.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value);
+  assert.deepEqual(durable.reviewer, ref); assert.equal(reviewer.options.reviewOnly, true);
+  assert.notEqual(reviewer.options.cwd, value.implementer.options.cwd); assert.deepEqual(reviewer.input.allowedFiles, []);
+  assert.equal(reviewer.input.threadId, undefined); assert.match(reviewer.input.prompt, /independent evidence-only reviewer/);
+  assert.deepEqual(await fs.readdir(reviewer.options.cwd), ['evidence.json']);
+  const packet = JSON.parse(await fs.readFile(path.join(reviewer.options.cwd, 'evidence.json'), 'utf8'));
+  assert.deepEqual(packet.reviewed_git_state, ref.reviewed_git_state);
+  await controller.review({ task_id: task.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
+  await assert.rejects(controller.review({ task_id: task.id, request_id: value.input.request_id }), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+  reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const view = await controller.get(task.id);
+  assert.equal(view.reviewer.state, 'completed'); assert.equal(view.reviewer.overall, 'FAIL');
+  assert.deepEqual(view.reviewer.review_result.controller_overrides, ['SCOPE', 'TEST_EVIDENCE']);
+  assert.equal(view.reviewer.review_result.packet_hash, ref.packet_hash); assert.equal(view.reviewer.local.server_closed, true);
+  await controller.review({ task_id: task.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
+  await assert.rejects(controller.continue({ task_id: task.id, request_id: 'new_turn', instruction: 'try again' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
+  await assert.rejects(controller.publish({ task_id: task.id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
+  assert.equal(controller._api, undefined);
+});
+
+for (const mutation of ['packet', 'worktree', 'normal_checkout', 'packet_link']) test(`local review rejects ${mutation} mutation during analysis`, async context => {
+  const value = await reviewing(context), file = path.join(value.reviewer.options.cwd, 'evidence.json');
+  if (mutation === 'packet') { await fs.chmod(file, 0o600); await fs.writeFile(file, '{}'); await fs.chmod(file, 0o400); }
+  else if (mutation === 'packet_link') { const text = await fs.readFile(file); await fs.unlink(file); await fs.writeFile(file + '.other', text); await fs.symlink(file + '.other', file); }
+  else if (mutation === 'normal_checkout') await fs.writeFile(path.join(value.normal, 'greeting.txt'), 'normal checkout changed during review');
+  else await fs.writeFile(path.join(value.implementer.options.cwd, 'greeting.txt'), 'changed during review');
+  value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const ref = value.controller.task(value.started.task_id).reviewer;
+  assert.equal(ref.state, 'needs_attention'); assert.equal(ref.review_result, null); assert.match(ref.error, /LOCAL_REVIEW_(PACKET|TREE|NORMAL_CHECKOUT)_CHANGED/);
+});
+
+for (const outcome of ['invalid_json', 'failed', 'interrupted', 'uncertain', 'missing_terminal', 'missing_ack']) test(`local reviewer ${outcome} cannot produce a trusted result`, async context => {
+  const value = await reviewing(context);
+  if (outcome === 'missing_ack') {
+    const task = value.controller.task(value.started.task_id); task.reviewer.local.turn_submission_acknowledged = false; value.controller.save(task);
+    value.reviewer.identity.turnSubmissionAcknowledged = false;
+  }
+  value.reviewer.finish(['failed', 'interrupted', 'uncertain'].includes(outcome) ? outcome : 'completed', !['missing_terminal', 'uncertain'].includes(outcome), outcome === 'invalid_json' ? 'I declare PASS' : reviewOutput());
+  await value.drain(); const ref = value.controller.task(value.started.task_id).reviewer;
+  assert.equal(ref.state, 'needs_attention'); assert.equal(ref.review_result, null); assert(ref.error);
+});
+
+test('review integrity is rechecked on get_task after a completed analysis', async context => {
+  const value = await reviewing(context); value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  await fs.writeFile(path.join(value.implementer.options.cwd, 'greeting.txt'), 'late mutation');
+  const view = await value.controller.get(value.started.task_id);
+  assert.equal(view.reviewer.state, 'needs_attention'); assert.equal(view.reviewer.review_result, null);
+  assert.equal(view.reviewer.error, 'LOCAL_REVIEW_INTEGRITY_CHANGED');
+});
+
+for (const action of ['cleanup', 'shutdown']) test(`${action} cancels and closes an owned local reviewer`, async context => {
+  const value = await reviewing(context);
+  if (action === 'cleanup') await value.controller.cleanup({ task_id: value.started.task_id }); else await value.controller.close();
+  assert(value.reviewer.calls.includes('cancel')); assert(value.reviewer.calls.includes('close'));
+  const recovered = await new Controller(value.config).init();
+  try { assert.equal(recovered.task(value.started.task_id).reviewer.review_result, null); }
+  finally { await recovered.close(); }
+});
+
+test('reviewer human requests never auto-approve, and pending reviewer restart never replays', async context => {
+  const value = await reviewing(context);
+  assert.throws(() => value.reviewer.emit('human_request', { request: { id: 123, method: 'item/commandExecution/requestApproval' } }), /LOCAL_REVIEW_HUMAN_REQUEST_UNSUPPORTED/);
+  assert.equal(value.reviewer.input.signal.aborted, true);
+  const pending = value.controller.task(value.started.task_id);
+  await value.controller.close();
+  const first = await new Controller(value.config).init(); first.save(pending); clearInterval(first.sweeper); first.dbClosed = true; first.db.close();
+  const recovered = await new Controller(value.config).init();
+  try {
+    const ref = recovered.task(pending.id).reviewer;
+    assert.equal(ref.state, 'needs_attention'); assert.equal(ref.local.execution_state, 'uncertain'); assert.equal(ref.review_result, null);
+    assert.equal(ref.local.thread_id, pending.reviewer.local.thread_id); assert.match(ref.local.diagnostics.join(), /NO_REPLAY/);
+    await recovered.review({ task_id: pending.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
+  } finally { await recovered.close(); }
+});
+
+test('a reused implementer thread is rejected before reviewer turn submission', async context => {
+  const value = await setup(context, { reviewThread: 'thread-fixture' });
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'review_reused_thread' }); await value.drain();
+  const ref = value.controller.task(started.task_id).reviewer;
+  assert.equal(ref.state, 'needs_attention'); assert.equal(ref.local.turn_submission_attempted, false);
+  assert.equal(ref.review_result, null); assert(value.instances[1].calls.includes('close'));
+});
+
+test('restart preserves completed review and marks a crash during result validation uncertain without replay', async context => {
+  const value = await reviewing(context); value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const completed = value.controller.task(value.started.task_id).reviewer.review_result;
+  await value.controller.close();
+  const recovered = await new Controller(value.config).init();
+  assert.deepEqual(recovered.task(value.started.task_id).reviewer.review_result, completed);
+  await recovered.review({ task_id: value.started.task_id, request_id: 'review_operation' });
+  const pending = recovered.task(value.started.task_id); pending.reviewer.state = 'finishing'; pending.reviewer.review_result = null;
+  recovered.save(pending); await recovered.close();
+  const restarted = await new Controller(value.config).init();
+  try {
+    const ref = restarted.task(pending.id).reviewer;
+    assert.equal(ref.state, 'needs_attention'); assert.equal(ref.local.execution_state, 'uncertain');
+    assert.equal(ref.review_result, null); assert.equal(value.instances.length, 2);
+    await restarted.review({ task_id: pending.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
+  } finally { await restarted.close(); }
+});
+
+test('reviewer cancellation cannot race validation into a completed result', async context => {
+  const value = await reviewing(context), original = value.controller.verifyLocalReviewPacket.bind(value.controller);
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  value.controller.verifyLocalReviewPacket = async task => {
+    const packet = await original(task); entered(); await new Promise(resolve => { release = resolve; }); return packet;
+  };
+  value.reviewer.finish('completed', true, reviewOutput()); await waiting;
+  const stopping = value.controller.cleanup({ task_id: value.started.task_id });
+  for (let attempt = 0; attempt < 100 && !value.controller.task(value.started.task_id).reviewer.stopping; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+  release(); await stopping; await value.drain();
+  assert.equal(value.controller.task(value.started.task_id).reviewer.review_result, null);
+});
+
 test('local notification evidence is durable before completion and packets reuse controller Git snapshots without API evidence', async context => {
   const value = await setup(context, {}, { noApi: true });
   value.input.contract.test_commands = ['python3 check.py', 'python3 missing.py'];
@@ -152,8 +283,7 @@ test('local notification evidence is durable before completion and packets reuse
   assert.equal(data.command_execution_evidence, undefined); assert.equal(data.file_rpc_operation_evidence, undefined);
   assert.equal(controller.task(started.task_id).file_rpc_evidence, undefined); assert.equal(controller._api, undefined);
   assert(!packet.text.includes('Model says')); assert(!packet.text.includes('untrusted test')); assert(!packet.text.includes('token=private'));
-  assert.equal(data.gates.local_review, 'disabled'); assert.equal(data.gates.local_publication, 'disabled');
-  await assert.rejects(controller.review({ task_id: started.task_id, request_id: 'local_packet_review' }), /LOCAL_REVIEW_UNSUPPORTED/);
+  assert.equal(data.gates.local_review, 'analysis_only'); assert.equal(data.gates.local_publication, 'disabled');
   await assert.rejects(controller.publish({ task_id: started.task_id, title: 'No' }), /LOCAL_PUBLISH_UNSUPPORTED/);
 });
 
@@ -224,6 +354,16 @@ test('unconfirmed app-server closure blocks local packet preparation even after 
   const saved = value.controller.task(started.task_id);
   assert.equal(saved.implementer.local.server_closed, false);
   await assert.rejects(value.controller.buildPacket(saved), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
+  await assert.rejects(value.controller.review({ task_id: saved.id, request_id: 'review_unclosed' }), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
+});
+
+test('unconfirmed reviewer closure prevents workspace deletion and remains explicit', async context => {
+  const value = await reviewing(context); value.reviewer.mode.closeFails = true;
+  value.reviewer.finish('interrupted'); await value.drain();
+  const result = await value.controller.cleanup({ task_id: value.started.task_id, delete_workspace: true });
+  assert.equal(result.cleanup.server_closed, false); assert.equal(result.cleanup.workspace_deleted, false);
+  assert.match(result.cleanup.cleanup_diagnostic, /REVIEWER_LOCAL_CLOSE_UNCONFIRMED/);
+  assert.equal(result.reviewer.review_result, null);
 });
 
 test('invalid backend, unsupported non-repository local tasks and protected scope fail before provisioning', async context => {
@@ -366,7 +506,7 @@ test('shutdown bounds an unresponsive cancel request, closes execution, and pres
 test('local continue, review and publish reject explicitly without downstream API or publication work', async context => {
   const value = await setup(context), started = await value.start(); await value.running();
   await assert.rejects(value.controller.continue({ task_id: started.task_id, instruction: 'answer', request_id: 'next_request' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
-  await assert.rejects(value.controller.review({ task_id: started.task_id, request_id: 'review_request' }), /LOCAL_REVIEW_UNSUPPORTED/);
+  await assert.rejects(value.controller.review({ task_id: started.task_id, request_id: 'review_request' }), /LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION/);
   await assert.rejects(value.controller.publish({ task_id: started.task_id, title: 'not allowed' }), /LOCAL_PUBLISH_UNSUPPORTED/);
   assert.equal(value.api.created.length, 0); assert.equal(value.controller.task(started.task_id).reviewer, undefined);
   assert.equal(value.controller.task(started.task_id).publication, undefined);
@@ -593,7 +733,7 @@ test('MCP routes structured human replies and preserves unsupported review/publi
   assert.equal(continued.isError, undefined); assert.equal(value.backend.responses.length, 1);
   const retry = await client.callTool({ name: 'continue_task', arguments: value.response() }); assert.equal(retry.isError, undefined);
   assert.equal(value.backend.responses.length, 1);
-  await assert.rejects(value.controller.review({ task_id: value.started.task_id, request_id: 'still_no_review' }), /LOCAL_REVIEW_UNSUPPORTED/);
+  await assert.rejects(value.controller.review({ task_id: value.started.task_id, request_id: 'still_no_review' }), /LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION/);
   await assert.rejects(value.controller.publish({ task_id: value.started.task_id, title: 'No publication' }), /LOCAL_PUBLISH_UNSUPPORTED/);
 });
 

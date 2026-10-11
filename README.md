@@ -111,10 +111,10 @@ descriptions cannot be accepted (decline/cancel remain available). There are at
 most 32 requests per turn, eight questions per request and 20 options per question.
 
 Post-completion/new-turn continuation and restart reattachment remain unsupported.
-Local `review_task` and `publish_task` still reject with `LOCAL_REVIEW_UNSUPPORTED`
-and `LOCAL_PUBLISH_UNSUPPORTED`; separate evidence integration is required.
+Local `review_task` supports the bounded independent analysis described below.
+Local `publish_task` still rejects with `LOCAL_PUBLISH_UNSUPPORTED`.
 
-### Local evidence groundwork (not review authorization)
+### Local evidence and independent analysis
 
 The Controller synchronously retains bounded `item/started` and `item/completed`
 command/file-change notifications in `task.local_execution_evidence` in its existing
@@ -126,8 +126,8 @@ Final adapter summaries cannot reconstruct missing notification history.
 
 The internal `Controller.buildPacket(task)` path can prepare a
 `pab.local-codex-review.v1` packet after the local job is finished and the owned
-app-server is confirmed closed. This is groundwork, not a new MCP operation or an
-independent review. It reuses pinned-baseline/worktree validation, contract checks,
+app-server is confirmed closed. The existing `review_task` uses this internal path;
+no new MCP operation is added. It reuses pinned-baseline/worktree validation, contract checks,
 controller before/after repository snapshots, current file hashes, unauthorized
 file detection and Git state checks. Agents API packet behavior is unchanged;
 native notifications never populate Agents API or file-RPC evidence structures.
@@ -154,16 +154,71 @@ and concurrent external changes remain a possible capture race despite before/af
 Git checks. No independent PASS or publication authorization is produced.
 
 Remaining gates: **PR #6 live human-routing acceptance remains UNVERIFIED**;
-independent local reviewer semantics/execution, validation evidence, reviewed-tree
-binding and publisher integration need separate review and authorization. Local
-`review_task`/`publish_task` remain disabled. No live turns are needed for the offline
-evidence tests:
+independent validation evidence, live reviewer acceptance and publisher integration
+need separate review and authorization. Local publication remains disabled. No live
+turns are needed for the offline evidence/reviewer tests:
 
 ```bash
-node --test test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
+node --test test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
 npm test
 git diff --check
 ```
+
+### Independent local reviewer
+
+After a confirmed completed implementation, `review_task` freezes a bounded packet
+into a separate reviewer directory and starts a fresh `LocalCodexBackend` instance
+and thread. No implementer thread is resumed, no conversation history is supplied,
+and the implementer must already be closed. Reviewer mode requests native
+`read-only` sandboxing and command networking disabled at thread/turn creation,
+retains subscription authentication and unique-default model checks, and rejects
+writable scopes, existing thread history and resumption. Native reviewer human
+requests are not approved or routed in this slice; they interrupt analysis.
+These use the existing [app-server protocol](https://developers.openai.com/codex/app-server),
+not another isolation framework. Tests verify requested/returned policies using
+mocks, not independent live kernel enforcement.
+
+The reviewer is instructed to read only `evidence.json`, not execute implementation
+tests, install dependencies, access unrelated contexts or use network services.
+Native read-only mode is not a narrow filesystem **read** boundary. Evidence-only
+read scope is behavioral; no OS-enforced read isolation from other host files or
+Codex history is claimed. Read-only instructions are not themselves enforcement.
+
+The Controller owns the packet hash, reviewed Git tree/state, separate reviewer
+model/thread/turn identity, submission/acknowledgement and terminal observations.
+It verifies packet file type/mode/hash, task identity/contract, implementation tree
+and normal-checkout state before and after review. `get_task` rechecks integrity
+before exposing a retained result while the workspace exists. Mutations invalidate
+the result. Closing the owned server and checking sampled state is not proof of
+escaped-descendant termination or an immutable freeze against external writers.
+
+The distinct local instruction contract requires all requirement/invariant IDs plus
+SCOPE and TEST_EVIDENCE. Strict JSON, exact IDs, nonempty bounded evidence, consistent
+overall verdict, 16 KiB output and 2000-character per-finding limits are validated;
+malformed/incomplete output yields `needs_attention`, not PASS. Findings remain
+model analysis, not independently certified truth. Controller overrides are explicit:
+
+- Required test commands cannot obtain TEST_EVIDENCE PASS from native matches,
+  completion/exit zero or reviewer assertions: no independent test executor exists.
+- Current v1 evidence cannot independently establish historical compliance with
+  the local contract's Git-publication/history/configuration and write-scope
+  prohibitions. SCOPE is therefore FAIL for missing required proof, not an invented
+  Agents API attestation requirement or an assertion of observed misconduct.
+- Missing optional diagnostics do not invent additional tests or violations.
+
+**Overall PASS is not qualified by current v1 evidence.** A completed review with
+legitimate FAIL findings is useful and expected. The persisted `review_result`
+includes validated findings, controller overrides, model-proposed overall result,
+packet hash and reviewed-tree/thread/turn binding. Invalid, cancelled, incomplete,
+unacknowledged or uncertain execution cannot produce a review result.
+
+Request retries never submit twice. There is one local reviewer attempt per task
+in this slice; a failed/uncertain attempt is not automatically replaced. Restart
+preserves completed findings and marks unfinished execution/validation for attention,
+without replay. There is no atomic transaction spanning app-server dispatch and
+SQLite persistence; missing acknowledgements remain uncertain. Cleanup, expiration
+and shutdown cancel/close both owned roles before any workspace deletion. Local
+post-completion implementation continuation and publication remain unsupported.
 
 Cleanup initiates cancellation before waiting on a local job, closes the owned
 app-server, and bounds each wait. Shutdown does the same. Files remain unless
@@ -181,7 +236,7 @@ Codex Runner's SDK pattern is simpler for batch execution, but its adapter uses
 `never` approvals; app-server supplies the bidirectional native approvals needed here.
 No containers, namespace launchers or managed-policy framework are involved.
 
-`LocalCodexBackend({cwd, codexPath, codexHome, onApproval, onQuestion, onProgress, onLifecycle})`
+`LocalCodexBackend({cwd, codexPath, codexHome, onApproval, onQuestion, onProgress, onLifecycle, reviewOnly})`
 requires an absolute, caller-approved workspace. `connect()` checks the existing
 ChatGPT login, subscription plan and effective OpenAI provider configuration without
 logging in, copying credentials or setting `forced_login_method`. API-key/custom
@@ -310,8 +365,9 @@ the bounded fixture acceptance above.
 This acceptance was for the standalone adapter, not this controller integration.
 PR #6 adds offline-tested durable human-response routing to the same live turn;
 its live human-routing acceptance remains unverified. Uncertain delivery is not replayed.
-Local independent review and publication remain separately blocked; this PR does not
-change their existing Agents API gates or authorize deployment.
+Local independent evidence analysis is now supported; PASS qualification and local
+publication remain blocked. Existing Agents API gates and deployment authorization
+are unchanged.
 
 ## Setup
 
@@ -364,7 +420,7 @@ No repository registrations or account configuration are shipped with this sourc
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
 and publication for the default Agents API path. Local execution is the limited
-opt-in slice described above; local review/publication are unsupported. Agents API
+opt-in slice described above; local evidence-only review is supported, publication is not. Agents API
 execution/review uses paid API sessions. Publication accepts only
 `task_id`, `title`, optional `body`, and `draft:true` (the default), never arbitrary
 paths, commands or branches. It verifies unchanged state and commit-tree equality,

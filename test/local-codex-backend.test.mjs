@@ -104,6 +104,56 @@ test('ordinary file scopes and non-protected lookalike names remain accepted', a
   assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
 });
 
+async function reviewFixture(context, overrides = {}, options = {}) {
+  return fixture(context, {
+    'config/read': () => ({ config: { ...configuration(), sandbox_mode: 'read-only' } }),
+    'thread/start': ({ defaults }) => ({ ...defaults['thread/start'](), sandbox: { type: 'readOnly', networkAccess: false } }),
+    ...overrides,
+  }, { reviewOnly: true, ...options });
+}
+
+test('review-only adapter requests fresh read-only thread and network-denied turn with unchanged authentication/model checks', async context => {
+  const value = await reviewFixture(context), result = await value.run({ allowedFiles: [] });
+  assert.equal(result.status, 'completed'); assert.equal(result.authentication, 'chatgpt'); assert.equal(result.model, 'gpt-6-astra');
+  const start = value.requests.find(request => request.method === 'thread/start');
+  const turn = value.requests.find(request => request.method === 'turn/start');
+  assert.equal(start.params.sandbox, 'read-only'); assert.match(start.params.developerInstructions, /Read evidence.json only/);
+  assert.deepEqual(turn.params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert(value.launches[0].args.includes('sandbox_mode="read-only"'));
+  assert(!value.requests.some(request => request.method === 'thread/resume'));
+  assert.equal(value.launches[0].config.env.OPENAI_API_KEY, undefined);
+});
+
+test('review-only adapter rejects writable scope, resume, incompatible policy and preexisting thread history', async context => {
+  const value = await reviewFixture(context);
+  await assert.rejects(value.run(), /INVALID_REVIEW_SCOPE/);
+  await assert.rejects(value.run({ allowedFiles: [], threadId: 'old-thread' }), /INVALID_REVIEW_SCOPE/);
+  assert.equal(value.launches.length, 0);
+  for (const overrides of [
+    { 'config/read': () => ({ config: configuration() }) },
+    { 'thread/start': ({ defaults }) => defaults['thread/start']() },
+    { 'thread/start': ({ defaults }) => ({ ...defaults['thread/start'](), thread: { id: 'thread-fixture', turns: [{ id: 'old', status: 'completed' }] }, sandbox: { type: 'readOnly', networkAccess: false } }) },
+    { 'thread/start': ({ defaults }) => ({ ...defaults['thread/start'](), sandbox: { type: 'readOnly', networkAccess: true } }) },
+  ]) {
+    const rejected = await reviewFixture(context, overrides), result = await rejected.run({ allowedFiles: [] });
+    assert.equal(result.status, 'failed'); assert(!rejected.requests.some(request => request.method === 'turn/start'));
+  }
+});
+
+test('review-only adapter cannot grant native approval even with an accepting caller callback', async context => {
+  let approvals = 0;
+  const value = await reviewFixture(context, {
+    'turn/start': ({ send, nextTurn }) => {
+      nextTurn(); setImmediate(() => send({ id: 93, method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-fixture', turnId: 'turn-1', itemId: 'command' } }));
+      return { turn: { id: 'turn-1', status: 'inProgress' } };
+    },
+  }, { onApproval: () => { approvals++; return 'accept'; }, deferHumanRequests: true });
+  const result = await value.run({ allowedFiles: [] });
+  assert.equal(approvals, 0); assert.notEqual(result.status, 'completed');
+  assert(value.replies.some(reply => reply.id === 93 && reply.error));
+  assert(!value.replies.some(reply => reply.result?.decision === 'accept'));
+});
+
 test('start and resume use the same thread, ordinary sandbox and structured command provenance', async context => {
   const progress = [];
   const value = await fixture(context, {}, { onProgress: message => progress.push(message.method) });
