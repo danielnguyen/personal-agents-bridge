@@ -595,6 +595,18 @@ Task resolution verifies the origin and registered baseline; publication also ch
 GitHub numeric identity to reject repository replacement or transfer. All existing
 worktree, validation, review and exact-tree publication gates still apply.
 
+Managed GitHub checkouts are verified with full strict Git object/connectivity
+checking, a restricted storage/configuration layout, an index-to-tree comparison,
+and an independent filesystem walk comparing every file's raw Git blob hash, size
+and mode against the pinned tree. Missing/extra files, corrupt objects, alternate
+object stores, symlinks and unexpected metadata fail closed, even when HEAD or Git
+status looks correct. Retry, discovery and task resolution recheck this state; none
+repairs it. Every selected `base_ref` also passes the same supported-tree admission
+before task-worktree creation, including historical commits. This closes a historical
+symlink policy bypass; it is not evidence of a demonstrated sandbox escape. Legacy
+host registrations retain their existing tree policy. Supported GitHub HTTPS/SCP/SSH
+origins are compared by complete normalized owner/repository identity, not prefixes.
+
 Identical requests revalidate and return `already_registered`; they do not refresh
 the baseline or alter an existing checkout. Rename, transfer, origin/identity changes
 and local ID/path collisions fail closed. An existing host-registered GitHub origin
@@ -604,25 +616,53 @@ repository size and checked-out file bytes are each capped at 128 MiB; at most
 20,000 entries are inspected, with bounded Git/API output. The registry remains
 capped at 64 KiB, with at most 100 discovery entries. These are admission and
 evidence limits, **not a filesystem quota** on downloaded history. API commands have
-15-second limits. Existing coreutils `/usr/bin/timeout` bounds the fetch process
-group at 120 seconds, with a 125-second parent fallback and discarded transport
-output; no network retry is automatic. Unexpected termination remains fail-closed.
+15-second limits. Registration Git subprocesses (including fetch and integrity
+checks) have 120-second limits. They run asynchronously under existing coreutils
+`/usr/bin/timeout`, without detached children or unref'ed jobs, using a fixed umask
+and bounded output (128 KiB API, 256 KiB Git). Output is never returned as an error.
+The Controller observes process-group termination through Linux `/proc`, kills
+remaining group members on cancellation/overflow, and reports unconfirmed termination
+rather than success. This verifies the owned process group, not a universal claim
+about descendants that deliberately escape it. Repository code is never executed.
+Registration/discovery share only their own lock; unrelated task cleanup and timers
+remain responsive. Shutdown cancels registration, stops tasks without first waiting
+for registration, then drains registration and its audit before closing SQLite.
+No network retry is automatic. Unexpected termination remains fail-closed.
 
 #### Failure recovery and deployment
 
 Both registration writers share an exclusive `repositories.json.lock` directory.
 Controller requests serialize; another process receives `REPOSITORY_REGISTRY_BUSY`.
-Registry updates use exclusive private temporary files, file synchronization, atomic
-rename and parent synchronization. Completed checkouts are published before registry
-entries. A failure cannot advertise a partial checkout as registered.
+The publication order is: verify objects/tree/index/files, synchronize every staged
+file (including Git objects and metadata) and directory bottom-up, reverify, rename
+the checkout, synchronize its parent, reverify the published checkout, then write and
+synchronize an exclusive private registry temporary file, atomically rename it, and
+synchronize the registry parent. New provisioning-root ancestors have their parent
+entries synchronized too. A final resolver check precedes success. Existing-entry
+retries also synchronize and reverify before success. Discovery is read-only.
+Synchronization failures fail closed; pre-registry failures leave no trusted entry.
+If registry publication was attempted but its acknowledgement/verification fails,
+the outcome is explicitly uncertain, not success. An entry already atomically visible
+at that boundary must pass complete validation before any subsequent use.
+
+This is ordered filesystem durability, conditional on Linux/local filesystem `fsync`
+and atomic-rename semantics, durable existing state roots, and storage honoring those
+operations. It is **not** a universal crash/power-loss atomicity claim or protection
+against a malicious trusted OS/operator. The multi-directory operation is not a
+single transaction; inspection may be necessary after interruption. Tree inspection
+is bounded at 100,000 storage entries and 512 MiB combined checkout/Git storage,
+not a download quota. Content-transforming checkouts that differ from raw Git blobs
+are intentionally not admitted.
 
 A crash may leave the lock, a `.stage-github_<id>` directory, a registry temporary
-file, or an unregistered `github_<id>` checkout. Fetch failure retains its stage,
-because subprocess termination can be uncertain; retries do not reuse it. A registry
+file, or an unregistered `github_<id>` checkout. Any staging failure retains its stage
+for inspection; retries do not reuse it. Unconfirmed process termination retains the
+registry lock and prevents reporting a clean Controller shutdown. A registry
 write failure after checkout publication retains that unregistered destination.
 No startup replay, automatic lock stealing, orphan adoption, destructive replacement
 or hash repair is performed. A lost acknowledgement after a successful registry
-replacement can return the existing entry only after complete identity validation.
+replacement can return the existing entry only after complete identity/content
+validation and synchronization. Corruption is never automatically repaired or adopted.
 `REGISTRATION_INCOMPLETE_REQUIRES_INSPECTION`, `REGISTRATION_DESTINATION_EXISTS`, or
 a persistent `REPOSITORY_REGISTRY_BUSY` require a trusted operator to stop further
 registration, establish that the original Controller/fetch/helper processes have
@@ -630,6 +670,14 @@ exited, inspect registry identities and private artifacts, and remove **only con
 unregistered** leftovers/abandoned locks before a new explicit request. Do not delete
 registered repositories. Ordinary successful registrations need no host intervention;
 uncertain filesystem/process failures deliberately do.
+
+Controller invocation audit records retain the validated bounded requested GitHub
+name (null for invalid input), Controller role, and sanitized success, denial, failure
+or uncertain outcome. They contain no raw subprocess output, local paths or
+credentials. The initial durable record is uncertain until completion, so a crash
+cannot fabricate success; no audit record triggers replay. Errors after an attempted
+registry publication are `REGISTRATION_PUBLICATION_UNCERTAIN`. MCP authentication or
+schema rejections before Controller invocation are not registration executions.
 
 For deployment, independently review and merge first, stage a clean release with
 locked dependencies, preserve/backup the existing registry and state, ensure the

@@ -17,6 +17,13 @@ per-task authorization, or proof of human intent supplied by the tunnel.
   The Controller provisions under a fixed owner-only root, disables hooks and
   configured filters, rejects submodules/symlinks, and atomically records full
   identities. No repository content or dependency script is executed at registration.
+  Managed checkouts require object connectivity and independent raw file/mode checks
+  on publication, retry, discovery and task resolution. Historical task baselines
+  receive the same tree-admission checks. Synchronization precedes registry publication;
+  failures retain untrusted artifacts, never silently repair/adopt them. Durability
+  relies on filesystem/storage synchronization semantics, not universal power-loss
+  atomicity. Registration's asynchronous subprocess group is bounded/cancellable;
+  unconfirmed termination fails closed. Attempt audits are Controller-owned.
   Only trusted Controller transport receives GitHub authentication. Registration
   does not grant execution privileges or add credentials to task environments.
   Existing broad-read/confidentiality limitations still apply. See README for

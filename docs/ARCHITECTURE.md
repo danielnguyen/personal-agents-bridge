@@ -49,7 +49,14 @@ writers use one exclusive lock and atomic synchronized registry replacement. The
 is no separate database or queue. Identical successful requests validate existing
 state; interrupted provisioning stays unregistered and is never adopted/replayed.
 Discovery exposes only bounded IDs/identity/baseline/status, not filesystem paths.
-Controller invocation auditing records successful remote registration identity.
+Registration subprocesses are asynchronous, bounded and Controller-cancellable;
+their lock never serializes unrelated task operations. The integrity helper checks
+Git connectivity, storage shape and raw worktree contents rather than trusting HEAD
+or status. Selected historical baselines pass admission before materialization.
+Ordered checkout/object/directory synchronization precedes atomic registry publication;
+uncertain boundaries remain inspection-only. Controller invocation auditing records
+the bounded requested identity and sanitized success/denial/failure/uncertainty with
+Controller attribution, including interrupted attempts. Shutdown drains those audits.
 Registration is distinct from contract/task authorization. See README for precise
 limits, lock/orphan recovery and the non-confidential broad-read threat model.
 
