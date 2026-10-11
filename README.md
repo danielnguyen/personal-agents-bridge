@@ -3,7 +3,7 @@
 A single-owner demonstration of **ChatGPT → MCP → Agents API → self-hosted Codex
 → sandboxed Git worktree → independent review → exact-tree draft PR publication**.
 
-ChatGPT invokes six MCP tools through Secure MCP Tunnel. The bridge creates Agents
+ChatGPT invokes six MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
 API sessions and connects a local Codex executor. For an allowlisted repository,
 implementation happens in an isolated Git worktree backed by a task-private Git
 store. Command networking is disabled; writes are confined to the task worktree
@@ -19,16 +19,62 @@ dedicated host/account without unrelated secrets. See [SECURITY.md](SECURITY.md)
 and [architecture](docs/ARCHITECTURE.md) for the actual guarantees and limits.
 Publishing this source does not make its private MCP deployment publicly accessible.
 
-## Local Codex backend prototype
+## Opt-in Local Codex controller slice
 
-`local-codex-backend.mjs` is an **opt-in, disconnected prototype** for trusted
-repositories on the owner's dedicated VM. Production still uses the Agents API.
+`start_task` accepts optional `execution_backend`: omitted or `agents_api` retains
+the existing default; `local_codex` explicitly opts into subscription-authenticated
+execution for an allowlisted `repository_id` only. Selection is immutable and part
+of request deduplication. Omitted/explicit default selections keep the legacy
+fingerprint representation, including retries of pre-integration tasks.
+
+The Controller remains the sole authority. Both paths share registration checks,
+pinned base commits, task-private Git stores/worktrees, contracts, baseline capture,
+SQLite task records, request IDs, ownership, audit and expiration. Local tasks receive
+a local-policy `TASK.md` and the same contract inline, not an assertion of the
+Agents API repository sandbox. They never create Agents API sessions. The API client
+is constructed lazily; local-only controller operation does not require an inference
+`OPENAI_API_KEY`. Existing tunnel authorization credentials are still independently
+required and unchanged.
+
+This slice supports **start → get → cleanup only**. `get_task` reports persisted
+`execution_backend` and `implementer.local` observations: phase/execution state,
+thread/turn IDs, model, submission-attempt/acknowledgement flags, terminal observation,
+bounded diagnostics and human-attention requirements. Codex IDs are not Agents API
+session IDs. Latest bounded output is labeled `model`; command counts are not
+certified command/test evidence. A completed turn is not a test PASS.
+
+Synchronous lifecycle callbacks save identity before the next inference step.
+Submission intent is recorded before dispatch; absence of an acknowledgement is
+not proof of delivery or non-delivery. After restart unfinished local records require
+attention, with known IDs retained and **no automatic replay**. Completed records
+are retained. A process surviving a controller crash is not automatically reattached
+or killed: unknown ownership/termination remains a cleanup blocker.
+
+Native approval/clarification requests are bounded and redacted in task state,
+never automatically approved or answered, and trigger interruption. Such tasks
+cannot become successful merely because the model later completes. Local
+`continue_task`, `review_task`, and `publish_task` fail explicitly with
+`LOCAL_CONTINUE_UNSUPPORTED`, `LOCAL_REVIEW_UNSUPPORTED`, and
+`LOCAL_PUBLISH_UNSUPPORTED`. Human delivery/resumption is deferred to PR #6;
+independent review and publication need separate evidence integration.
+
+Cleanup initiates cancellation before waiting on a local job, closes the owned
+app-server, and bounds each wait. Shutdown does the same. Files remain unless
+`delete_workspace=true`; deletion reuses the task worktree removal mechanism and
+is blocked when execution/closure is unresolved. Task/audit records survive.
+`server_closed` reports the owned server only; escaped-descendant termination is
+not attested. No app-server event is promoted to Agents API command/file-RPC evidence.
+
+### Local execution adapter
+
+`local-codex-backend.mjs` remains a reusable adapter for trusted repositories on the
+owner's dedicated VM. Agents API remains the default backend; no deployment is included.
 It uses the installed `codex app-server` over stdio with no added dependencies.
 Codex Runner's SDK pattern is simpler for batch execution, but its adapter uses
 `never` approvals; app-server supplies the bidirectional native approvals needed here.
 No containers, namespace launchers or managed-policy framework are involved.
 
-`LocalCodexBackend({cwd, codexPath, codexHome, onApproval, onQuestion, onProgress})`
+`LocalCodexBackend({cwd, codexPath, codexHome, onApproval, onQuestion, onProgress, onLifecycle})`
 requires an absolute, caller-approved workspace. `connect()` checks the existing
 ChatGPT login, subscription plan and effective OpenAI provider configuration without
 logging in, copying credentials or setting `forced_login_method`. API-key/custom
@@ -57,6 +103,8 @@ of uncertain submissions. `cancel()` requests interruption; await the `run()` re
 for terminal confirmation. `close()` terminates the owned server process group,
 best-effort; escaped descendants and restart reconciliation are not independently
 attested. Always close in `finally`.
+`close()` returns whether the owned server's exit was observed (or no server was
+started), not a guarantee about escaped descendants.
 
 `onApproval(request)` must obtain a human decision and return `accept`, `decline`
 or `cancel`; absent handlers decline. Session-wide grants are not accepted.
@@ -64,6 +112,11 @@ or `cancel`; absent handlers decline. Session-wide grants are not accepted.
 permission/clarification requests interrupt rather than silently grant access.
 `onProgress(event)` is a synchronous observer of active-turn notifications.
 Requests cleared by Codex or interrupted turns cannot receive late approvals.
+`onLifecycle(event)` is synchronous: model selection, thread acknowledgement,
+pre-dispatch submission intent, turn acknowledgement, terminal observation and
+human requests. It exposes no account credentials; human request payloads remain
+private and must be bounded/redacted by the receiver. Throwing or returning a
+promise fails closed rather than allowing unsaved identity to advance.
 
 **Accepted limitation:** native approvals do not intercept every in-sandbox action.
 File scope, asking before dependency changes/destruction/secret reads/network or
@@ -82,13 +135,16 @@ Authentication checks and token usage do not independently establish billing att
 Offline validation (no model turns):
 
 ```bash
-node --test test/local-codex-backend.test.mjs
+node --test test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
+node --test test/controller.test.mjs
 npm test
 git diff --check
 ```
 
-Prototype closeout validation: **33/33 focused tests and 178/178 full offline tests passed**;
-`git diff --check` passed. Offline tests do not establish live authentication or billing.
+This controller slice passes **61 focused, 17 controller, and 207 full offline tests**,
+with **0 failures and 0 skipped tests** in each run; `git diff --check` also passes.
+Validation uses injected adapters, never real model turns. Offline tests do not
+establish live authentication, billing attribution or controller live acceptance.
 
 ### Operator-only fixture acceptance
 
@@ -138,9 +194,11 @@ JS
 Inspect the private command evidence as well as the fixture; do not publish raw logs
 or rerun an uncertain turn automatically. The reported live success is limited to
 the bounded fixture acceptance above.
-The next small step is independent review, then a separate opt-in controller adapter
-that persists thread/turn IDs, bridges human approvals and maps native evidence
-without changing existing review/publication gates. No production switch is included.
+This acceptance was for the standalone adapter, not this controller integration.
+PR #6 must establish durable human-response routing and safe same-thread continuation,
+including uncertain-submission reconciliation, before enabling local `continue_task`.
+Local independent review and publication remain separately blocked; this PR does not
+change their existing Agents API gates or authorize deployment.
 
 ## Setup
 
@@ -192,14 +250,16 @@ No repository registrations or account configuration are shipped with this sourc
 | `cleanup_task` | Stop execution/delete remote sessions; optionally remove the worktree. |
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
-and publication. Execution/review uses paid API sessions. Publication accepts only
+and publication for the default Agents API path. Local execution is the limited
+opt-in slice described above; local review/publication are unsupported. Agents API
+execution/review uses paid API sessions. Publication accepts only
 `task_id`, `title`, optional `body`, and `draft:true` (the default), never arbitrary
 paths, commands or branches. It verifies unchanged state and commit-tree equality,
 then pushes only its task branch without force. Deletes, renames, modes, symlinks
 and binary files retain their Git semantics. Submodules are unsupported. PRs target
 the registered GitHub repository's default branch; the bridge never merges them.
 
-Commands use `codex sandbox -P bridge_task -C <worktree> -- <command>` with a trusted
+Agents API tasks' commands use `codex sandbox -P bridge_task -C <worktree> -- <command>` with a trusted
 pinned profile. File-write RPCs have equivalent sandbox enforcement. The outer
 exec-server transport retains the network access required by the Agents API.
 Startup probes and controller attestation must succeed before implementation.

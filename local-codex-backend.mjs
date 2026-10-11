@@ -108,11 +108,12 @@ class Rpc {
 }
 
 export class LocalCodexBackend {
-  constructor({ cwd, codexPath = 'codex', codexHome, env = process.env, onApproval, onQuestion, onProgress,
+  constructor({ cwd, codexPath = 'codex', codexHome, env = process.env, onApproval, onQuestion, onProgress, onLifecycle,
     timeoutMs = 180000, spawnProcess = spawn } = {}) {
     if (!path.isAbsolute(cwd || '')) throw error('ABSOLUTE_WORKSPACE_REQUIRED');
     this.cwd = cwd; this.binary = codexPath; this.env = childEnvironment(env, codexHome);
     this.onApproval = onApproval; this.onQuestion = onQuestion; this.onProgress = onProgress;
+    this.onLifecycle = onLifecycle;
     this.timeoutMs = timeoutMs; this.spawnProcess = spawnProcess; this.busy = false; this.closed = false;
   }
   async connect() {
@@ -120,6 +121,7 @@ export class LocalCodexBackend {
     if (this.connection) return this.connection;
     this.connection = (async () => {
       this.cwd = await realpath(this.cwd);
+      if (this.closed) throw error('BACKEND_CLOSED');
       const args = Object.entries(settings()).flatMap(([key, value]) => ['-c', `${key}=${toml(value)}`]);
       this.rpc = new Rpc(this.binary, args, { cwd: this.cwd, env: this.env }, message => this.receive(message),
         code => this.finish('uncertain', code), this.spawnProcess);
@@ -158,6 +160,14 @@ export class LocalCodexBackend {
     }
     throw error('MODEL_CATALOG_INCOMPLETE');
   }
+  lifecycle(phase, result, extra = {}) {
+    try {
+      const observed = this.onLifecycle?.({ phase, threadId: result.threadId, turnId: result.turnId, model: result.model || null,
+        turnSubmissionAttempted: result.turnSubmissionAttempted, turnSubmissionAcknowledged: result.turnSubmissionAcknowledged,
+        terminalObserved: result.terminalObserved, ...extra });
+      if (observed?.then) { Promise.resolve(observed).catch(() => {}); throw error('LIFECYCLE_HANDLER_FAILED'); }
+    } catch { throw error('LIFECYCLE_HANDLER_FAILED'); }
+  }
   async run({ prompt, allowedFiles, threadId, signal } = {}) {
     if (this.busy) throw error('EXECUTION_ALREADY_ACTIVE');
     if (!text(prompt) || !Array.isArray(allowedFiles) || !allowedFiles.length || allowedFiles.some(file =>
@@ -165,13 +175,14 @@ export class LocalCodexBackend {
     if (threadId !== undefined && !text(threadId)) throw error('INVALID_THREAD_ID');
     this.busy = true;
     let timer, abort;
-    const result = { status: 'uncertain', threadId: threadId || null, turnId: null, turnSubmissionAttempted: false, terminalObserved: false, commands: [], files: [], messages: [],
+    const result = { status: 'uncertain', threadId: threadId || null, turnId: null, turnSubmissionAttempted: false, turnSubmissionAcknowledged: false, terminalObserved: false, commands: [], files: [], messages: [],
       uncertainties: ['Upstream command/output coverage is unverified.', 'Model messages are not independent test evidence.', 'Descendant-process termination is not independently attested.'],
       authentication: 'unverified', subscriptionUsageAttribution: 'unverified', approvalLimitation: APPROVAL_LIMITATION };
     try {
       await this.connect(); await this.checkRoute(); result.authentication = 'chatgpt';
       if (signal?.aborted) { result.status = 'interrupted'; return result; }
       result.model = await this.defaultModel();
+      this.lifecycle('model_selected', result);
       if (threadId) {
         const previous = await this.rpc.request('thread/read', { threadId, includeTurns: false });
         if (previous?.thread?.id !== threadId || previous.thread.model !== result.model) throw error('RESUME_MODEL_MISMATCH');
@@ -179,6 +190,7 @@ export class LocalCodexBackend {
       const options = { cwd: this.cwd, model: result.model, modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: 'workspace-write',
         developerInstructions: `${INSTRUCTIONS}\nApproved files: ${JSON.stringify(allowedFiles)}` };
       const started = await this.rpc.request(threadId ? 'thread/resume' : 'thread/start', { ...options, ...(threadId ? { threadId } : {}) });
+      if (text(started?.thread?.id)) { result.threadId = started.thread.id; this.lifecycle('thread_acknowledged', result); }
       if (started?.model !== result.model) throw error('THREAD_MODEL_MISMATCH');
       if (!text(started?.thread?.id) || (threadId && started.thread.id !== threadId) || started.modelProvider !== 'openai' ||
           started.cwd !== this.cwd || started.approvalPolicy !== 'on-request' || started.approvalsReviewer !== 'user' ||
@@ -194,11 +206,14 @@ export class LocalCodexBackend {
       timer = setTimeout(abort, this.timeoutMs);
       if (signal?.aborted) { this.finish('interrupted', 'CANCELLED_BEFORE_TURN'); return await done; }
       result.turnSubmissionAttempted = true;
+      this.lifecycle('turn_submitting', result);
       const turn = await this.rpc.request('turn/start', { threadId: result.threadId, model: result.model, input: [{ type: 'text', text: prompt, text_elements: [] }],
         approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: { type: 'workspaceWrite', writableRoots: [this.cwd], networkAccess: false,
           excludeTmpdirEnvVar: true, excludeSlashTmp: true } });
       if (!text(turn?.turn?.id)) throw error('TURN_START_UNCERTAIN');
       result.turnId = turn.turn.id;
+      result.turnSubmissionAcknowledged = true;
+      this.lifecycle('turn_acknowledged', result);
       if (turn.turn.status !== undefined && turn.turn.status !== 'inProgress') throw error('TURN_START_UNCERTAIN');
       for (const event of this.active.early.splice(0)) this.receive(event);
       await done;
@@ -282,12 +297,15 @@ export class LocalCodexBackend {
       if (params.threadId !== active.result.threadId || params.turn?.id !== active.result.turnId || !['completed', 'failed', 'interrupted'].includes(params.turn.status)) return this.rpc.fail('INVALID_TERMINAL_EVENT');
       if (params.turn.status === 'completed' && params.turn.error) return this.rpc.fail('CONFLICTING_TERMINAL_EVENT');
       active.result.terminalObserved = true;
+      this.lifecycle('terminal_observed', active.result, { status: params.turn.status });
       this.finish(params.turn.status);
     }
   }
   async approve(message, active) {
     const { id, method, params } = message;
     if (params.threadId !== active.result.threadId || params.turnId !== active.result.turnId) return this.rpc.fail('APPROVAL_IDENTITY_MISMATCH');
+    try { this.lifecycle('human_request', active.result, { request: { method, params } }); }
+    catch { return this.rpc.fail('LIFECYCLE_HANDLER_FAILED'); }
     let result;
     if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(method)) {
       let decision = 'decline';
@@ -339,5 +357,6 @@ export class LocalCodexBackend {
   async close() {
     this.closed = true; this.finish('interrupted', 'BACKEND_CLOSED_WITHOUT_TERMINAL_CONFIRMATION');
     if (this.rpc) await this.rpc.close();
+    return !this.rpc || this.rpc.dead === true;
   }
 }
