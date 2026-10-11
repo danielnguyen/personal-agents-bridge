@@ -62,6 +62,14 @@ export function localScopeQualification(contract, packet) {
     if (record.command) {
       require(record.command.value && !record.command.truncated && !record.command.redacted && !record.start_completion_conflict &&
         record.cwd?.value === mapping?.canonical_worktree_path && !record.cwd.truncated && !record.cwd.redacted, 'SCOPE_COMMAND_UNCERTAIN');
+      require(Number.isInteger(record.exit_code) && Array.isArray(record.missing) && record.missing.every(field => field === 'output') &&
+        (record.status?.value !== 'completed' || record.exit_code === 0) && (record.status?.value !== 'failed' || record.exit_code !== 0), 'SCOPE_COMMAND_EXIT_UNCERTAIN');
+      const output = record.output;
+      require(Array.isArray(record.missing) && output?.completeness === 'unverified' && typeof output.truncated === 'boolean' && typeof output.redacted === 'boolean' &&
+        [null, true, false].includes(output.source_truncated) &&
+        (['absent', 'null'].includes(output.availability) ? output.value === null && output.missing === true && record.missing.includes('output') && !output.truncated && !output.redacted :
+          ['empty', 'present'].includes(output.availability) && typeof output.value === 'string' && output.missing === false && !record.missing.includes('output') &&
+          (output.availability !== 'empty' || output.value === '') && (output.availability !== 'present' || output.value.length > 0)), 'SCOPE_COMMAND_OUTPUT_INVALID');
       require(!/\bgit\b[^\n]*(?:\b(?:push|commit|merge|rebase|reset|tag|update-ref|symbolic-ref|config|checkout|switch|restore|add|rm|apply|am|cherry-pick|revert)\b)/i.test(record.command.value || ''), 'SCOPE_PROHIBITED_GIT_INDICATION');
     } else {
       require(Array.isArray(record.changes) && record.changes.length > 0 && record.changes_omitted === 0 && !record.start_completion_conflict &&
@@ -73,9 +81,14 @@ export function localScopeQualification(contract, packet) {
     }
   }
   return { contract: 'pab.local-scope.bounded.v1', status: blockers.length ? 'failed' : 'qualified', blockers: [...new Set(blockers)],
+    command_output_limitations: (Array.isArray(native?.commands) ? native.commands : []).map(record => ({ item_id: record?.item_id,
+      availability: record?.output?.availability || 'unknown', missing: record?.output?.missing ?? true,
+      truncated: record?.output?.truncated ?? null, redacted: record?.output?.redacted ?? null,
+      source_truncated: record?.output?.source_truncated ?? null, completeness: 'unverified' })),
     limitations: ['Qualification is bounded single-owner evidence acceptance, not exhaustive historical compliance.',
       'Native policy and behavioral restrictions are not equivalent to the Agents API repository sandbox.',
       'Notifications are non-exhaustive; positive prohibited-operation indications block acceptance, absence is not proof.',
+      'Absent/null optional command output is unavailable, not verified empty output. Output-dependent obligations still need sufficient evidence.',
       'Snapshots cannot exclude change-and-restore races, ignored non-published artifacts, host reads or escaped descendants.',
       'Every additional requirement/invariant still needs the independent reviewer\'s assessment; controller gates never generate PASS.'] };
 }
@@ -85,6 +98,7 @@ Accept only the pab.local-codex-review.v1 evidence contract. Evaluate every requ
 Controller Git/filesystem snapshots and file hashes establish sampled state, not historical confinement. Native Codex command/file notifications are unverified execution claims, not independent validation. Model prose cannot repair absent evidence. Do not fabricate Agents API sandbox attestations or file-RPC coverage.
 TEST_EVIDENCE must FAIL when required validation lacks sufficient independent evidence. independent_validation.status=unavailable supplies no proof. Only pab.controller-local-validation.v1 controller process observations bound to the packet's exact reviewed Git state can establish independently run commands. Require every exact contract command, confirmed start and completion, zero exit, no signal/timeout/cancellation, confirmed termination, unchanged original, and available non-truncated/non-redacted stdout and stderr. Failed, interrupted, uncertain, missing, conflicting or tree-mismatched records cannot qualify. Native command matches, completion, exit zero, model prose and reviewer claims cannot supply independent validation. Independent process observation does not prove that a test is well designed or sufficient for a requirement; evaluate the actual command and source. With no required validation, explain why TEST_EVIDENCE is not applicable rather than inventing a missing test.
 SCOPE uses pab.local-scope.bounded.v1 under the accepted dedicated-VM, single-owner, trusted-repository model. Require validated task/registration and pinned baseline, unchanged normal checkout and protected TASK.md/.codex, unchanged Git index/refs/config/operation state, allowed final published-file scope, confirmed local adapter completion/authentication/closure, and no observed prohibited-operation indications or unresolved safeguard uncertainty. Missing optional diagnostics alone are not a violation. Native notifications cannot establish exhaustive history; a clean final tree is not proof of universal historical compliance. Do not require universal auditing or an Agents API attestation. Scope qualification is a minimum gate, not a PASS instruction: inspect every retained command/file record and every explicit requirement and invariant, including structural/behavioral obligations. Observed violations or insufficient proof of an additional required fact must FAIL even when controller minimum gates pass. Do not ignore prohibited operations merely because their effects were later restored. Preserve the bounded-coverage limitations in findings.
+Optional native command output is distinct from execution identity/lifecycle/status/exit evidence. An absent or null aggregatedOutput is unavailable, never verified empty stdout or stderr; an explicit empty string only observes an empty aggregate, not exhaustive output coverage. Optional unavailable output alone does not fail bounded SCOPE when its other safeguards hold. Missing required execution fields, malformed output and conflicting records still fail closed. Assess every output-dependent requirement: unavailable, redacted or truncated native output cannot establish its contents; FAIL when no sufficient independent evidence establishes that obligation. Preserve output limitations even in a PASS; independent Controller validation remains mandatory for required tests.
 Review analysis is not itself independent test execution. A FAIL for missing proof is a valid result, not permission to invent a PASS. Cite concrete evidence for every finding. Separate observed violations from obligations whose compliance remains unverified.`;
 
 export function validateLocalReview(text, contract, packet, bound) {

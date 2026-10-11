@@ -308,6 +308,7 @@ export class LocalCodexBackend {
       } else {
         const previous = active.items.get(item.id);
         if (previous?.completed) return this.rpc.fail('DUPLICATE_ITEM');
+        if (previous && previous.item.type !== item.type) return this.rpc.fail('ITEM_TYPE_CHANGED');
         active.items.set(item.id, { item, completed: true });
         if (item.type === 'commandExecution') {
           const missing = [];
@@ -317,10 +318,19 @@ export class LocalCodexBackend {
           if (!['completed', 'failed', 'declined'].includes(item.status)) missing.push('status');
           if (!Number.isInteger(item.exitCode)) missing.push('exitCode');
           if (typeof item.aggregatedOutput !== 'string') missing.push('output');
+          const outputAvailability = item.aggregatedOutput === undefined ? 'absent' : item.aggregatedOutput === null ? 'null' :
+            typeof item.aggregatedOutput !== 'string' ? 'malformed' : item.aggregatedOutput === '' ? 'empty' : 'present';
+          if (outputAvailability === 'malformed') missing.push('output_format');
+          if (previous && (previous.item.status !== 'inProgress' || ['command', 'cwd'].some(field => previous.item[field] !== item[field]) ||
+              (previous.item.aggregatedOutput != null && typeof previous.item.aggregatedOutput !== 'string') ||
+              (text(previous.item.aggregatedOutput) && (typeof item.aggregatedOutput !== 'string' || !item.aggregatedOutput.startsWith(previous.item.aggregatedOutput))))) missing.push('start_completion_conflict');
+          if ((item.status === 'completed' && Number.isInteger(item.exitCode) && item.exitCode !== 0) ||
+              (item.status === 'failed' && item.exitCode === 0)) missing.push('status_exit_conflict');
           active.result.commands.push({ provenance: 'codex_app_server_item', itemId: item.id, command: item.command ?? null, cwd: item.cwd ?? null,
-            status: item.status, exitCode: item.exitCode ?? null, output: item.aggregatedOutput?.slice(0, 65536) ?? null,
+            status: item.status, exitCode: item.exitCode ?? null, output: typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput.slice(0, 65536) : null, outputAvailability,
             locallyTruncated: typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 65536, missing, outputCompleteness: 'unverified' });
-          if (missing.length) active.result.uncertainties.push(`Command ${item.id} has missing evidence: ${missing.join(', ')}.`);
+          const executionMissing = missing.filter(field => field !== 'output');
+          if (executionMissing.length) active.result.uncertainties.push(`Command ${item.id} has missing evidence: ${executionMissing.join(', ')}.`);
         } else if (item.type === 'fileChange') active.result.files.push({ provenance: 'codex_app_server_item', itemId: item.id, status: item.status, changes: item.changes });
         else if (item.type === 'agentMessage') active.result.messages.push({ provenance: 'model', text: item.text });
       }

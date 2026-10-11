@@ -667,6 +667,13 @@ test('MCP exposes explicit local opt-in and persisted state without adding opera
   await server.connect(serverTransport); await client.connect(clientTransport);
   context.after(async () => { await client.close(); await server.close(); });
   const list = await client.listTools(); assert.equal(list.tools.length, 6);
+  assert.match(client.getInstructions(), /qualified local Codex repository tasks/);
+  assert.match(client.getInstructions(), /No local post-completion continuation\./);
+  assert(!client.getInstructions().includes('No local post-completion continuation, review or publication'));
+  assert.match(list.tools.find(tool => tool.name === 'start_task').description, /qualified PASS review and controller safeguards/);
+  assert.match(list.tools.find(tool => tool.name === 'review_task').description, /controller-owned independent validation and a separate Codex reviewer/);
+  assert.match(list.tools.find(tool => tool.name === 'publish_task').description, /exact frozen Git tree/);
+  assert(!list.tools.some(tool => /Local review and publication are unsupported/.test(tool.description)));
   assert.deepEqual(list.tools.find(tool => tool.name === 'start_task').inputSchema.properties.execution_backend.enum, ['agents_api', 'local_codex']);
   const invalid = await client.callTool({ name: 'start_task', arguments: { ...value.input, execution_backend: 'invalid' } }); assert.equal(invalid.isError, true);
   const started = await client.callTool({ name: 'start_task', arguments: value.input }); assert.equal(started.isError, undefined);

@@ -304,6 +304,50 @@ test('missing and locally truncated command output stays explicitly unverified',
   }
 });
 
+for (const [availability, output] of [['absent', undefined], ['null', null], ['empty', ''], ['present', 'ok\n'], ['malformed', 42], ['malformed', {}]]) {
+  test(`native command output ${availability} (${typeof output}) is classified without inventing contents`, async context => {
+    const value = await fixture(context, { 'turn/start': ({ nextTurn, items, complete }) => {
+      nextTurn(); setImmediate(() => { items({ aggregatedOutput: output }); complete(); }); return { turn: { id: 'turn-1' } };
+    } });
+    const result = await value.run(), record = result.commands[0];
+    assert.equal(result.status, 'completed'); assert.equal(result.terminalObserved, true);
+    assert.equal(record.outputAvailability, availability);
+    assert.equal(record.output, typeof output === 'string' ? output : null);
+    assert.equal(record.missing.includes('output'), typeof output !== 'string');
+    assert.equal(result.uncertainties.length, availability === 'malformed' ? 4 : 3);
+    if (availability === 'malformed') assert(result.uncertainties.some(diagnostic => diagnostic.includes('output_format')));
+  });
+}
+
+for (const [label, change, diagnostic] of [
+  ['missing exit with optional output', { exitCode: null, aggregatedOutput: null }, 'exitCode'],
+  ['changed command', { command: 'different' }, 'start_completion_conflict'],
+  ['changed cwd', { cwd: '/other' }, 'start_completion_conflict'],
+  ['contradictory completed status', { exitCode: 1 }, 'status_exit_conflict'],
+  ['contradictory failed status', { status: 'failed' }, 'status_exit_conflict'],
+]) test(`optional output correction retains execution uncertainty: ${label}`, async context => {
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, items, complete }) => {
+    nextTurn(); setImmediate(() => { items(change); complete(); }); return { turn: { id: 'turn-1' } };
+  } });
+  const result = await value.run();
+  assert(result.uncertainties.some(value => value.includes(diagnostic)));
+});
+
+for (const missing of ['start', 'completion']) test(`optional output cannot hide missing command ${missing}`, async context => {
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, event, complete, cwd }) => {
+    nextTurn(); setImmediate(() => {
+      const item = { id: 'incomplete-command', type: 'commandExecution', command: 'true', cwd, aggregatedOutput: null };
+      if (missing !== 'start') event('item/started', { threadId: 'thread-fixture', turnId: 'turn-1', item: { ...item, status: 'inProgress' } });
+      if (missing !== 'completion') event('item/completed', { threadId: 'thread-fixture', turnId: 'turn-1', item: { ...item, status: 'completed', exitCode: 0 } });
+      complete();
+    });
+    return { turn: { id: 'turn-1' } };
+  } });
+  const result = await value.run();
+  assert(result.commands[0].missing.includes(missing));
+  assert(result.uncertainties.some(value => value.includes(missing)));
+});
+
 test('foreign-turn and duplicate terminal item evidence fails closed', async context => {
   for (const duplicate of [false, true]) {
     const value = await fixture(context, { 'turn/start': ({ nextTurn, event, items }) => {

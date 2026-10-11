@@ -11,7 +11,7 @@ import { createServer } from '../server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { validateLocalReview, localScopeQualification } from '../local-reviewer-instructions.mjs';
-import { observeLocalEvidence } from '../local-evidence.mjs';
+import { createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 class LocalPublisher extends GitHubPublisher {
   constructor(remote) { super(); this.remote = remote; this.pushes = 0; this.creates = 0; this.base = 'main'; }
@@ -74,9 +74,16 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = []) {
 test('qualified local PASS publishes the exact tree through the existing publisher, once, without Agents API identities', async context => {
   const value = await setup(context, ['one.txt'], true, ['test "$(cat one.txt)" = exact']);
   const { c, id, work, input, remote, baseline, publisher, api, executor } = value;
-  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await value.review();
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n');
+  const task = c.task(id), item = { id: 'write-without-output', type: 'commandExecution', command: "printf 'exact\\n' > one.txt", cwd: work };
+  for (const method of ['item/started', 'item/completed']) observeLocalEvidence(task.local_execution_evidence, { method,
+    params: { threadId: task.implementer.local.thread_id, turnId: task.implementer.local.turn_id,
+      item: { ...item, status: method === 'item/started' ? 'inProgress' : 'completed', ...(method === 'item/completed' ? { exitCode: 0 } : {}) } } }, task.implementer.local, text => text);
+  c.save(task); await value.review();
   const reviewed = c.task(id).reviewer, qualification = reviewed.review_result.scope_qualification;
   assert.equal(qualification.status, 'qualified'); assert(qualification.limitations.length > 0);
+  assert.equal(qualification.command_output_limitations[0].availability, 'absent');
+  assert.equal(qualification.command_output_limitations[0].missing, true);
   assert.equal(c.task(id).local_validation.results[0].status, 'passed');
   const [result, duplicate] = await Promise.all([c.publish(input), c.publish(input)]);
   assert.deepEqual(result, duplicate); assert.equal(result.draft, true);
@@ -142,6 +149,70 @@ test('bounded scope gates reject missing, forged and contradictory observations 
     const changed = structuredClone(packet); mutate(changed);
     assert.equal(localScopeQualification(value.contract, changed).status, 'failed');
   }
+});
+
+test('bounded SCOPE separates optional output limitations from execution and requirement qualification', async context => {
+  const value = await setup(context, ['one.txt'], true);
+  await fs.writeFile(path.join(value.work, 'one.txt'), 'exact'); await value.review();
+  const task = value.c.task(value.id);
+  const packet = JSON.parse(await fs.readFile(path.join(value.c.workspaceRoot, value.id, task.reviewer.packet_directory, 'evidence.json')));
+  const raw = { overall: 'PASS', findings: task.reviewer.review_result.findings };
+  const observedPacket = (output, change = {}, start = true, complete = true, startChange = {}) => {
+    const candidate = structuredClone(packet); candidate.native_activity = createLocalEvidence(task.id);
+    const item = { id: 'native-output', type: 'commandExecution', command: 'printf exact', cwd: value.work, status: 'inProgress' };
+    for (const [enabled, method, eventItem] of [[start, 'item/started', { ...item, ...startChange }],
+      [complete, 'item/completed', { ...item, status: 'completed', exitCode: 0, aggregatedOutput: output, ...change }]]) {
+      if (enabled) observeLocalEvidence(candidate.native_activity, { method, params: { threadId: task.implementer.local.thread_id,
+        turnId: task.implementer.local.turn_id, item: eventItem } }, task.implementer.local, text => text);
+    }
+    return candidate;
+  };
+  for (const [availability, output] of [['absent', undefined], ['null', null], ['empty', ''], ['present', 'exact']]) {
+    const candidate = observedPacket(output), result = validateLocalReview(JSON.stringify(raw), value.contract, candidate, text => text);
+    assert.equal(result.scope_qualification.status, 'qualified'); assert.equal(result.overall, 'PASS');
+    assert.equal(result.scope_qualification.command_output_limitations[0].availability, availability);
+    assert.equal(candidate.native_activity.commands[0].output.value, typeof output === 'string' ? output : null);
+    const failed = structuredClone(raw); failed.overall = 'FAIL'; failed.findings[0].status = 'FAIL';
+    failed.findings[0].evidence = 'Required output contents are not independently established.';
+    if (availability !== 'empty' && availability !== 'present') {
+      for (const alteration of [() => {}, data => { const output = data.native_activity.commands[0].output;
+        Object.assign(output, { availability: 'present', value: '[REDACTED]', missing: false, redacted: true }); data.native_activity.commands[0].missing = []; },
+      data => { const output = data.native_activity.commands[0].output;
+        Object.assign(output, { availability: 'present', value: 'partial', missing: false, truncated: true, source_truncated: true }); data.native_activity.commands[0].missing = []; }]) {
+        const limited = structuredClone(candidate); alteration(limited);
+        const outputContract = { ...value.contract, requirements: [{ id: 'R1', text: 'The command must emit the exact complete stdout token expected-output.' }] };
+        limited.contract = outputContract; limited.local_scope.contract_sha256 = digest(outputContract);
+        const rejected = validateLocalReview(JSON.stringify(failed), outputContract, limited, text => text);
+        assert.equal(rejected.overall, 'FAIL'); assert.equal(rejected.findings[0].status, 'FAIL');
+        assert.equal(rejected.scope_qualification.status, 'qualified');
+        assert.deepEqual(rejected.scope_qualification.command_output_limitations[0].redacted, limited.native_activity.commands[0].output.redacted);
+      }
+    }
+  }
+  for (const candidate of [observedPacket(null, { exitCode: null }), observedPacket(null, {}, false), observedPacket(null, {}, true, false),
+    observedPacket({}), observedPacket(null, { command: 'changed' }), observedPacket(null, { cwd: '/other' }),
+    observedPacket(null, { status: 'unknown' }), observedPacket(null, { exitCode: 1 }), observedPacket(null, { status: 'failed' }),
+    observedPacket(null, {}, true, true, { status: 'completed' }), observedPacket(null, {}, true, true, { aggregatedOutput: 'lost prefix' })]) {
+    assert.equal(localScopeQualification(value.contract, candidate).status, 'failed');
+  }
+  for (const mutate of [data => data.execution.diagnostics.push('RUNTIME_UNCERTAINTY'),
+    data => data.native_activity.commands[0].thread_id = 'foreign', data => data.native_activity.commands[0].turn_id = 'foreign',
+    data => data.native_activity.commands[0].output.availability = 'empty', data => delete data.native_activity.commands[0].output.availability]) {
+    const candidate = observedPacket(null); mutate(candidate);
+    assert.equal(localScopeQualification(value.contract, candidate).status, 'failed');
+  }
+});
+
+test('optional output never rescues missing exit evidence or authorizes exact-tree publication', async context => {
+  const value = await setup(context, ['one.txt'], true); await fs.writeFile(path.join(value.work, 'one.txt'), 'exact');
+  const task = value.c.task(value.id), item = { id: 'missing-exit', type: 'commandExecution', command: 'printf exact', cwd: value.work };
+  for (const method of ['item/started', 'item/completed']) observeLocalEvidence(task.local_execution_evidence, { method,
+    params: { threadId: task.implementer.local.thread_id, turnId: task.implementer.local.turn_id,
+      item: { ...item, status: method === 'item/started' ? 'inProgress' : 'completed', aggregatedOutput: null } } }, task.implementer.local, text => text);
+  value.c.save(task); await value.review('FAIL');
+  assert(value.c.task(value.id).reviewer.review_result.scope_qualification.blockers.includes('SCOPE_COMMAND_EXIT_UNCERTAIN'));
+  await assert.rejects(value.c.publish(value.input), /PUBLICATION_REQUIRES_PASS_REVIEW/);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
 });
 
 for (const operation of ['git push origin HEAD', 'git -C . commit -m prohibited', 'git config user.name prohibited']) test(`observed prohibited indication blocks SCOPE even with clean final Git state: ${operation}`, async context => {

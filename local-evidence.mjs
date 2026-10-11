@@ -47,14 +47,18 @@ export function observeLocalEvidence(ledger, event, identity, bound) {
     record.command = retained(item.command, 2048, bound);
     record.cwd = retained(item.cwd, 1024, bound);
     record.exit_code = completed && Number.isInteger(item.exitCode) ? item.exitCode : null;
-    record.output = retained(completed ? item.aggregatedOutput : null, 2048, bound);
+    record.output = retained(item.aggregatedOutput, 2048, bound);
+    record.output.availability = item.aggregatedOutput === undefined ? 'absent' : item.aggregatedOutput === null ? 'null' :
+      typeof item.aggregatedOutput !== 'string' ? 'malformed' : item.aggregatedOutput === '' ? 'empty' : 'present';
     record.output.source_truncated = item.truncated === true || item.outputTruncated === true || item.output_truncated === true ? true : null;
     record.output.completeness = 'unverified';
     for (const field of ['command', 'cwd', 'output']) if (record[field].missing || (field !== 'output' && !record[field].value)) record.missing.push(field);
     if (record.exit_code === null) record.missing.push('exit_code');
-    record.start_completion_conflict = !!previous && ['command', 'cwd'].some(field =>
-      previous[field].value !== record[field].value || previous[field].truncated || previous[field].redacted);
-    if (record.start_completion_conflict) record.start_fields = { command: previous.command, cwd: previous.cwd };
+    if (record.output.availability === 'malformed') record.missing.push('output_format');
+    record.start_completion_conflict = !!previous && (previous.status.value !== 'inProgress' || previous.output.availability === 'malformed' ||
+      ['command', 'cwd'].some(field => previous[field].value !== record[field].value || previous[field].truncated || previous[field].redacted) ||
+      (!!previous.output.value && (previous.output.truncated || previous.output.redacted || record.output.missing || !record.output.value.startsWith(previous.output.value))));
+    if (record.start_completion_conflict) record.start_fields = { command: previous.command, cwd: previous.cwd, status: previous.status, output: previous.output };
   } else {
     record.changes = [];
     record.changes_omitted = Array.isArray(item.changes) ? Math.max(0, item.changes.length - 16) : 0;

@@ -116,6 +116,24 @@ Local `review_task` supports the bounded independent analysis described below.
 Local `publish_task` now requires the qualified independent PASS and exact-tree
 gates below. Human routing alone cannot authorize publication.
 
+Pinned Codex **0.157.1** supports the `item/tool/requestUserInput` protocol request,
+but its blocking `request_user_input` tool is available in Plan mode, not Default
+mode unless `default_mode_request_user_input` is enabled. That feature is
+under development and disabled by default. PAB does not select Plan mode or enable
+that feature; its pinned feature subset does not attest every other effective
+feature. Therefore the protocol's existence is not proof that the default PAB
+turn can generate a live callback. See the pinned [mode gate](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/tools/src/tool_config.rs#L17)
+and [feature default](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/features/src/lib.rs#L1605).
+The separate [async-question tool](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/core/src/tools/handlers/request_user_input_async.rs)
+emits agent-message items, not this JSON-RPC callback. PAB does not substitute
+those messages for native authorization. The retained acceptance had no native
+pending request; it cannot establish whether the model attempted an unavailable
+tool or used async messaging. Qualifying real human routing requires separately
+authorized mode/capability work and live exact-callback/turn continuity evidence.
+Native command/file approvals remain supported when actually requested; the
+harmless acceptance command did not trigger one. No capabilities are enabled by
+this correction.
+
 ### Local evidence and independent analysis
 
 The Controller synchronously retains bounded `item/started` and `item/completed`
@@ -125,6 +143,21 @@ output, missing fields, redaction/truncation and rejected/omitted event counts r
 explicit. File-change claims are separate from controller-observed file bytes.
 Model prose, reasoning, human answers and raw notification logs are excluded.
 Final adapter summaries cannot reconstruct missing notification history.
+
+Native aggregate output now retains distinct `absent`, `null`, `empty`, `present`
+and `malformed` availability. The [pinned output projection](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/app-server-protocol/src/protocol/item_builders.rs#L116)
+can encode an empty aggregate as null. This explains why missing output need not
+mean failed execution, but PAB never converts absent/null into verified empty
+stdout or stderr. Optional output gaps stay in the notification ledger and the
+review result's `scope_qualification.command_output_limitations`, not fatal
+adapter diagnostics. Start/completion, identity, command/cwd, status and exit
+evidence remain mandatory; malformed/conflicting records and unrelated runtime
+uncertainty still block qualification. Truncation/redaction remains explicit.
+The reviewer must FAIL an output-dependent obligation without sufficient evidence;
+controller-owned independent execution remains mandatory for required tests.
+This neither generates PASS findings nor weakens exact-tree publication gates.
+Old acceptance records and FAIL reviews are not rewritten or automatically
+requalified; missing availability provenance in old command records fails closed.
 
 The internal `Controller.buildPacket(task)` path can prepare a
 `pab.local-codex-review.v1` packet after the local job is finished and the owned
@@ -156,10 +189,16 @@ and concurrent external changes remain a possible capture race despite before/af
 Git checks. Evidence capture alone produces no independent PASS or publication
 authorization; validation, independent review and controller publication gates follow.
 
-Remaining gates: **PR #6 live human-routing acceptance remains UNVERIFIED**;
-live validation/reviewer and end-to-end exact-tree publication acceptance remain
-outstanding. Bounded SCOPE qualification and publisher integration are offline-tested,
-not authorization to deploy or run live acceptance. No live turns are needed for tests:
+Bounded A/B acceptance at `c11a3caa2abbb94380eb71579f07a5e4056bba97` observed four
+ChatGPT-authenticated turns, correct fixture bytes, independently passing validation
+and a separate terminal reviewer. The Controller overrode model PASS with
+`SCOPE_EXECUTION_UNCERTAIN` because a completed zero-exit write had unavailable
+output. That actual FAIL remains unchanged. Native test-command correlation was
+unmatched (shell wrapper); no native file-change event was retained. Human routing
+remains **UNVERIFIED**. This correction is offline-tested only: fresh qualified
+SCOPE acceptance and separately authorized exact-tree publication remain outstanding.
+No billing attribution guarantee or deployment authorization follows. No live
+turns are needed for tests:
 
 ```bash
 node --test test/publication.test.mjs test/local-validation.test.mjs test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
