@@ -2,7 +2,7 @@ import { reviewerInstructions } from './reviewer-instructions.mjs';
 import { budgetPacket, packetSizeDiagnostic } from './packet-budget.mjs';
 import { captureFileRpcEvidence } from './file-rpc-evidence.mjs';
 import OpenAI from 'openai';
-import { LocalCodexBackend, INSTRUCTIONS as localInstructions } from './local-codex-backend.mjs';
+import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence } from './review-evidence.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
@@ -82,7 +82,7 @@ Repository sandbox read access is broad. These execution rules add no credential
 Use python3 -B when running Python. Report actual test commands and exit results.
 `;
 export function contractMarkdown(c, backend = 'agents_api') {
-  const rules = backend === 'local_codex' ? `This contract is authoritative. Never modify TASK.md, .codex, Git history/index/configuration, or the normal checkout.\n${localInstructions}\nUse native human requests when available; otherwise stop and state the question. Human response routing is not supported in this slice. Native workspace-write restrictions are not PAB repository sandbox attestation.\n` : executionRules;
+  const rules = backend === 'local_codex' ? `This contract is authoritative. Never modify TASK.md, .codex, Git history/index/configuration, or the normal checkout.\n${localInstructions}\nUse native human requests when available and wait for the human response; otherwise stop and state the question. Native workspace-write restrictions are not PAB repository sandbox attestation.\n` : executionRules;
   return `# Task contract\n\n## Goal\n${c.goal}\n\n## Allowed files\n${c.allowed_files.map(x => `- ${x}`).join('\n')}\n\n## Requirements\n${c.requirements.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Invariants\n${c.invariants.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Required test commands\n${c.test_commands.map(x => '```sh\n' + x + '\n```').join('\n')}\n\n## Execution rules\n${rules}`;
 }
 // Built only from the controller's successful executor startup acknowledgement.
@@ -213,6 +213,7 @@ export class Controller {
         if (!t.cleaned && !t.implementer.local.result_received) {
           t.implementer.state = 'needs_attention';
           Object.assign(t.implementer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true });
+          this.invalidateLocalRequests(t, 'LOCAL_RESTART_CALLBACK_UNAVAILABLE');
           t.implementer.local.diagnostics = ['LOCAL_RESTART_UNRESOLVED_NO_REPLAY']; this.save(t);
         }
         continue;
@@ -348,6 +349,7 @@ export class Controller {
         t[role].error = this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED');
         Object.assign(t[role].local, { execution_state: t[role].local.turn_submission_attempted ? 'uncertain' : 'failed', phase: 'failed', result_received: true, human_attention_required: true,
           diagnostics: [this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED')] });
+        this.invalidateLocalRequests(t, 'LOCAL_EXECUTION_FAILED');
         this.opDone(t.request_id, 'failed');
       }
       this.save(t); } }).finally(() => this.jobs.delete(key));
@@ -424,29 +426,96 @@ export class Controller {
     local.turn_submission_acknowledged ||= event.turnSubmissionAcknowledged === true;
     local.terminal_observed ||= event.terminalObserved === true;
   }
+  invalidateLocalRequests(task, diagnostic) {
+    for (const request of task.implementer.local.human_requests) {
+      if (!['pending', 'responding'].includes(request.status)) continue;
+      request.status = request.status === 'responding' ? 'uncertain' : 'interrupted';
+      request.diagnostic = diagnostic;
+      if (request.operation_id) this.opDone(request.operation_id, 'uncertain');
+    }
+  }
+  localHumanState(task) {
+    const local = task.implementer.local, pending = local.human_requests.find(request => request.status === 'pending');
+    const unresolved = local.human_requests.some(request => !['resolved', 'responding'].includes(request.status));
+    local.human_attention_required = unresolved || !['running', 'completed'].includes(local.execution_state);
+    task.implementer.state = pending ? (pending.expected_response === 'approval' ? 'waiting_for_approval' : 'waiting_for_clarification')
+      : unresolved ? 'needs_attention' : local.execution_state;
+  }
+  recordLocalRequest(task, event) {
+    const local = task.implementer.local, { id, method, params = {} } = event.request || {};
+    if (!((typeof id === 'string' && id.length > 0 && id.length <= 200) || Number.isSafeInteger(id)) ||
+        params.threadId !== local.thread_id || params.turnId !== local.turn_id ||
+        local.human_requests.some(request => request.native_request_id === id) || local.human_requests.length >= 32) throw new BridgeError('LOCAL_HUMAN_REQUEST_INVALID');
+    const supported = humanRequestMethods.includes(method);
+    const request = { request_ref: randomUUID(), task_id: task.id, thread_id: local.thread_id, turn_id: local.turn_id,
+      native_request_id: id, method: this.bounded(method, 128), status: supported ? 'pending' : 'interrupted',
+      expected_response: method === 'item/tool/requestUserInput' ? 'clarification' : 'approval',
+      start_operation_id: task.request_id, operation_id: null, delivery: 'not_attempted', diagnostic: supported ? null : 'UNSUPPORTED_HUMAN_REQUEST' };
+    const details = Object.fromEntries(Object.entries(params).filter(([key]) => !['threadId', 'turnId', 'questions'].includes(key)));
+    if (event.request.item) details.item = event.request.item;
+    const description = JSON.stringify(details);
+    request.summary = this.bounded(description, 4096);
+    request.description_incomplete = request.summary !== description || description === '{}';
+    if (method === 'item/commandExecution/requestApproval' && !params.command && !params.reason && !params.networkApprovalContext && !event.request.item?.command) request.description_incomplete = true;
+    if (method === 'item/fileChange/requestApproval' && !params.reason && !event.request.item?.changes) request.description_incomplete = true;
+    if (request.expected_response === 'approval') {
+      if (params.availableDecisions != null && !Array.isArray(params.availableDecisions)) throw new BridgeError('LOCAL_APPROVAL_DECISIONS_INVALID');
+      request.decisions = ['accept', 'decline', 'cancel'].filter(decision => !params.availableDecisions || params.availableDecisions.includes(decision));
+      if (!request.decisions.length) throw new BridgeError('LOCAL_APPROVAL_DECISIONS_UNSUPPORTED');
+    }
+    if (request.expected_response === 'clarification') {
+      const exact = (value, maximum) => {
+        if (typeof value !== 'string' || !value || this.bounded(value, maximum) !== value) throw new BridgeError('LOCAL_QUESTION_UNREPRESENTABLE');
+        return value;
+      };
+      if (!Array.isArray(params.questions) || !params.questions.length || params.questions.length > 8) throw new BridgeError('LOCAL_QUESTIONS_INVALID');
+      request.questions = params.questions.map(question => {
+        if (question.isSecret === true || (question.options != null && (!Array.isArray(question.options) || question.options.length > 20))) throw new BridgeError('LOCAL_QUESTION_UNSUPPORTED');
+        return { id: exact(question.id, 100), header: this.bounded(question.header || '', 200), question: exact(question.question, 2000),
+          isOther: question.isOther === true, options: (question.options || []).map(option => ({ label: exact(option.label, 200), description: this.bounded(option.description || '', 500) })) };
+      });
+      if (new Set(request.questions.map(question => question.id)).size !== request.questions.length) throw new BridgeError('LOCAL_QUESTIONS_INVALID');
+      request.summary = request.questions.map(question => question.question).join('\n').slice(0, 4096);
+    }
+    local.human_requests.push(request);
+    this.localHumanState(task);
+    return supported;
+  }
   async runLocal(id, workspace, contract) {
     let task = this.task(id);
     if (this.closed || task.implementer.stopping) return;
     await verifyTaskWorktree(path.join(this.workspaceRoot, id), task.repository);
     if (this.closed || this.task(id).implementer.stopping) return;
     const abort = new AbortController();
-    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.timeoutMs, onLifecycle: event => {
+    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.timeoutMs, deferHumanRequests: true, onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
       const current = this.task(id), ref = current.implementer, local = ref.local;
       this.localIdentity(local, event); local.phase = this.bounded(event.phase, 64);
       if (event.phase === 'turn_acknowledged') { local.execution_state = 'running'; ref.state = 'running'; }
       if (event.phase === 'terminal_observed') { local.execution_state = event.status; ref.state = 'finishing'; }
+      let unsupported = false;
       if (event.phase === 'human_request') {
-        const request = event.request || {}, params = request.params || {};
-        local.human_attention_required = true; ref.state = 'needs_attention';
-        local.human_requests = [...local.human_requests.slice(-3), { method: this.bounded(request.method, 128),
-          summary: this.bounded(params.command || params.reason || (Array.isArray(params.questions) ? params.questions.slice(0, 4).map(question => question.question).join('\n') : '') || 'Human intervention required', 1024),
-          resolution: 'unsupported_no_human_answer' }];
+        unsupported = !this.recordLocalRequest(current, event);
+      }
+      if (['human_response_submitting', 'human_response_sent', 'human_request_resolved'].includes(event.phase)) {
+        const request = local.human_requests.find(request => request.native_request_id === event.request?.id);
+        if (!request) throw new BridgeError('LOCAL_CALLBACK_IDENTITY_MISMATCH');
+        if (event.phase === 'human_response_submitting') {
+          if (request.status !== 'responding' || !request.response || request.delivery !== 'prepared') throw new BridgeError('LOCAL_RESPONSE_NOT_AUTHORIZED');
+          request.delivery = 'attempted';
+        } else if (event.phase === 'human_response_sent') {
+          if (request.status === 'responding') request.delivery = 'sent_unconfirmed';
+        } else if (request.status === 'pending') {
+          request.status = 'interrupted'; request.diagnostic = 'NATIVE_REQUEST_CLEARED_WITHOUT_RESPONSE';
+        } else if (request.status === 'responding') {
+          request.status = 'resolved'; request.delivery = 'server_cleared';
+        }
+        this.localHumanState(current);
       }
       this.save(current);
-      if (event.phase === 'human_request') abort.abort();
+      if (unsupported) abort.abort();
       if (ref.stopping && event.phase !== 'terminal_observed') throw new BridgeError('LOCAL_STOP_REQUESTED');
-    }, onApproval: () => 'decline', onQuestion: () => { throw new BridgeError('LOCAL_CLARIFICATION_UNSUPPORTED'); }, onProgress: event => {
+    }, onProgress: event => {
       if (this.dbClosed) return;
       const params = event.params || {}, current = this.task(id), local = current.implementer.local;
       let output;
@@ -471,8 +540,11 @@ export class Controller {
       if (typeof output === 'string') { local.latest_model_output = this.bounded(output, 4096); local.output_truncated ||= output.length > 4096; }
       local.command_count = Array.isArray(result.commands) ? result.commands.length : null;
       local.subscription_usage_attribution = 'unverified';
-      local.human_attention_required ||= local.execution_state !== 'completed';
-      task.implementer.state = local.human_requests.length ? 'needs_attention' : local.execution_state;
+      for (const request of local.human_requests) {
+        if (request.status === 'responding' && local.terminal_observed && request.delivery === 'sent_unconfirmed') request.status = 'resolved';
+      }
+      this.invalidateLocalRequests(task, 'LOCAL_TURN_ENDED_WITHOUT_CALLBACK_RESOLUTION');
+      this.localHumanState(task);
       this.opDone(task.request_id); this.save(task);
     } finally {
       const closed = await settledWithin(Promise.resolve().then(() => backend.close()));
@@ -486,9 +558,11 @@ export class Controller {
   }
   localView(t) {
     const ref = t.implementer, local = ref.local;
+    const humanRequests = local.human_requests.map(({ native_request_id, response, ...request }) => request);
     return { state: ref.state, session_id: null, turn_id: null, environment_id: null,
-      local, latest_output: local.latest_model_output || null, latest_output_source: 'model',
-      clarification_required: local.human_requests.some(request => request.method === 'item/tool/requestUserInput'),
+      local: { ...local, human_requests: humanRequests }, pending_human_requests: humanRequests.filter(request => request.status === 'pending'),
+      latest_output: local.latest_model_output || null, latest_output_source: 'model',
+      clarification_required: humanRequests.some(request => request.status === 'pending' && request.expected_response === 'clarification'),
       human_attention_required: local.human_attention_required, error: ref.error || null,
       evidence_notice: 'Native adapter observations only; no exhaustive command history, controller-certified test evidence, or test PASS is implied.' };
   }
@@ -644,11 +718,12 @@ export class Controller {
     if (!t.cleaned) result.state = result.implementer.state;
     return result;
   }
-  async continue({ task_id: id, instruction, request_id }) {
-    this.rejectSecret(instruction);
+  async continue({ task_id: id, instruction, request_id, human_response }) {
     return this.locked(id, async () => {
       let t = this.task(id);
-      if (t.execution_backend === 'local_codex') throw new BridgeError('LOCAL_CONTINUE_UNSUPPORTED');
+      if (t.execution_backend === 'local_codex') return this.continueLocal(t, { instruction, request_id, human_response });
+      if (human_response !== undefined || typeof instruction !== 'string' || !instruction.trim()) throw new BridgeError('INVALID_CONTINUE_INPUT');
+      this.rejectSecret(instruction);
       if (t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION'); if (t.cleaned) throw new BridgeError('TASK_CLEANED');
       if (this.jobs.has(`${id}:implementer`)) throw new BridgeError('TASK_STARTING');
       const old = this.operation(request_id, 'continue', { id, instruction }, id);
@@ -685,6 +760,51 @@ export class Controller {
         return this.get(id);
       } catch (e) { this.opDone(request_id, e instanceof BridgeError ? 'rejected' : 'uncertain'); throw e; }
     });
+  }
+  continueLocal(task, { instruction, request_id, human_response }) {
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (instruction !== undefined || !object(human_response) || !/^[A-Za-z0-9_-]{8,100}$/.test(request_id || '') ||
+        Object.keys(human_response).some(key => !['request_ref', 'thread_id', 'turn_id', 'decision', 'answers'].includes(key))) throw new BridgeError('LOCAL_STRUCTURED_RESPONSE_REQUIRED');
+    const payload = { id: task.id, human_response };
+    this.rejectSecret(payload);
+    const old = this.db.prepare('SELECT * FROM operations WHERE id=?').get(request_id);
+    if (old) {
+      if (old.fingerprint !== digest({ kind: 'local_response', payload })) throw new BridgeError('REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT');
+      return this.get(task.id, false);
+    }
+    const local = task.implementer.local, owned = this.localRuns.get(task.id);
+    if (this.closed || task.cleaned || task.implementer.stopping || Date.now() >= task.deadline || local.terminal_observed || local.result_received) throw new BridgeError('LOCAL_CALLBACK_NOT_ACTIVE');
+    const request = local.human_requests.find(candidate => candidate.request_ref === human_response.request_ref);
+    if (!request || request.status !== 'pending') throw new BridgeError('LOCAL_PENDING_REQUEST_NOT_FOUND');
+    if (human_response.thread_id !== request.thread_id || human_response.turn_id !== request.turn_id) throw new BridgeError('LOCAL_CALLBACK_IDENTITY_MISMATCH');
+    if (!owned || local.owner_instance !== this.instanceId) throw new BridgeError('LOCAL_CALLBACK_OWNER_UNAVAILABLE');
+    const response = Object.fromEntries(['decision', 'answers'].filter(key => Object.hasOwn(human_response, key)).map(key => [key, human_response[key]]));
+    try { validateHumanResponse(request.method, request.questions, response, request.decisions); }
+    catch { throw new BridgeError('LOCAL_HUMAN_RESPONSE_INVALID'); }
+    if (response.decision === 'accept' && request.description_incomplete) throw new BridgeError('LOCAL_APPROVAL_DESCRIPTION_INCOMPLETE');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.operation(request_id, 'local_response', payload, task.id);
+      request.response = structuredClone(response); request.operation_id = request_id;
+      request.status = 'responding'; request.delivery = 'prepared';
+      this.save(task); this.opDone(request_id, 'submitting');
+      this.db.exec('COMMIT');
+    } catch {
+      this.db.exec('ROLLBACK');
+      throw new BridgeError('LOCAL_RESPONSE_PERSISTENCE_FAILED');
+    }
+    try {
+      owned.backend.respondToRequest({ requestId: request.native_request_id, threadId: request.thread_id, turnId: request.turn_id, response });
+      this.opDone(request_id, 'accepted');
+    } catch {
+      owned.abort.abort();
+      const current = this.task(task.id), failed = current.implementer.local.human_requests.find(candidate => candidate.request_ref === request.request_ref);
+      failed.status = 'uncertain'; failed.diagnostic = 'LOCAL_RESPONSE_DELIVERY_UNCERTAIN';
+      current.implementer.local.human_attention_required = true; current.implementer.state = 'needs_attention';
+      this.save(current); this.opDone(request_id, 'uncertain');
+      throw new BridgeError('LOCAL_RESPONSE_DELIVERY_UNCERTAIN');
+    }
+    return this.get(task.id, false);
   }
   async repositoryDiff(repo, baseline) {
     let diff = git(repo, 'diff', '--no-ext-diff', '--no-textconv', baseline, '--');
@@ -963,7 +1083,8 @@ export class Controller {
     });
   }
   async stopLocal(id) {
-    let task = this.task(id); task.implementer.stopping = true; this.save(task);
+    let task = this.task(id); task.implementer.stopping = true;
+    this.invalidateLocalRequests(task, 'LOCAL_CALLBACK_CANCELLED'); this.save(task);
     const owned = this.localRuns.get(id), diagnostics = new Set();
     if (owned) {
       owned.abort.abort();

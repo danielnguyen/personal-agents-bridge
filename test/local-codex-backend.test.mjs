@@ -513,3 +513,109 @@ test('failed human-request persistence cannot race a completed event into succes
   const result = await value.run(); assert.equal(result.status, 'uncertain');
   assert(result.uncertainties.includes('LIFECYCLE_HANDLER_FAILED')); assert.equal(value.replies.length, 0);
 });
+
+async function deferred(context, method = 'item/commandExecution/requestApproval', options = {}, overrides = {}) {
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, send }) => {
+    nextTurn(); setImmediate(() => send({ id: 0, method, params: { threadId: 'thread-fixture', turnId: 'turn-1', command: 'node --version',
+      questions: [{ id: 'scope', question: 'Which file?', isOther: true, options: [{ label: 'fixture.txt' }] }] } }));
+    return { turn: { id: 'turn-1' } };
+  }, ...overrides }, { deferHumanRequests: true, ...options });
+  const running = value.run();
+  for (let attempt = 0; attempt < 100 && !value.backend.active?.requests.has(0); attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert(value.backend.active?.requests.has(0));
+  return { ...value, running, respond: response => value.backend.respondToRequest({ requestId: 0, threadId: 'thread-fixture', turnId: 'turn-1', response }) };
+}
+
+for (const decision of ['accept', 'decline', 'cancel']) test(`deferred native ${decision} replies to the original request and turn exactly once`, async context => {
+  const events = [], value = await deferred(context, 'item/commandExecution/requestApproval', { onLifecycle: event => events.push(event),
+    onApproval: () => { assert.fail('Deferred requests must not invoke automatic handlers'); } },
+  { reply: ({ complete }) => setImmediate(() => complete(decision === 'cancel' ? 'interrupted' : 'completed')) });
+  const request = events.find(event => event.phase === 'human_request');
+  assert.equal(request.request.id, 0); assert.equal(request.threadId, 'thread-fixture'); assert.equal(request.turnId, 'turn-1');
+  assert.equal(value.replies.length, 0); assert.equal(value.backend.busy, true);
+  value.respond({ decision });
+  assert.throws(() => value.respond({ decision }), /NATIVE_REQUEST_UNAVAILABLE/);
+  const result = await value.running;
+  assert.equal(result.status, decision === 'cancel' ? 'interrupted' : 'completed');
+  assert.deepEqual(value.replies, [{ id: 0, result: { decision } }]);
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  assert.equal(value.requests.filter(request => request.method === 'thread/start').length, 1);
+  assert(!value.requests.some(request => request.method === 'thread/resume'));
+  assert.deepEqual(events.filter(event => event.phase.startsWith('human_response')).map(event => event.phase), ['human_response_submitting', 'human_response_sent']);
+});
+
+test('deferred clarification delivers exact native question IDs without starting a new turn', async context => {
+  const value = await deferred(context, 'item/tool/requestUserInput', {}, { reply: ({ complete }) => setImmediate(() => complete()) });
+  assert.throws(() => value.respond({ answers: { wrong: { answers: ['fixture.txt'] } } }), /INVALID_CLARIFICATION_ANSWER/);
+  value.respond({ answers: { scope: { answers: ['human free text'] } } });
+  assert.equal((await value.running).status, 'completed');
+  assert.deepEqual(value.replies[0], { id: 0, result: { answers: { scope: { answers: ['human free text'] } } } });
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+});
+
+test('adapter rejects wrong native request type/ID, thread, turn and malformed decisions before writing', async context => {
+  const value = await deferred(context, 'item/fileChange/requestApproval');
+  for (const changed of [{ requestId: '0' }, { requestId: 1 }, { threadId: 'foreign' }, { turnId: 'foreign' }]) {
+    assert.throws(() => value.backend.respondToRequest({ requestId: 0, threadId: 'thread-fixture', turnId: 'turn-1', response: { decision: 'accept' }, ...changed }), /NATIVE_REQUEST_UNAVAILABLE/);
+  }
+  for (const response of [{ decision: 'yes' }, { decision: 'acceptForSession' }, { decision: 'accept', extra: true }, { answers: {} }]) {
+    assert.throws(() => value.respond(response), /INVALID_APPROVAL_DECISION/);
+  }
+  assert.equal(value.replies.length, 0);
+  await value.backend.cancel(); assert.equal((await value.running).status, 'interrupted');
+});
+
+for (const phase of ['human_response_submitting', 'human_response_sent']) test(`${phase} persistence failure never retries and reports uncertain delivery`, async context => {
+  const value = await deferred(context, 'item/commandExecution/requestApproval', { onLifecycle: event => { if (event.phase === phase) throw Error('storage unavailable'); } });
+  assert.throws(() => value.respond({ decision: 'accept' }), /HUMAN_RESPONSE_DELIVERY_UNCERTAIN/);
+  const result = await value.running; assert.equal(result.status, 'uncertain');
+  assert.equal(value.replies.length, phase === 'human_response_submitting' ? 0 : 1);
+  assert.throws(() => value.respond({ decision: 'accept' }), /NATIVE_REQUEST_UNAVAILABLE/);
+});
+
+for (const stop of ['cancel', 'close', 'complete', 'server_resolved', 'transport_loss']) test(`${stop} invalidates a deferred request and rejects late acceptance`, async context => {
+  const value = await deferred(context);
+  if (stop === 'cancel') await value.backend.cancel();
+  if (stop === 'close') await value.backend.close();
+  if (stop === 'complete') value.complete();
+  if (stop === 'server_resolved') value.event('serverRequest/resolved', { threadId: 'thread-fixture', requestId: 0 });
+  if (stop === 'transport_loss') value.backend.rpc.child.kill();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.throws(() => value.respond({ decision: 'accept' }), /NATIVE_REQUEST_UNAVAILABLE/);
+  if (stop === 'server_resolved') await value.backend.cancel();
+  await value.running; assert.equal(value.replies.length, 0);
+});
+
+test('duplicate native requests, including after response, cannot elicit another approval', async context => {
+  for (const answered of [false, true]) {
+    const value = await deferred(context);
+    const request = value.backend.active.humanRequests.get(0);
+    if (answered) value.respond({ decision: 'decline' });
+    value.backend.rpc.child.stdout.write(JSON.stringify(request) + '\n');
+    const result = await value.running;
+    assert.equal(result.status, 'uncertain'); assert(result.uncertainties.includes('DUPLICATE_SERVER_REQUEST'));
+    assert.equal(value.replies.length, answered ? 1 : 0);
+  }
+});
+
+test('unbound resolution cannot clear a pending human request', async context => {
+  const value = await deferred(context);
+  value.event('serverRequest/resolved', { requestId: 0 });
+  const result = await value.running; assert.equal(result.status, 'uncertain');
+  assert(result.uncertainties.includes('REQUEST_RESOLUTION_MISMATCH')); assert.equal(value.replies.length, 0);
+});
+
+test('bounded timeout interrupts even while a deferred callback remains unanswered', async context => {
+  const value = await deferred(context, 'item/fileChange/requestApproval', { timeoutMs: 100 });
+  const result = await value.running;
+  assert.equal(result.status, 'interrupted'); assert.equal(result.terminalObserved, true); assert.equal(value.replies.length, 0);
+  assert.throws(() => value.respond({ decision: 'accept' }), /NATIVE_REQUEST_UNAVAILABLE/);
+});
+
+test('deferred approvals respect native available decisions instead of silently widening them', async context => {
+  const value = await deferred(context);
+  value.backend.active.humanRequests.get(0).params.availableDecisions = ['decline', 'cancel'];
+  assert.throws(() => value.respond({ decision: 'accept' }), /INVALID_APPROVAL_DECISION/);
+  value.respond({ decision: 'decline' }); value.complete();
+  assert.equal((await value.running).status, 'completed'); assert.equal(value.replies.length, 1);
+});
