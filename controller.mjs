@@ -6,8 +6,8 @@ import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMetho
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
-import { localReviewerInstructions, validateLocalReview } from './local-reviewer-instructions.mjs';
-import { LocalValidation, VALIDATION_VERSION } from './local-validation.mjs';
+import { localReviewerInstructions, validateLocalReview, localExecutionQualified } from './local-reviewer-instructions.mjs';
+import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -501,7 +501,9 @@ export class Controller {
     if (this.closed || task.implementer.stopping) return;
     await verifyTaskWorktree(path.join(this.workspaceRoot, id), task.repository);
     if (this.closed || this.task(id).implementer.stopping) return;
-    task = this.task(id); task.local_execution_evidence = createLocalEvidence(id); this.save(task);
+    const protectedState = await this.localProtectedState(workspace);
+    if (this.closed || this.task(id).implementer.stopping) return;
+    task = this.task(id); task.local_protected_before = protectedState; task.local_execution_evidence = createLocalEvidence(id); this.save(task);
     const abort = new AbortController();
     const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.timeoutMs, deferHumanRequests: true, onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
@@ -550,6 +552,8 @@ export class Controller {
       this.localIdentity(local, result);
       const status = ['completed', 'failed', 'interrupted', 'uncertain'].includes(result.status) ? result.status : 'uncertain';
       const confirmed = local.terminal_observed && local.turn_submission_acknowledged && local.thread_id && local.turn_id;
+      local.authentication = result.authentication === 'chatgpt' ? 'chatgpt' : 'unverified';
+      local.adapter_contract = 'pab.local-codex-backend.v1';
       local.execution_state = status === 'completed' && !confirmed ? 'uncertain' : status;
       local.result_received = true; local.phase = 'finished';
       local.diagnostics = (Array.isArray(result.uncertainties) ? result.uncertainties : ['LOCAL_RESULT_UNVERIFIED']).slice(0, 12).map(value => this.bounded(value, 512));
@@ -748,6 +752,7 @@ export class Controller {
   async continue({ task_id: id, instruction, request_id, human_response }) {
     return this.locked(id, async () => {
       let t = this.task(id);
+      if (t.execution_backend === 'local_codex' && t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION');
       if (t.execution_backend === 'local_codex') return this.continueLocal(t, { instruction, request_id, human_response });
       if (human_response !== undefined || typeof instruction !== 'string' || !instruction.trim()) throw new BridgeError('INVALID_CONTINUE_INPUT');
       this.rejectSecret(instruction);
@@ -862,6 +867,25 @@ export class Controller {
     const fresh = this.task(id); fresh.repository_evidence = t.repository_evidence; fresh.repository_evidence_error = null; this.save(fresh);
     return changed;
   }
+  async localProtectedState(repo) {
+    const entries = []; let bytes = 0;
+    const walk = async name => {
+      if (entries.length >= MAX_FILES) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
+      const target = path.join(repo, name);
+      const stat = await fs.lstat(target).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (!stat) { entries.push([name, 'absent']); return; }
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()) || (stat.isFile() && stat.nlink !== 1)) throw new BridgeError('LOCAL_PROTECTED_PATH_UNSAFE');
+      if (stat.isDirectory()) {
+        entries.push([name, 'directory', stat.mode]);
+        for (const child of (await fs.readdir(target)).sort()) await walk(`${name}/${child}`);
+      } else {
+        bytes += stat.size; if (bytes > MAX_PACKET) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
+        entries.push([name, 'file', stat.mode, digest(await fs.readFile(target))]);
+      }
+    };
+    await walk('TASK.md'); await walk('.codex');
+    return { provenance: 'controller', status: 'captured', sha256: digest(entries) };
+  }
   async buildPacket(t) {
     try {
       const result = await this.buildPacketData(t);
@@ -921,6 +945,8 @@ export class Controller {
     const changed = repositoryChanges || [...new Set([...git(repo, 'diff', '--name-only', t.baseline).trim().split('\n'), ...git(repo, 'ls-files', '--others').trim().split('\n')].filter(Boolean))];
     if (t.execution_backend === 'local_codex') {
       const data = { ...localEvidencePacket(t, contract.test_commands, repo, reviewedState),
+        local_scope: { version: 'pab.local-scope.bounded.v1', provenance: 'controller', contract_sha256: digest(contract),
+          protected_before: t.local_protected_before || null, protected_at_review: await this.localProtectedState(repo) },
         reviewed_git_state: reviewedState, controller_evidence: await repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this)),
         file_byte_evidence: fileBytes, baseline_state: JSON.parse(await fs.readFile(path.join(root, 'baseline-state.json'), 'utf8')),
         current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
@@ -984,6 +1010,7 @@ export class Controller {
   async review({ task_id: id, request_id }) {
     return this.locked(id, async () => {
       const t = this.task(id);
+      if (t.execution_backend === 'local_codex' && t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION');
       if (t.execution_backend === 'local_codex') return this.reviewLocal(t, request_id);
       if (t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION'); if (t.cleaned) throw new BridgeError('TASK_CLEANED');
       if (t.reviewer && !t.reviewer.stale) return this.get(id);
@@ -1008,6 +1035,7 @@ export class Controller {
     const text = await fs.readFile(file, 'utf8');
     if (digest(text) !== ref.packet_hash) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const packet = JSON.parse(text);
+    if (JSON.stringify(await this.localProtectedState(path.join(root, 'repo'))) !== JSON.stringify(packet.local_scope?.protected_at_review)) throw new BridgeError('LOCAL_REVIEW_PROTECTED_PATH_CHANGED');
     if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state) ||
         JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
     const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
@@ -1140,6 +1168,8 @@ export class Controller {
       task = this.task(id); const ref = task.reviewer;
       this.localIdentity(ref.local, result);
       const confirmed = ref.local.turn_submission_acknowledged && ref.local.terminal_observed && ref.local.thread_id && ref.local.turn_id && result.authentication === 'chatgpt';
+      ref.local.authentication = result.authentication === 'chatgpt' ? 'chatgpt' : 'unverified';
+      ref.local.adapter_contract = 'pab.local-codex-backend.v1';
       Object.assign(ref.local, { execution_state: result.status === 'completed' && !confirmed ? 'uncertain' : ['completed', 'failed', 'interrupted', 'uncertain'].includes(result.status) ? result.status : 'uncertain',
         phase: 'validating', result_received: true, diagnostics: (result.uncertainties || []).slice(0, 12).map(value => this.bounded(value, 512)) });
       ref.state = 'finishing'; this.save(task);
@@ -1152,7 +1182,7 @@ export class Controller {
     task = this.task(id);
     try {
       const ref = task.reviewer, local = ref.local;
-      if (ref.stopping || ref.error || local.execution_state !== 'completed' || !local.server_closed || !local.terminal_observed ||
+      if (ref.stopping || ref.error || !localExecutionQualified(local) || local.execution_state !== 'completed' || !local.server_closed || !local.terminal_observed ||
           !local.turn_submission_acknowledged || !local.thread_id || !local.turn_id || local.thread_id === task.implementer.local.thread_id ||
           result.authentication !== 'chatgpt') throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
       const packet = await this.verifyLocalReviewPacket(task);
@@ -1163,6 +1193,7 @@ export class Controller {
       if (this.closed || task.reviewer.stopping) throw new BridgeError('LOCAL_REVIEW_CANCELLED');
       task.reviewer.review_result = { ...validated, packet_hash: task.reviewer.packet_hash, reviewed_git_state: task.reviewer.reviewed_git_state,
         thread_id: task.reviewer.local.thread_id, turn_id: task.reviewer.local.turn_id };
+      task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
       task.reviewer.state = 'completed'; task.reviewer.local.phase = 'finished';
     } catch (error) {
       task = this.task(id); task.reviewer.state = 'needs_attention'; task.reviewer.review_result = null;
@@ -1172,6 +1203,35 @@ export class Controller {
     }
     this.opDone(task.reviewer.request_id, task.reviewer.review_result ? 'accepted' : 'uncertain'); this.save(task);
   }
+  async qualifyLocalPublication(task) {
+    if (!task.reviewer || task.reviewer.stale || task.reviewer.state !== 'completed' || task.reviewer.review_result?.overall !== 'PASS') throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
+    for (const role of ['implementer', 'reviewer']) {
+      const ref = task[role];
+      if (ref.state !== 'completed' || ref.error || ref.session_id || ref.environment_id || !localExecutionQualified(ref.local) || ref.local.human_attention_required ||
+          ref.local.human_requests.some(request => request.status !== 'resolved')) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
+    }
+    if (this.localRuns.has(task.id) || this.localRuns.has(`${task.id}:reviewer`) || this.validationRuns.has(task.id) ||
+        task.reviewer.local.thread_id === task.implementer.local.thread_id) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
+    const packet = await this.verifyLocalReviewPacket(task), result = task.reviewer.review_result;
+    if (packet.execution?.task_id !== task.id || ['thread_id', 'turn_id', 'model', 'authentication', 'adapter_contract'].some(key =>
+      packet.execution?.[key] !== task.implementer.local[key])) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
+    const root = path.join(this.workspaceRoot, task.id), contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'));
+    if (digest(result) !== task.reviewer.findings_sha256 || result.packet_hash !== task.reviewer.packet_hash ||
+        result.thread_id !== task.reviewer.local.thread_id || result.turn_id !== task.reviewer.local.turn_id ||
+        JSON.stringify(result.reviewed_git_state) !== JSON.stringify(task.reviewer.reviewed_git_state) ||
+        result.validation_contract !== 'pab.local-review.v2') throw new BridgeError('LOCAL_PUBLICATION_REVIEW_INVALID');
+    if (!independentValidationPassed(task.local_validation, contract.test_commands, packet.reviewed_git_state, task.id) ||
+        JSON.stringify(task.local_validation) !== JSON.stringify(packet.independent_validation)) throw new BridgeError('LOCAL_PUBLICATION_VALIDATION_UNVERIFIED');
+    const qualified = validateLocalReview(JSON.stringify({ overall: result.overall, findings: result.findings }), contract, packet, this.bounded.bind(this));
+    if (qualified.overall !== 'PASS' || JSON.stringify(qualified.scope_qualification) !== JSON.stringify(result.scope_qualification)) throw new BridgeError('LOCAL_PUBLICATION_REVIEW_INVALID');
+    const publication = task.publication;
+    if (publication && (publication.task_id !== task.id || publication.pushed_branch !== task.repository.branch ||
+        publication.review_packet_sha256 !== task.reviewer.packet_hash || publication.reviewed_tree_sha !== task.reviewer.reviewed_git_state.tree_sha ||
+        publication.reviewer_backend !== 'local_codex' || publication.reviewer_session_id !== null ||
+        publication.reviewer_thread_id !== task.reviewer.local.thread_id || publication.reviewer_turn_id !== task.reviewer.local.turn_id ||
+        publication.review_overall !== 'PASS')) throw new BridgeError('LOCAL_PUBLICATION_BINDING_CHANGED');
+    if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+  }
   async publish(input) {
     if (!input || Object.keys(input).some(k => !['task_id', 'title', 'body', 'draft'].includes(k)) ||
         typeof input.title !== 'string' || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title) ||
@@ -1179,20 +1239,20 @@ export class Controller {
     this.rejectSecret(input);
     return this.locked(input.task_id, async () => {
       let t = this.task(input.task_id);
-      if (t.execution_backend === 'local_codex') throw new BridgeError('LOCAL_PUBLISH_UNSUPPORTED');
       try {
         if (!t.repository) throw new BridgeError('PUBLICATION_REQUIRES_REPOSITORY');
         if (['implementer', 'reviewer'].some(role => this.jobs.has(`${t.id}:${role}`))) throw new BridgeError('TASK_EXECUTION_PENDING');
-        for (const role of ['implementer', 'reviewer']) if (t[role]?.session_id && !t[role].deleted) await this.viewRole(t, role);
+        for (const role of ['implementer', 'reviewer']) if (t.execution_backend !== 'local_codex' && t[role]?.session_id && !t[role].deleted) await this.viewRole(t, role);
         t = this.task(t.id);
         if (t.implementer.state !== 'completed') throw new BridgeError('PUBLICATION_REQUIRES_COMPLETED_IMPLEMENTATION');
-        if (!t.reviewer || t.reviewer.stale || t.reviewer.state !== 'completed' || t.reviewer.session_id === t.implementer.session_id ||
+        if (t.execution_backend === 'local_codex') await this.qualifyLocalPublication(t);
+        else if (!t.reviewer || t.reviewer.stale || t.reviewer.state !== 'completed' || t.reviewer.session_id === t.implementer.session_id ||
             t.reviewer.review_result?.overall !== 'PASS' || t.reviewer.review_result.packet_hash !== t.reviewer.packet_hash) throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
         const registered = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), t.repository.repository_id, t.repository.base_ref, this.workspaceRoot, this.stateRoot);
         if (JSON.stringify(registered.registered_identity) !== JSON.stringify(t.repository.registered_identity)) throw new BridgeError('REPOSITORY_PATH_CHANGED');
         for (const role of ['implementer', 'reviewer']) {
           t[role].stopping = true; this.save(t);
-          if (!await this.executor.stop(t[role].executor)) throw new BridgeError('EXECUTOR_NOT_STOPPED');
+          if (t.execution_backend !== 'local_codex' && !await this.executor.stop(t[role].executor)) throw new BridgeError('EXECUTOR_NOT_STOPPED');
         }
         t = this.task(t.id);
         const result = await publishReviewedTask(this, t, { title: input.title, body: input.body || '', draft: true });

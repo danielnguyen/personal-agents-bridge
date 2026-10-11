@@ -132,7 +132,7 @@ test('unsupported candidate entries and invalid tree identities fail closed', as
   await assert.rejects(materializeValidationTree(value.repo, tree, destination), /VALIDATION_TREE_ENTRY_UNSUPPORTED/);
 });
 
-test('only complete independent exact-tree evidence may remove TEST_EVIDENCE floor; SCOPE still FAIL', async context => {
+test('only complete independent exact-tree evidence may remove TEST_EVIDENCE floor; missing scope proof still FAILs', async context => {
   const value = await fixture(context), runner = new LocalValidation({ root: value.root });
   const results = await runner.run({ ...value, commands: ['test "$(cat answer.txt)" = 42'], attemptId: 'attempt', onRecord: () => {} });
   const reviewed = { tree_sha: value.tree, state: { head: 'baseline' } };

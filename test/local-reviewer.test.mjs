@@ -8,7 +8,7 @@ const input = () => ({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'T
 const packet = { evidence_version: LOCAL_EVIDENCE_VERSION, independent_validation: { status: 'unavailable' } };
 const validate = (raw = input(), overrides = {}) => validateLocalReview(JSON.stringify(raw), { ...contract(), ...overrides }, packet, value => value);
 
-test('controller downgrades model PASS for required independent validation and historical scope proof', () => {
+test('controller downgrades model PASS for missing independent validation and bounded scope proof', () => {
   const result = validate(input(), { test_commands: ['python3 -B check.py'] });
   assert.equal(result.overall, 'FAIL'); assert.equal(result.model_overall, 'PASS');
   assert.deepEqual(result.controller_overrides, ['SCOPE', 'TEST_EVIDENCE']);

@@ -36,7 +36,8 @@ is constructed lazily; local-only controller operation does not require an infer
 `OPENAI_API_KEY`. Existing tunnel authorization credentials are still independently
 required and unchanged.
 
-This slice supports **start → get → native human response → same turn → cleanup**.
+This slice supports **start → get → native human response → same turn → independent
+validation/review → qualified exact-tree draft publication → cleanup**.
 `get_task` reports persisted
 `execution_backend` and `implementer.local` observations: phase/execution state,
 thread/turn IDs, model, submission-attempt/acknowledgement flags, terminal observation,
@@ -112,7 +113,26 @@ most 32 requests per turn, eight questions per request and 20 options per questi
 
 Post-completion/new-turn continuation and restart reattachment remain unsupported.
 Local `review_task` supports the bounded independent analysis described below.
-Local `publish_task` still rejects with `LOCAL_PUBLISH_UNSUPPORTED`.
+Local `publish_task` now requires the qualified independent PASS and exact-tree
+gates below. Human routing alone cannot authorize publication.
+
+Pinned Codex **0.157.1** supports the `item/tool/requestUserInput` protocol request,
+but its blocking `request_user_input` tool is available in Plan mode, not Default
+mode unless `default_mode_request_user_input` is enabled. That feature is
+under development and disabled by default. PAB does not select Plan mode or enable
+that feature; its pinned feature subset does not attest every other effective
+feature. Therefore the protocol's existence is not proof that the default PAB
+turn can generate a live callback. See the pinned [mode gate](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/tools/src/tool_config.rs#L17)
+and [feature default](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/features/src/lib.rs#L1605).
+The separate [async-question tool](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/core/src/tools/handlers/request_user_input_async.rs)
+emits agent-message items, not this JSON-RPC callback. PAB does not substitute
+those messages for native authorization. The retained acceptance had no native
+pending request; it cannot establish whether the model attempted an unavailable
+tool or used async messaging. Qualifying real human routing requires separately
+authorized mode/capability work and live exact-callback/turn continuity evidence.
+Native command/file approvals remain supported when actually requested; the
+harmless acceptance command did not trigger one. No capabilities are enabled by
+this correction.
 
 ### Local evidence and independent analysis
 
@@ -123,6 +143,21 @@ output, missing fields, redaction/truncation and rejected/omitted event counts r
 explicit. File-change claims are separate from controller-observed file bytes.
 Model prose, reasoning, human answers and raw notification logs are excluded.
 Final adapter summaries cannot reconstruct missing notification history.
+
+Native aggregate output now retains distinct `absent`, `null`, `empty`, `present`
+and `malformed` availability. The [pinned output projection](https://github.com/openai/codex/blob/36650394c5b38c2990ccf2a3457165ca3e9d9726/codex-rs/app-server-protocol/src/protocol/item_builders.rs#L116)
+can encode an empty aggregate as null. This explains why missing output need not
+mean failed execution, but PAB never converts absent/null into verified empty
+stdout or stderr. Optional output gaps stay in the notification ledger and the
+review result's `scope_qualification.command_output_limitations`, not fatal
+adapter diagnostics. Start/completion, identity, command/cwd, status and exit
+evidence remain mandatory; malformed/conflicting records and unrelated runtime
+uncertainty still block qualification. Truncation/redaction remains explicit.
+The reviewer must FAIL an output-dependent obligation without sufficient evidence;
+controller-owned independent execution remains mandatory for required tests.
+This neither generates PASS findings nor weakens exact-tree publication gates.
+Old acceptance records and FAIL reviews are not rewritten or automatically
+requalified; missing availability provenance in old command records fails closed.
 
 The internal `Controller.buildPacket(task)` path can prepare a
 `pab.local-codex-review.v1` packet after the local job is finished and the owned
@@ -151,15 +186,22 @@ Snapshots are sampled state, not a syscall/network audit or immutable freeze.
 Existing Git diff enumeration can omit ignored writes; the normal-checkout snapshot
 includes ignored files. App-server closure does not attest descendant termination,
 and concurrent external changes remain a possible capture race despite before/after
-Git checks. No independent PASS or publication authorization is produced.
+Git checks. Evidence capture alone produces no independent PASS or publication
+authorization; validation, independent review and controller publication gates follow.
 
-Remaining gates: **PR #6 live human-routing acceptance remains UNVERIFIED**;
-live validation/reviewer acceptance, SCOPE qualification and publisher integration
-need separate review and authorization. Local publication remains disabled. No live
-turns are needed for the offline evidence/reviewer tests:
+Bounded A/B acceptance at `c11a3caa2abbb94380eb71579f07a5e4056bba97` observed four
+ChatGPT-authenticated turns, correct fixture bytes, independently passing validation
+and a separate terminal reviewer. The Controller overrode model PASS with
+`SCOPE_EXECUTION_UNCERTAIN` because a completed zero-exit write had unavailable
+output. That actual FAIL remains unchanged. Native test-command correlation was
+unmatched (shell wrapper); no native file-change event was retained. Human routing
+remains **UNVERIFIED**. This correction is offline-tested only: fresh qualified
+SCOPE acceptance and separately authorized exact-tree publication remain outstanding.
+No billing attribution guarantee or deployment authorization follows. No live
+turns are needed for tests:
 
 ```bash
-node --test test/local-validation.test.mjs test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
+node --test test/publication.test.mjs test/local-validation.test.mjs test/local-reviewer.test.mjs test/local-evidence.test.mjs test/local-codex-backend.test.mjs test/local-controller-integration.test.mjs
 npm test
 git diff --check
 ```
@@ -202,16 +244,25 @@ model analysis, not independently certified truth. Controller overrides are expl
 - Required test commands cannot obtain TEST_EVIDENCE PASS from native matches,
   completion/exit zero or reviewer assertions. Only complete controller-owned
   validation, bound to the exact reviewed tree/state, can remove that failure floor.
-- Current v1 evidence cannot independently establish historical compliance with
-  the local contract's Git-publication/history/configuration and write-scope
-  prohibitions. SCOPE is therefore FAIL for missing required proof, not an invented
-  Agents API attestation requirement or an assertion of observed misconduct.
+- SCOPE uses `pab.local-scope.bounded.v1`: validated registration/task identity and
+  pinned baseline, unchanged normal checkout and protected `TASK.md`/`.codex`,
+  unchanged Git index/refs/config/operation state, approved final file scope, and
+  authenticated, acknowledged, terminal and closed local execution. Missing or
+  contradictory provenance, unresolved safeguard uncertainty, rejected/omitted
+  notifications and observed prohibited-operation indications fail qualification.
+  Native command text is screened conservatively for Git mutation indications;
+  this is not a universal shell parser or historical audit. The reviewer must
+  assess every retained command/file record and each additional contract obligation.
 - Missing optional diagnostics do not invent additional tests or violations.
 
-**Overall PASS is not qualified by current v1 evidence.** A completed review with
-legitimate FAIL findings is useful and expected. The persisted `review_result`
+SCOPE may PASS under the accepted single-owner, trusted-repository dedicated-VM
+model, **not as proof of exhaustive historical compliance or Agents API sandbox
+equivalence**. Minimum gates only downgrade findings, never generate PASS or override
+the reviewer's FAIL on a requirement/invariant. Coverage limitations are retained
+in every review result, including PASS. A legitimate FAIL remains useful. The persisted `review_result`
 includes validated findings, controller overrides, model-proposed overall result,
-packet hash and reviewed-tree/thread/turn binding. Invalid, cancelled, incomplete,
+packet hash, bounded qualification and reviewed-tree/thread/turn binding, using
+`pab.local-review.v2`. Invalid, cancelled, incomplete,
 unacknowledged or uncertain execution cannot produce a review result.
 
 Request retries never submit twice. There is one local reviewer attempt per task
@@ -220,7 +271,37 @@ preserves completed findings and marks unfinished execution/validation for atten
 without replay. There is no atomic transaction spanning app-server dispatch and
 SQLite persistence; missing acknowledgements remain uncertain. Cleanup, expiration
 and shutdown cancel/close both owned roles before any workspace deletion. Local
-post-completion implementation continuation and publication remain unsupported.
+post-completion implementation continuation remains unsupported.
+
+### Qualified local publication
+
+`publish_task` uses the existing controller-owned `publication.mjs` path, not a
+second publisher. Both local roles must be completed, terminal, acknowledged and
+closed, with distinct implementer/reviewer threads and no active owned processes,
+unresolved human requests or unknown execution diagnostics. The three adapter
+coverage warnings (non-exhaustive upstream output, untrusted model prose, and no
+independent escaped-descendant attestation) remain explicit accepted limitations,
+not claims of exhaustive enforcement.
+
+The Controller rechecks strict findings and their persisted digest, packet hash,
+reviewed tree/state, task/registration/normal-checkout identity, protected paths,
+and exact-tree independent validation including confirmed termination. Empty test
+lists still require a completed validation lifecycle. Legacy tasks lacking the new
+pre-execution protected snapshot or review binding cannot qualify retrospectively.
+
+The shared publisher freezes implementation/review changes, uses only the fixed
+task branch, builds a commit from the reviewed tree, verifies tree identity, refuses
+default-branch or conflicting-ref updates, and creates only draft PRs. Retry input
+fingerprints and uncertain push/PR reconciliation remain unchanged; missing remote
+acknowledgements do not authorize duplicate PR creation. Local thread/turn identities
+are recorded without fabricating Agents API session IDs. Required tests must pass
+independently; a completed validation attempt or native exit zero is insufficient.
+
+Snapshot checks cannot exclude external change-and-restore races, ignored artifacts,
+broad host reads or escaped descendants. A persisted findings digest detects changed
+records, not a compromised Controller/database owner. Existing immutable Git tree
+publication preserves exact reviewed bytes; it is not universal execution confinement.
+No live publication acceptance or deployment authorization is implied by these tests.
 
 ### Controller-owned local validation
 
@@ -262,8 +343,8 @@ Absent or different-tree validation cannot satisfy TEST_EVIDENCE. Aggregate
 Only all required commands with observed start/completion, zero exit, complete
 output, unchanged original and confirmed termination can qualify. Test design and
 requirement sufficiency remain review questions; native notifications/model prose
-never supply independent results. **SCOPE still FAILs under the v1 historical-proof
-limitation, and local publication remains disabled.**
+never supply independent results. SCOPE is qualified separately under the bounded
+contract above; independent test success cannot override a scope or requirement FAIL.
 
 Cancellation kills the owned process group before waiting; missing close or live
 group members leave termination unconfirmed and block workspace deletion. This
@@ -346,8 +427,9 @@ when deferral is disabled; no pending controller callback promises are introduce
 File scope, asking before dependency changes/destruction/secret reads/network or
 LAN/Tailscale access, and prohibiting Git publication are explicit **behavioral
 instructions**, not universal pre-execution enforcement. Workspace-write is not
-PAB's existing per-path repository sandbox. Use only trusted repositories; do not
-connect this prototype to publication or assert security equivalence.
+PAB's existing per-path repository sandbox. Use only trusted repositories; publication
+must go through the Controller's qualified review gates, never the executor. Do not
+assert security equivalence.
 
 Results retain command text, cwd, status, exit code, bounded output and native item
 provenance. Missing start/output/exit/completion and local truncation remain explicit;
@@ -421,9 +503,9 @@ the bounded fixture acceptance above.
 This acceptance was for the standalone adapter, not this controller integration.
 PR #6 adds offline-tested durable human-response routing to the same live turn;
 its live human-routing acceptance remains unverified. Uncertain delivery is not replayed.
-Local independent evidence analysis is now supported; PASS qualification and local
-publication remain blocked. Existing Agents API gates and deployment authorization
-are unchanged.
+Local validation, bounded PASS qualification and exact-tree publication integration
+have offline coverage only; end-to-end live qualification remains outstanding.
+Existing Agents API gates and deployment authorization are unchanged.
 
 ## Setup
 
@@ -476,7 +558,7 @@ No repository registrations or account configuration are shipped with this sourc
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
 and publication for the default Agents API path. Local execution is the limited
-opt-in slice described above; local evidence-only review is supported, publication is not. Agents API
+opt-in path described above; local publication requires the bounded qualification gates. Agents API
 execution/review uses paid API sessions. Publication accepts only
 `task_id`, `title`, optional `body`, and `draft:true` (the default), never arbitrary
 paths, commands or branches. It verifies unchanged state and commit-tree equality,

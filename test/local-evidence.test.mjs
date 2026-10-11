@@ -46,6 +46,33 @@ test('bounded/redacted output and source truncation stay distinguishable from mi
   assert(!JSON.stringify(ledger).includes('private.invalid')); assert(!JSON.stringify(ledger).includes('token=private'));
 });
 
+test('optional output absence, null, explicit empty, nonempty and malformed values remain distinct', () => {
+  for (const [availability, output] of [['absent', undefined], ['null', null], ['empty', ''], ['present', 'ok'], ['malformed', {}]]) {
+    const ledger = createLocalEvidence('task'); started(ledger, { ...command, aggregatedOutput: null });
+    observe(ledger, notification({ ...command, aggregatedOutput: output }));
+    const record = ledger.commands[0];
+    assert.equal(record.output.availability, availability);
+    assert.equal(record.output.value, typeof output === 'string' ? output : null);
+    assert.equal(record.output.missing, typeof output !== 'string');
+    assert.equal(record.missing.includes('output_format'), availability === 'malformed');
+    assert.equal(record.start_completion_conflict, false);
+  }
+});
+
+test('malformed starts and conflicting output cannot be concealed by optional completion output', () => {
+  for (const [initial, final] of [
+    [{ ...command, status: 'completed' }, command],
+    [{ ...command, aggregatedOutput: {} }, command],
+    [{ ...command, aggregatedOutput: 'prefix' }, { ...command, aggregatedOutput: null }],
+    [{ ...command, aggregatedOutput: 'prefix' }, { ...command, aggregatedOutput: 'different' }],
+  ]) {
+    const ledger = createLocalEvidence('task');
+    observe(ledger, notification(initial, 'item/started')); observe(ledger, notification(final));
+    assert.equal(ledger.commands[0].start_completion_conflict, true);
+    assert(ledger.commands[0].start_fields);
+  }
+});
+
 test('native file-change claims are separate from command observations and actual file bytes', () => {
   const ledger = createLocalEvidence('task');
   const item = { id: 'file', type: 'fileChange', status: 'completed', changes: [
@@ -67,6 +94,15 @@ test('malformed, omitted and oversized file-change fields are explicit', () => {
   assert.equal(record.changes_omitted, 5); assert(record.changes[1].diff.truncated);
   observe(ledger, notification({ id: 'empty', type: 'fileChange', status: 'completed' }));
   assert(ledger.file_changes[1].missing.includes('changes'));
+});
+
+test('a conflicting file-change completion retains the original prohibited-path indication', () => {
+  const ledger = createLocalEvidence('task');
+  const item = { id: 'file', type: 'fileChange', status: 'completed', changes: [{ path: '/task/TASK.md', kind: { type: 'update' }, diff: '+bad' }] };
+  started(ledger, item);
+  observe(ledger, notification({ ...item, changes: [{ ...item.changes[0], path: '/task/allowed.txt' }] }));
+  assert.equal(ledger.file_changes[0].start_completion_conflict, true);
+  assert.equal(ledger.file_changes[0].start_changes[0].path.value, '/task/TASK.md');
 });
 
 test('correlation uses exact commands and cwd, not substrings, shell inference, redacted or conflicting fields', () => {
@@ -114,7 +150,7 @@ for (const state of ['completed', 'interrupted', 'uncertain', 'failed']) test(`p
   const packet = localEvidencePacket(task, ['python3 check.py'], '/task');
   assert.equal(packet.evidence_version, LOCAL_EVIDENCE_VERSION); assert.equal(packet.execution.state, state);
   assert.equal(packet.native_activity.status, 'unavailable'); assert.equal(packet.independent_validation.status, 'unavailable');
-  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'analysis_only');
+  assert.equal(packet.required_test_correlation.tests[0].status, 'unmatched'); assert.equal(packet.gates.local_review, 'bounded_evidence_qualification');
   assert(!JSON.stringify(packet).includes('I independently verified')); assert(!JSON.stringify(packet).includes('private'));
 });
 
