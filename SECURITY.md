@@ -10,6 +10,24 @@ per-task authorization, or proof of human intent supplied by the tunnel.
 
 - Repository targets are a local allowlist of canonical Git identities; callers
   cannot submit arbitrary paths. The bridge source cannot target itself.
+- Remote registration can extend that allowlist only after GitHub API user/owner
+  numeric identity and repository access checks. Organization/collaborator access
+  is insufficient. Both registration and discovery use the existing single-owner
+  tunnel authorization; chat consent is not independently verified identity.
+  The Controller provisions under a fixed owner-only root, disables hooks and
+  configured filters, rejects submodules/symlinks, and atomically records full
+  identities. No repository content or dependency script is executed at registration.
+  Managed checkouts require object connectivity and independent raw file/mode checks
+  on publication, retry, discovery and task resolution. Historical task baselines
+  receive the same tree-admission checks. Synchronization precedes registry publication;
+  failures retain untrusted artifacts, never silently repair/adopt them. Durability
+  relies on filesystem/storage synchronization semantics, not universal power-loss
+  atomicity. Registration's asynchronous subprocess group is bounded/cancellable;
+  unconfirmed termination fails closed. Attempt audits are Controller-owned.
+  Only trusted Controller transport receives GitHub authentication. Registration
+  does not grant execution privileges or add credentials to task environments.
+  Existing broad-read/confidentiality limitations still apply. See README for
+  limits, crash recovery, and the shared local/remote registry lock.
 - Implementation runs in a task-private worktree/store. The normal checkout and
   registered backing repository are not writable from command/file RPC sandboxes.
 - Command and file-write RPC paths use a controller-pinned Codex permission profile.

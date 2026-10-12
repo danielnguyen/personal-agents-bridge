@@ -21,7 +21,7 @@ flowchart TD
 
 ## Trusted control plane
 
-`server.mjs` defines six strict-purpose MCP tools; `controller.mjs` owns task
+`server.mjs` defines eight strict-purpose MCP tools; `controller.mjs` owns task
 lifecycle, sessions, locks, durable records, expiry and review. The server has no
 public HTTP listener. `tunnel.py` operates the official outbound tunnel client.
 This demonstration assumes a sole authorized owner. Tunnel association checks do
@@ -32,6 +32,33 @@ and tunnel process are trusted. A local operator can change the program or state
 this is not a defense against a malicious host administrator.
 
 ## Repository isolation
+
+`register_github_repository` is a trusted Controller operation, not an agent tool.
+The narrow GitHub adapter reads authenticated user/repository identities and fetches
+only a constructed HTTPS GitHub URL. Numeric user/owner equality and API access are
+required; PAB itself and organization-owned repositories are excluded. Provisioning
+uses a fixed private root outside task/runtime/source roots, no Git hooks/templates
+or executable filter drivers, and no recursive submodules or repository execution.
+The default-branch commit and file tree are checked before checkout; ownership is
+rechecked before publication of the checkout and registry entry.
+
+The existing registry remains version 1. `github_repositories` adds numeric
+repository/owner, canonical name, visibility, default branch and pinned baseline
+bindings without altering legacy filesystem identity records. Both local and remote
+writers use one exclusive lock and atomic synchronized registry replacement. There
+is no separate database or queue. Identical successful requests validate existing
+state; interrupted provisioning stays unregistered and is never adopted/replayed.
+Discovery exposes only bounded IDs/identity/baseline/status, not filesystem paths.
+Registration subprocesses are asynchronous, bounded and Controller-cancellable;
+their lock never serializes unrelated task operations. The integrity helper checks
+Git connectivity, storage shape and raw worktree contents rather than trusting HEAD
+or status. Selected historical baselines pass admission before materialization.
+Ordered checkout/object/directory synchronization precedes atomic registry publication;
+uncertain boundaries remain inspection-only. Controller invocation auditing records
+the bounded requested identity and sanitized success/denial/failure/uncertainty with
+Controller attribution, including interrupted attempts. Shutdown drains those audits.
+Registration is distinct from contract/task authorization. See README for precise
+limits, lock/orphan recovery and the non-confidential broad-read threat model.
 
 `repositories.mjs` resolves operator-registered logical IDs, validates canonical
 path and directory/Git identities, and rejects the bridge source and overlapping

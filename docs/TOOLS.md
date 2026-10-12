@@ -2,6 +2,18 @@
 
 ## Tool list
 
+- `list_registered_repositories({})`: read registered logical IDs, bounded GitHub
+  identity, baseline and availability without host paths or network requests.
+- `register_github_repository({repository: "owner/repository"})`: after user consent,
+  verify the trusted Controller's authenticated GitHub numeric user/owner identity,
+  provision and register an existing user-owned repository. No path, URL, command,
+  credential or checkout-directory input is accepted. Returns `registered` or
+  `already_registered`, a stable `github_<numeric ID>`, GitHub identity and pinned
+  baseline. This does not start a task. Organizations/collaborator-only access and
+  incomplete identities fail closed. Consent is not independent authentication;
+  the existing sole-owner tunnel and Controller ownership policy remain authoritative.
+  Registration retries validate durable identity, not task operation request IDs.
+  See README for staged provisioning, shared registry locks and failure recovery.
 - `start_task({contract, request_id, repository_id?, base_ref?})`: create a disposable
   repository, or a private task worktree for an allowlisted repository ID. `base_ref`
   defaults to `HEAD` and is resolved to an exact commit before execution. Returns
