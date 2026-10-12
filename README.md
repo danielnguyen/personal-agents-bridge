@@ -620,14 +620,55 @@ evidence limits, **not a filesystem quota** on downloaded history. API commands 
 checks) have 120-second limits. They run asynchronously under existing coreutils
 `/usr/bin/timeout`, without detached children or unref'ed jobs, using a fixed umask
 and bounded output (128 KiB API, 256 KiB Git). Output is never returned as an error.
-The Controller observes process-group termination through Linux `/proc`, kills
-remaining group members on cancellation/overflow, and reports unconfirmed termination
-rather than success. This verifies the owned process group, not a universal claim
+Healthy subprocesses are event-driven: no periodic process-table scans. A bounded
+Node deadline supplements the coreutils watchdog. Cancellation, deadline expiry,
+or output overflow immediately signal the group and, if still running, its leader.
+The launch deliberately does not use `--foreground`: GNU timeout establishes its
+own process group before forking the command ([coreutils 8.32 source](https://github.com/coreutils/coreutils/blob/v8.32/src/timeout.c#L450-L462));
+a real-subprocess regression checks the command and timeout leader's observed PGIDs.
+The Controller begins settlement on `exit`, not only on pipe `close`, so surviving
+descendants holding inherited output descriptors cannot hide behind an open pipe.
+An absent group (`kill(-pgid, 0)` returning `ESRCH`) needs no `/proc` scan. Otherwise,
+Linux `/proc` distinguishes live members from zombies only during settlement;
+remaining live members are killed and cannot yield successful completion. Verification
+retries are serialized at 25ms intervals and bounded by a two-second settlement
+deadline. Success requires pipe closure, exit zero, and no live group members.
+Uncertain termination retains the existing registry lock/audit failure semantics;
+timers, abort listeners and verification retries stop at settlement, including on
+verification failure. This verifies the owned process group, not a universal claim
 about descendants that deliberately escape it. Repository code is never executed.
 Registration/discovery share only their own lock; unrelated task cleanup and timers
 remain responsive. Shutdown cancels registration, stops tasks without first waiting
 for registration, then drains registration and its audit before closing SQLite.
 No network retry is automatic. Unexpected termination remains fail-closed.
+
+Supervisor regressions use real disposable subprocesses, including inherited pipes,
+background descendants, shutdown, cancellation, validation deadlines and injected
+verification failures. Reproduce the offline performance workload separately with:
+
+```bash
+node --test test/registration-process.test.mjs test/github-registration.test.mjs
+node test/registration-process-benchmark.mjs /tmp/pab-monitor-measurements.json
+```
+
+The benchmark creates a new result file (refuses overwrite), runs three alternating
+control/monitored samples, and measures parent CPU, 40 sequential `git --version`
+calls, two CPU-only Python validation processes, and one/three idle sleepers. It
+does not register repositories, invoke Codex, or contact GitHub. Measurements on
+Node 26.5.1 / GNU timeout 8.32 before/after the event-driven correction (medians):
+
+| Workload | Before: control / monitored | After: control / monitored |
+| --- | --- | --- |
+| One idle child, parent CPU (% of one core) | 0.063 / 53.454 | 0.059 / 0.062 |
+| Forty Git calls (wall ms) | 40.70 / 1034.49 | 31.21 / 58.83 |
+| Two concurrent validations (wall ms) | 2813.21 / 4259.83 | 2790.60 / 2782.57 |
+| Three idle children, parent CPU (% of one core) | 0.126 / 98.960 | 0.076 / 0.085 |
+
+These are host measurements, not CI timing thresholds or universal performance
+guarantees. The control launches directly; monitored execution additionally retains
+the timeout process, fixed umask and termination checks. No safeguards were disabled
+to obtain these results. Deliberate process-group escape and unkillable kernel waits
+remain outside confirmed termination; uncertainty never becomes registration success.
 
 #### Failure recovery and deployment
 

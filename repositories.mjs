@@ -12,8 +12,11 @@ const within = (a, b) => a === b || a.startsWith(b + path.sep);
 function preserveInterruption(error) {
   if (['REGISTRATION_INTERRUPTED', 'REGISTRATION_TERMINATION_UNCERTAIN'].includes(error.code)) throw error;
 }
-async function processGroupAlive(pid) {
+async function processGroupAlive(pid, stopped) {
+  try { process.kill(-pid, 0); }
+  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
   for (const name of await fs.readdir('/proc')) {
+    if (stopped()) return true;
     if (!/^\d+$/.test(name)) continue;
     try {
       const stat = await fs.readFile(`/proc/${name}/stat`, 'utf8');
@@ -26,49 +29,82 @@ async function processGroupAlive(pid) {
 export async function registrationProcess(binary, args, { cwd, env, signal, timeout = 120000, maxBuffer = 256 * 1024 } = {}) {
   if (signal?.aborted) fail('REGISTRATION_INTERRUPTED');
   return new Promise((resolve, reject) => {
-    let child, closed = false, code, failed = false, reason, bytes = 0, output = [], finishing = false;
-    let stopAt = null;
-    const stop = value => { reason ||= value; stopAt ||= Date.now(); };
+    let child, closed = false, exited = false, code, reason, bytes = 0;
+    let settled = false, checking = false, deadline, grace, retry;
+    const output = [], started = Date.now();
+    const killOwned = () => {
+      if (!child?.pid) return;
+      try { process.kill(-child.pid, 'SIGKILL'); }
+      catch (error) { if (error.code !== 'ESRCH') reason = 'REGISTRATION_TERMINATION_UNCERTAIN'; }
+      if (!exited) {
+        try { child.kill('SIGKILL'); }
+        catch { reason = 'REGISTRATION_TERMINATION_UNCERTAIN'; }
+      }
+    };
+    const finish = uncertain => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline); clearTimeout(grace); clearTimeout(retry);
+      signal?.removeEventListener('abort', abort);
+      if (uncertain) {
+        reason = 'REGISTRATION_TERMINATION_UNCERTAIN'; killOwned();
+        child?.stdout?.destroy(); child?.stderr?.destroy();
+      }
+      if (reason || code !== 0) {
+        const errorCode = reason || 'REGISTRATION_PROCESS_FAILED';
+        reject(Object.assign(new Error(errorCode), { code: errorCode, status: code }));
+      } else resolve(Buffer.concat(output).toString('utf8'));
+    };
+    const verify = async () => {
+      if (settled || checking) return;
+      checking = true;
+      clearTimeout(retry);
+      try {
+        const alive = child.pid ? await processGroupAlive(child.pid, () => settled) : false;
+        if (settled) return;
+        if (alive) {
+          reason ||= 'REGISTRATION_DESCENDANTS_REMAINED';
+          killOwned();
+        }
+        if (closed && !alive) { finish(false); return; }
+        retry = setTimeout(verify, 25);
+      } catch { finish(true); }
+      finally { checking = false; }
+    };
+    const settle = () => {
+      if (settled) return;
+      if (!grace) grace = setTimeout(() => finish(true), 2000);
+      void verify();
+    };
+    const stop = value => {
+      if (settled) return;
+      reason ||= value;
+      killOwned();
+      settle();
+    };
     const abort = () => stop('REGISTRATION_INTERRUPTED');
     try {
       child = spawn('/usr/bin/timeout', ['--signal=KILL', `${timeout / 1000}s`, '/bin/sh', '-c', 'umask 022; exec "$@"', 'pab-registration', binary, ...args],
         { cwd, env, detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch { reject(Object.assign(new Error('REGISTRATION_PROCESS_FAILED'), { code: 'REGISTRATION_PROCESS_FAILED' })); return; }
-    child.once('error', () => { failed = true; stop('REGISTRATION_PROCESS_FAILED'); });
-    child.once('close', exitCode => { closed = true; code = exitCode; });
+    child.once('error', () => stop('REGISTRATION_PROCESS_FAILED'));
+    child.once('exit', (exitCode, exitSignal) => {
+      exited = true; code = exitCode;
+      if (settled) return;
+      if (exitSignal === 'SIGKILL' && Date.now() - started >= timeout) reason ||= 'REGISTRATION_PROCESS_TIMEOUT';
+      if (reason) killOwned();
+      settle();
+    });
+    child.once('close', exitCode => { closed = true; code = exitCode; settle(); });
     for (const stream of ['stdout', 'stderr']) child[stream].on('data', data => {
+      if (settled) return;
       bytes += data.length;
       if (bytes > maxBuffer) stop('REGISTRATION_OUTPUT_LIMIT');
       else if (stream === 'stdout') output.push(data);
     });
+    deadline = setTimeout(() => stop('REGISTRATION_PROCESS_TIMEOUT'), timeout);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    const deadline = setTimeout(() => stop('REGISTRATION_PROCESS_TIMEOUT'), timeout + 100);
-    const monitor = setInterval(async () => {
-      if (finishing) return;
-      finishing = true;
-      try {
-        const alive = child.pid ? await processGroupAlive(child.pid) : !failed;
-        if ((reason || closed) && alive) {
-          stop(reason || 'REGISTRATION_DESCENDANTS_REMAINED');
-          try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') stop('REGISTRATION_TERMINATION_UNCERTAIN'); }
-        }
-        if (closed && !alive) {
-          clearInterval(monitor); clearTimeout(deadline); signal?.removeEventListener('abort', abort);
-          if (reason || failed || code !== 0) {
-            const errorCode = reason || 'REGISTRATION_PROCESS_FAILED';
-            reject(Object.assign(new Error(errorCode), { code: errorCode, status: code }));
-          } else resolve(Buffer.concat(output).toString('utf8'));
-          return;
-        }
-        if (stopAt && Date.now() - stopAt > 2000) throw Error('termination unavailable');
-      } catch {
-        if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
-        try { child.kill('SIGKILL'); } catch {}
-        clearInterval(monitor); clearTimeout(deadline); signal?.removeEventListener('abort', abort);
-        reject(Object.assign(new Error('REGISTRATION_TERMINATION_UNCERTAIN'), { code: 'REGISTRATION_TERMINATION_UNCERTAIN' }));
-      } finally { finishing = false; }
-    }, 10);
   });
 }
 export const asynchronousRepoGit = signal => (cwd, ...args) => registrationProcess('/usr/bin/git',
