@@ -475,7 +475,7 @@ test('pre-ledger local tasks expose unavailable history, not a reconstructed suc
 
 test('local packet overflow persists shared size diagnostics without API retrieval or section loss', async context => {
   const value = await setup(context, { status: 'completed' }, { noApi: true }), started = await value.start(); await value.drain();
-  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(70000));
+  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(125000));
   await assert.rejects(value.controller.buildPacket(value.controller.task(started.task_id)), error =>
     error.code === 'EVIDENCE_SIZE_LIMIT' && error.diagnostic.required_section === 'local_packet');
   const saved = value.controller.task(started.task_id);
@@ -490,6 +490,110 @@ test('unconfirmed app-server closure blocks local packet preparation even after 
   assert.equal(saved.implementer.local.server_closed, false);
   await assert.rejects(value.controller.buildPacket(saved), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
   await assert.rejects(value.controller.review({ task_id: saved.id, request_id: 'review_unclosed' }), /LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED/);
+});
+
+async function failedReviewPacket(context) {
+  const value = await setup(context, { status: 'completed' }, { noApi: true });
+  const started = await value.start(); await value.drain();
+  const original = value.controller.packet.bind(value.controller);
+  const build = value.controller.buildPacket.bind(value.controller);
+  value.controller.packet = async task => {
+    const buildData = value.controller.buildPacketData;
+    value.controller.buildPacketData = async () => { throw Object.assign(new Error('EVIDENCE_SIZE_LIMIT'), { code: 'EVIDENCE_SIZE_LIMIT', diagnostic: { code: 'EVIDENCE_SIZE_LIMIT', measured_bytes: 157677, limit_bytes: 131072 } }); };
+    try { await build(task); } finally { value.controller.buildPacketData = buildData; }
+  };
+  await value.controller.review({ task_id: started.task_id, request_id: 'failed_packet_request' }); await value.drain();
+  value.controller.packet = original;
+  const failed = value.controller.task(started.task_id);
+  assert.equal(failed.reviewer.error, 'EVIDENCE_SIZE_LIMIT'); assert.equal(failed.reviewer.local.instance_started, false);
+  assert.equal(failed.local_validation.status, 'completed'); assert.equal(value.instances.length, 1);
+  return { ...value, started, failed };
+}
+
+test('explicit distinct request retries pre-execution packaging failure once with fresh validation and preserved history', async context => {
+  const value = await failedReviewPacket(context), { controller, started, failed } = value;
+  await controller.review({ task_id: started.task_id, request_id: 'failed_packet_request' });
+  assert.equal(controller.task(started.task_id).local_validation.attempt_id, failed.local_validation.attempt_id);
+  await Promise.all([1, 2].map(() => controller.review({ task_id: started.task_id, request_id: 'fresh_packet_request' })));
+  await value.drain();
+  const task = controller.task(started.task_id);
+  assert.notEqual(task.local_validation.attempt_id, failed.local_validation.attempt_id);
+  assert.deepEqual(task.reviewer.reviewed_git_state, failed.reviewer.reviewed_git_state);
+  assert.deepEqual(task.previous_reviewers[0].independent_validation, failed.local_validation);
+  assert.equal(task.previous_reviewers[0].review_packet_diagnostic.measured_bytes, 157677);
+  assert.equal(controller.db.prepare('SELECT status FROM operations WHERE id=?').get('failed_packet_request').status, 'failed');
+  assert.equal(value.instances.length, 2); assert.equal(controller._api, undefined);
+});
+
+for (const mutation of ['submitted', 'acknowledged', 'instance', 'thread', 'termination', 'active_validation', 'active_reviewer', 'active_job', 'old_operation', 'history']) test(`review retry rejects ${mutation} uncertainty`, async context => {
+  const value = await failedReviewPacket(context), { controller, started } = value;
+  const task = controller.task(started.task_id);
+  if (mutation === 'submitted') task.reviewer.local.turn_submission_attempted = true;
+  if (mutation === 'acknowledged') task.reviewer.local.turn_submission_acknowledged = true;
+  if (mutation === 'instance') task.reviewer.local.instance_started = true;
+  if (mutation === 'thread') task.reviewer.local.thread_id = 'unknown';
+  if (mutation === 'termination') task.local_validation.termination_confirmed = false;
+  if (mutation === 'history') task.previous_reviewers = [{ local: { instance_started: true } }];
+  if (mutation === 'old_operation') controller.opDone('failed_packet_request', 'uncertain');
+  controller.save(task);
+  if (mutation === 'active_validation') controller.validationRuns.set(task.id, {});
+  if (mutation === 'active_reviewer') controller.localRuns.set(`${task.id}:reviewer`, {});
+  if (mutation === 'active_job') controller.jobs.set(`${task.id}:reviewer`, Promise.resolve());
+  try { await assert.rejects(controller.review({ task_id: task.id, request_id: 'unsafe_retry' }), /LOCAL_REVIEW_RETRY_UNSAFE/); }
+  finally { controller.validationRuns.clear(); controller.localRuns.clear(); controller.jobs.clear(); }
+  assert.equal(value.instances.length, 1);
+});
+
+for (const state of ['cleaned', 'expired', 'changed_tree']) test(`review retry rejects ${state} without reviving the task`, async context => {
+  const value = await failedReviewPacket(context), { controller, started } = value;
+  const task = controller.task(started.task_id);
+  if (state === 'cleaned') await controller.cleanup({ task_id: task.id });
+  if (state === 'expired') { task.deadline = Date.now() - 1; controller.save(task); }
+  if (state === 'changed_tree') await fs.writeFile(path.join(controller.workspaceRoot, task.id, 'repo/greeting.txt'), 'different\n');
+  await assert.rejects(controller.review({ task_id: task.id, request_id: 'ineligible_retry' }), /TASK_CLEANED|TASK_EXPIRED|LOCAL_REVIEW_RETRY_TREE_CHANGED/);
+  assert.equal(value.instances.length, 1);
+});
+
+test('abrupt restart retains proven no-reviewer-execution failure without replay; new request alone retries', async context => {
+  const value = await failedReviewPacket(context);
+  clearInterval(value.controller.sweeper);
+  value.controller.closed = true; value.controller.dbClosed = true; value.controller.db.close();
+  const controller = await new Controller(value.config).init();
+  try {
+    const saved = controller.task(value.started.task_id);
+    assert.equal(saved.reviewer.error, 'EVIDENCE_SIZE_LIMIT');
+    assert.equal(saved.reviewer.local.execution_state, 'failed');
+    assert.equal(saved.reviewer.local.instance_started, false);
+    assert.equal(controller.jobs.size, 0); assert.equal(value.instances.length, 1);
+    await controller.review({ task_id: saved.id, request_id: 'failed_packet_request' });
+    assert.equal(value.instances.length, 1);
+    await controller.review({ task_id: saved.id, request_id: 'after_restart_review' });
+    await Promise.all([...controller.jobs.values()]);
+    assert.equal(value.instances.length, 2);
+    assert.equal(controller.task(saved.id).previous_reviewers.length, 1);
+  } finally { await controller.close(); }
+});
+
+test('graceful shutdown stop intent is not silently reversed by a review retry', async context => {
+  const value = await failedReviewPacket(context);
+  await value.controller.close();
+  const controller = await new Controller(value.config).init();
+  try {
+    await assert.rejects(controller.review({ task_id: value.started.task_id, request_id: 'stopped_retry' }), /LOCAL_REVIEW_RETRY_UNSAFE/);
+    assert.equal(value.instances.length, 1);
+  } finally { await controller.close(); }
+});
+
+test('cleanup while retry checks await never releases a replacement review', async context => {
+  const value = await failedReviewPacket(context), { controller, started } = value;
+  const original = controller.repositoryEvidence.bind(controller);
+  controller.repositoryEvidence = async id => {
+    const result = await original(id), task = controller.task(id);
+    task.cleaned = true; controller.save(task); return result;
+  };
+  await assert.rejects(controller.review({ task_id: started.task_id, request_id: 'cancelled_retry' }), /TASK_CLEANED/);
+  assert.equal(value.instances.length, 1);
+  assert.equal(controller.task(started.task_id).reviewer.request_id, 'failed_packet_request');
 });
 
 test('unconfirmed reviewer closure prevents workspace deletion and remains explicit', async context => {

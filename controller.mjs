@@ -256,7 +256,7 @@ export class Controller {
           this.invalidateLocalRequests(t, 'LOCAL_RESTART_CALLBACK_UNAVAILABLE');
           t.implementer.local.diagnostics = ['LOCAL_RESTART_UNRESOLVED_NO_REPLAY']; this.save(t);
         }
-        if (t.reviewer && (!t.reviewer.local.result_received || !t.reviewer.local.server_closed || ['starting', 'running', 'finishing'].includes(t.reviewer.state))) {
+        if (t.reviewer && !this.localPacketRetryEligible(t) && (!t.reviewer.local.result_received || !t.reviewer.local.server_closed || ['starting', 'running', 'finishing'].includes(t.reviewer.state))) {
           t.reviewer.state = 'needs_attention'; t.reviewer.review_result = null;
           Object.assign(t.reviewer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true,
             diagnostics: ['LOCAL_REVIEW_RESTART_NO_REPLAY'] });
@@ -1097,12 +1097,35 @@ export class Controller {
     await this.repositoryEvidence(task.id);
     return packet;
   }
+  localPacketRetryEligible(task) {
+    const ref = task.reviewer, local = ref?.local, validation = task.local_validation;
+    return ref?.error === 'EVIDENCE_SIZE_LIMIT' && ref.execution_backend === 'local_codex' && ref.state === 'needs_attention' && !ref.stopping &&
+      local?.execution_state === 'failed' && local.phase === 'failed' && local.result_received === true &&
+      local.instance_started === false && local.turn_submission_attempted === false && local.turn_submission_acknowledged === false &&
+      local.thread_id === null && local.turn_id === null && local.terminal_observed === false &&
+      !this.jobs.has(`${task.id}:reviewer`) && !this.localRuns.has(`${task.id}:reviewer`) && !this.validationRuns.has(task.id) &&
+      validation?.status === 'completed' && validation.termination_confirmed === true && validation.original_unchanged === true &&
+      validation.task_id === task.id && validation.request_id === ref.request_id &&
+      !(task.previous_reviewers || []).some(previous => previous.local?.instance_started !== false ||
+        previous.local.turn_submission_attempted !== false || previous.local.turn_submission_acknowledged !== false) &&
+      this.db.prepare('SELECT status FROM operations WHERE id=?').get(ref.request_id)?.status === 'failed';
+  }
   async reviewLocal(task, requestId) {
     if (task.cleaned || this.closed) throw new BridgeError('TASK_CLEANED');
+    if (Date.now() > task.deadline) throw new BridgeError('TASK_EXPIRED');
+    let retry = false;
     if (task.reviewer) {
-      const old = this.operation(requestId, 'review', { id: task.id }, task.id);
-      if (!old) this.opDone(requestId, 'not_started');
-      return this.get(task.id);
+      const ref = task.reviewer;
+      if (ref.error === 'EVIDENCE_SIZE_LIMIT' && requestId !== ref.request_id &&
+          !this.db.prepare('SELECT id FROM operations WHERE id=?').get(requestId)) {
+        if (!this.localPacketRetryEligible(task)) throw new BridgeError('LOCAL_REVIEW_RETRY_UNSAFE');
+        retry = true;
+      }
+      if (!retry) {
+        const old = this.operation(requestId, 'review', { id: task.id }, task.id);
+        if (!old) this.opDone(requestId, 'not_started');
+        return this.get(task.id);
+      }
     }
     if (task.implementer.stopping) throw new BridgeError('TASK_CLEANED');
     if (task.implementer.state !== 'completed' || task.implementer.local.execution_state !== 'completed' ||
@@ -1114,9 +1137,18 @@ export class Controller {
       turn_submission_attempted: false, turn_submission_acknowledged: false, terminal_observed: false, result_received: false,
       instance_started: false, server_closed: false, human_attention_required: false, human_requests: [], diagnostics: [] };
     const reviewedState = await reviewedGitState(path.join(this.workspaceRoot, task.id), task);
+    if (retry && (JSON.stringify(reviewedState) !== JSON.stringify(task.reviewer.reviewed_git_state) ||
+        JSON.stringify(reviewedState) !== JSON.stringify(task.local_validation.reviewed_git_state))) throw new BridgeError('LOCAL_REVIEW_RETRY_TREE_CHANGED');
     await this.repositoryEvidence(task.id);
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
     task = this.task(task.id);
+    if (task.cleaned || task.implementer.stopping || task.reviewer?.stopping) throw new BridgeError('TASK_CLEANED');
+    if (Date.now() > task.deadline) throw new BridgeError('TASK_EXPIRED');
+    if (retry) {
+      task.previous_reviewers ||= [];
+      task.previous_reviewers.push({ ...task.reviewer, independent_validation: task.local_validation,
+        review_packet_diagnostic: task.review_packet_diagnostic || null });
+    }
     task.reviewer = { state: 'starting', execution_backend: 'local_codex', request_id: requestId, local,
       reviewed_git_state: reviewedState, review_result: null };
     task.local_validation = { version: VALIDATION_VERSION, provenance: 'controller_process_observation', attempt_id: randomUUID(),

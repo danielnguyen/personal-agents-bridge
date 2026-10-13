@@ -52,6 +52,64 @@ attention, with known IDs retained and **no automatic replay**. Completed record
 are retained. A process surviving a controller crash is not automatically reattached
 or killed: unknown ownership/termination remains a cleanup blocker.
 
+### Bounded review packaging and explicit pre-execution retry
+
+Local evidence remains limited to 131,072 UTF-8 JSON bytes. When a full packet
+overflows, the Controller may encode repeated complete-file patch bodies as
+`pab.exact-diff-references.v1` references into the existing baseline/current maps.
+Literal fragments retain all patch headers, modes, paths and unsupported/binary
+markers. File hashes and the original patch hash/length accompany the references;
+construction must reconstruct the exact retained patch before accepting the packet.
+The reviewer contract explains the encoding, and Controller findings validation
+rejects invalid encodings. No native execution, independent validation, provenance,
+scope or Git evidence is removed. This is lossless for the already sanitized packet,
+not a claim that redacted source or notification history has become complete.
+Unmatched hunks stay literal; still-oversized packets fail `EVIDENCE_SIZE_LIMIT`.
+Agents API packaging is unchanged.
+
+An owner may explicitly request `review_task` again with a **new request ID** after
+an `EVIDENCE_SIZE_LIMIT` failure, but only for a still-live, uncleaned local task
+whose stored flags prove no reviewer instance or submission occurred. Prior
+validation must have completed with confirmed termination and an unchanged original;
+no reviewer/validation job or owned process may remain. The failed operation, reviewer,
+validation attempt and packet diagnostic are retained. The candidate Git state must
+match exactly, and independent validation runs anew before a fresh reviewer starts.
+Same-ID retries never rerun anything, including after restart. Persisted stop intent
+from graceful shutdown is not reversed by retry. Uncertain submissions,
+started reviewers, other failures, expiration and cleanup do not gain retry authority.
+Authorization still uses the existing single-owner MCP boundary, not a new human
+identity claim. Snapshot/change-and-restore races remain the existing bounded-model
+limitation; no immutable freeze or broader recovery mechanism is introduced.
+
+#### Recovering an already cleaned engineering task
+
+The retained Browser Trust Inspector task cannot be revived by this correction.
+Keep its workspace, contract, validation results and reviewed tree untouched. Do
+not edit SQLite, reverse cleanup, extend its deadline or reuse its request IDs.
+Repository tasks reject `initial_files`; there is no import-for-review API.
+
+After independent review, merge and separately authorized deployment of this fix,
+the smallest existing-interface recovery is a **new explicitly authorized local
+task** against the same registered repository and original pinned `base_ref`.
+Its bounded contract must authorize read-only access to the exact retained source
+files and reproduction of only the original allowed files in its new worktree
+(including any required deletions), preserve the original requirements/invariants
+and exact validation commands, and prohibit reimplementation or edits to the old
+task. Owner authorization must cover that read access and the new implementer turn;
+do not expose the old database, prompts, credentials, `.git`, `TASK.md` or unrelated
+task state as seed material. If the original obligations cannot truthfully apply to
+reproduction, stop for an explicit contract decision rather than silently weakening
+them. No promise is made that an arbitrary contract can recover this way.
+
+Require the new candidate tree to equal the retained reviewed tree
+`9497d776d724de9347ec5bfc5118cce507575a96` before authorizing independent review.
+Then use `review_task` with a new ID for fresh Controller validation and a new
+independent reviewer. Old test results remain historical evidence only. Tree
+equality does not transfer implementation history or a PASS verdict. Any mismatch
+or expired new task stops the recovery; do not repair hashes or auto-retry.
+Publication, if a genuine qualified PASS results, needs separate authorization.
+No recovery execution or production mutation is part of this correction PR.
+
 ### Durable native human requests
 
 Command/file approvals and `item/tool/requestUserInput` requests remain pending in
