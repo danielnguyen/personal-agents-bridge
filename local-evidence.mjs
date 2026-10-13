@@ -1,4 +1,5 @@
 import { PACKET_LIMIT, packetSizeDiagnostic } from './packet-budget.mjs';
+import { createHash } from 'node:crypto';
 
 export const LOCAL_EVIDENCE_VERSION = 'pab.local-codex-review.v1';
 export const LOCAL_RECORD_LIMIT = 64;
@@ -125,9 +126,63 @@ export function localEvidencePacket(task, required, cwd, reviewedState) {
         'App-server closure does not prove every descendant exited; snapshots are not an immutable filesystem freeze.'] } };
 }
 
+const diffHash = text => createHash('sha256').update(text).digest('hex');
+const diffLines = (text, prefix) => text ? text.split('\n').map((line, index, lines) =>
+  index === lines.length - 1 ? line ? `${prefix}${line}\n\\ No newline at end of file\n` : '' : `${prefix}${line}\n`).join('') : '';
+
+export function reconstructLocalDiff(packet) {
+  if (typeof packet.diff === 'string') return packet.diff;
+  const fail = () => { throw Object.assign(new Error('INVALID_LOCAL_DIFF_ENCODING'), { code: 'INVALID_LOCAL_DIFF_ENCODING' }); };
+  const encoded = packet.diff;
+  if (!encoded || encoded.representation !== 'pab.exact-diff-references.v1' || encoded.complete !== true ||
+      !Number.isInteger(encoded.utf8_bytes) || encoded.utf8_bytes < 0 || encoded.utf8_bytes > PACKET_LIMIT * 2 ||
+      !Array.isArray(encoded.fragments) || encoded.fragments.length > 4096) fail();
+  let text = '';
+  for (const fragment of encoded.fragments) {
+    if (typeof fragment === 'string') text += fragment;
+    else {
+      if (!fragment || !['baseline', 'current'].includes(fragment.map) || !['+', '-'].includes(fragment.prefix) ||
+          typeof fragment.file !== 'string' || !Object.hasOwn(packet[fragment.map] || {}, fragment.file)) fail();
+      const source = packet[fragment.map][fragment.file];
+      if (typeof source !== 'string' || source.includes('\0') || Buffer.byteLength(source) > PACKET_LIMIT || diffHash(source) !== fragment.sha256) fail();
+      text += diffLines(source, fragment.prefix);
+    }
+    if (Buffer.byteLength(text) > PACKET_LIMIT * 2) fail();
+  }
+  if (Buffer.byteLength(text) !== encoded.utf8_bytes || diffHash(text) !== encoded.sha256) fail();
+  return text;
+}
+
+function deduplicateLocalDiff(packet) {
+  if (typeof packet.diff !== 'string' || Buffer.byteLength(packet.diff) > PACKET_LIMIT * 2) return packet;
+  let fragments = [packet.diff];
+  for (const [map, prefix] of [['baseline', '-'], ['current', '+']]) {
+    for (const file of Object.keys(packet[map] || {}).sort()) {
+      const source = packet[map][file];
+      if (typeof source !== 'string' || source.includes('\0') || Buffer.byteLength(source) > PACKET_LIMIT) continue;
+      const body = diffLines(source, prefix), reference = { map, file, prefix, sha256: diffHash(source) };
+      if (!body || size(body) <= size(reference) + 16) continue;
+      fragments = fragments.flatMap(fragment => {
+        if (typeof fragment !== 'string') return [fragment];
+        const offset = fragment.indexOf(body);
+        if (offset < 0 || (offset > 0 && fragment[offset - 1] !== '\n')) return [fragment];
+        return [fragment.slice(0, offset), reference, fragment.slice(offset + body.length)].filter(value => value !== '');
+      });
+    }
+  }
+  const candidate = { ...packet, diff: { representation: 'pab.exact-diff-references.v1', complete: true,
+    utf8_bytes: Buffer.byteLength(packet.diff), sha256: diffHash(packet.diff), fragments } };
+  if (size(candidate) >= size(packet)) return packet;
+  if (reconstructLocalDiff(candidate) !== packet.diff) throw new Error('INVALID_LOCAL_DIFF_ENCODING');
+  return candidate;
+}
+
 export function budgetLocalPacket(data) {
   const packet = { ...data, packet_budget: { limit_bytes: PACKET_LIMIT, policy: 'All sections retained; overflow rejects construction without silent removal.' } };
-  const text = JSON.stringify(packet), bytes = Buffer.byteLength(text);
+  let text = JSON.stringify(packet), bytes = Buffer.byteLength(text);
+  if (bytes > PACKET_LIMIT) {
+    text = JSON.stringify(deduplicateLocalDiff(packet)); bytes = Buffer.byteLength(text);
+  }
   if (bytes > PACKET_LIMIT) throw Object.assign(new Error('EVIDENCE_SIZE_LIMIT'), { code: 'EVIDENCE_SIZE_LIMIT',
     diagnostic: packetSizeDiagnostic(Object.fromEntries(Object.entries(packet).map(([name, value]) => [name, size(value)])), 'local_packet', bytes) });
   return { text, bytes };
