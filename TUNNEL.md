@@ -35,8 +35,11 @@ transport inside the network-disabled command sandbox.
 After actually verifying exclusive personal access, create the following JSON at
 `~/.local/state/personal-agents-bridge/personal-tunnel.json`, with file mode `0600`
 and an owner-only state directory. Replace placeholders locally. Do not copy the
-result back into source control. Confirmation expires within 24 hours; renew only
-after checking the actual associations again.
+result back into source control. A confirmation may be valid for up to 30 days.
+Check the actual organization/workspace associations and exclusive personal access
+before creating or renewing it; never renew automatically. Reverify sooner if
+access or membership changes. The bridge still checks live tunnel associations
+on startup and every tool call, but cannot verify individual ChatGPT users.
 
 ```json
 {
@@ -49,7 +52,7 @@ after checking the actual associations again.
   "sole_authorized_user": true,
   "verification_method": "owner_checked_platform_settings",
   "verified_at": "<ACTUAL_UTC_VERIFICATION_TIME>",
-  "expires_at": "<UTC_TIME_WITHIN_24_HOURS_OF_VERIFICATION>"
+  "expires_at": "<UTC_TIME_WITHIN_30_DAYS_OF_VERIFICATION>"
 }
 ```
 

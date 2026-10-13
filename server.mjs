@@ -38,6 +38,8 @@ export async function fetchTunnelMetadata(tunnelId, stateRoot) {
     return JSON.parse(stdout);
   } catch { throw new BridgeError('LIVE_TUNNEL_ASSOCIATION_UNAVAILABLE'); }
 }
+const MAX_OWNER_CONFIRMATION_MS = 30 * 24 * 60 * 60 * 1000;
+
 export async function authorizePersonalTunnel({ stateRoot = `${homedir()}/.local/state/personal-agents-bridge`, expectedTunnel = process.env.BRIDGE_TUNNEL_ID, now = Date.now(), lookup = fetchTunnelMetadata } = {}) {
   if (!expectedTunnel || !/^tunnel_[A-Za-z0-9_-]+$/.test(expectedTunnel)) throw new BridgeError('PERSONAL_TUNNEL_NOT_CONFIGURED');
   const file = path.join(stateRoot, 'personal-tunnel.json');
@@ -45,7 +47,7 @@ export async function authorizePersonalTunnel({ stateRoot = `${homedir()}/.local
   try { stat = await fs.lstat(file); value = JSON.parse(await fs.readFile(file, 'utf8')); } catch { throw new BridgeError('PERSONAL_ASSOCIATION_NOT_VERIFIED'); }
   if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) throw new BridgeError('UNSAFE_TUNNEL_CONFIRMATION');
   const verified = Date.parse(value.verified_at); const expires = Date.parse(value.expires_at);
-  if (value.tunnel_id !== expectedTunnel || value.personal_only !== true || value.sole_authorized_user !== true || value.verification_method !== 'owner_checked_platform_settings' || typeof value.platform_organization_id !== 'string' || !value.platform_organization_id || typeof value.chatgpt_workspace_id !== 'string' || !value.chatgpt_workspace_id || !Array.isArray(value.associated_organizations) || !Array.isArray(value.associated_workspaces) || value.associated_organizations.length !== 1 || value.associated_workspaces.length !== 1 || value.associated_organizations[0] !== value.platform_organization_id || value.associated_workspaces[0] !== value.chatgpt_workspace_id || !Number.isFinite(verified) || !Number.isFinite(expires) || verified > now || expires <= now || expires - verified > 86400000) throw new BridgeError('PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED');
+  if (value.tunnel_id !== expectedTunnel || value.personal_only !== true || value.sole_authorized_user !== true || value.verification_method !== 'owner_checked_platform_settings' || typeof value.platform_organization_id !== 'string' || !value.platform_organization_id || typeof value.chatgpt_workspace_id !== 'string' || !value.chatgpt_workspace_id || !Array.isArray(value.associated_organizations) || !Array.isArray(value.associated_workspaces) || value.associated_organizations.length !== 1 || value.associated_workspaces.length !== 1 || value.associated_organizations[0] !== value.platform_organization_id || value.associated_workspaces[0] !== value.chatgpt_workspace_id || !Number.isFinite(verified) || !Number.isFinite(expires) || verified > now || expires <= now || expires - verified > MAX_OWNER_CONFIRMATION_MS) throw new BridgeError('PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED');
   const live = await lookup(expectedTunnel, stateRoot);
   if (live.id !== expectedTunnel || !Array.isArray(live.organization_ids) || !Array.isArray(live.workspace_ids) || live.organization_ids.length !== 1 || live.workspace_ids.length !== 1 || live.organization_ids[0] !== value.platform_organization_id || live.workspace_ids[0] !== value.chatgpt_workspace_id) throw new BridgeError('LIVE_TUNNEL_ASSOCIATION_MISMATCH');
   return { tunnel_id: value.tunnel_id };
