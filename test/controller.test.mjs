@@ -94,6 +94,49 @@ test('tunnel gate rejects missing, shared, expired, mismatched, and unsafe confi
   for (const bad of [{ personal_only: false }, { sole_authorized_user: false }, { associated_workspaces: ['workspace_personal', 'shared'] }, { expires_at: new Date(now - 1).toISOString() }, { tunnel_id: 'tunnel_wrong' }]) { await fs.writeFile(file, JSON.stringify({ ...good, ...bad })); await assert.rejects(authorizePersonalTunnel(opts)); }
   await fs.writeFile(file, JSON.stringify(good)); await fs.chmod(file, 0o644); await assert.rejects(authorizePersonalTunnel(opts));
 });
+test('tunnel owner confirmation accepts 30 days, rejects longer and stale claims', async t => {
+  const root = await fs.mkdtemp('/var/tmp/personal-agents-bridge/gate-');
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'personal-tunnel.json');
+  const now = Date.parse('2026-10-13T15:00:00.000Z'), day = 24 * 60 * 60 * 1000;
+  const live = { id: 'tunnel_test', organization_ids: ['org_personal'], workspace_ids: ['workspace_personal'] };
+  const good = {
+    tunnel_id: 'tunnel_test', personal_only: true, sole_authorized_user: true,
+    verification_method: 'owner_checked_platform_settings',
+    platform_organization_id: 'org_personal', chatgpt_workspace_id: 'workspace_personal',
+    associated_organizations: ['org_personal'], associated_workspaces: ['workspace_personal'],
+    verified_at: new Date(now).toISOString(), expires_at: new Date(now + 30 * day).toISOString(),
+  };
+  const write = async changes => fs.writeFile(file, JSON.stringify({ ...good, ...changes }), { mode: 0o600 });
+  let lookups = 0;
+  const opts = {
+    stateRoot: root, expectedTunnel: 'tunnel_test', now,
+    lookup: async () => { lookups++; return live; },
+  };
+
+  await write({});
+  const before = await fs.readFile(file, 'utf8');
+  assert.equal((await authorizePersonalTunnel(opts)).tunnel_id, 'tunnel_test');
+  assert.equal(await fs.readFile(file, 'utf8'), before, 'successful authorization must not renew confirmation');
+  assert.equal(lookups, 1, 'live association check is still required');
+
+  await write({ expires_at: new Date(now + 30 * day + 1).toISOString() });
+  await assert.rejects(authorizePersonalTunnel(opts), /PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED/);
+  assert.equal(lookups, 1, 'overlong confirmation must be rejected before live lookup');
+
+  await write({});
+  await assert.rejects(authorizePersonalTunnel({ ...opts, now: now + 30 * day }), /PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED/);
+  await write({ verified_at: new Date(now + 1).toISOString() });
+  await assert.rejects(authorizePersonalTunnel(opts), /PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED/);
+  await write({ verified_at: new Date(now - 30 * day).toISOString(), expires_at: new Date(now + 1).toISOString() });
+  await assert.rejects(authorizePersonalTunnel(opts), /PERSONAL_ASSOCIATION_UNVERIFIED_OR_EXPIRED/);
+
+  await write({});
+  await assert.rejects(
+    authorizePersonalTunnel({ ...opts, lookup: async () => ({ ...live, organization_ids: ['org_personal', 'other'] }) }),
+    /LIVE_TUNNEL_ASSOCIATION_MISMATCH/,
+  );
+});
 test('MCP advertises exactly eight tools; schema/authorization failures cannot execute', async t => {
   const { c, api } = await setup(t); let allowed = false;
   const server = createServer(c, async () => { if (!allowed) throw Error('private'); });
