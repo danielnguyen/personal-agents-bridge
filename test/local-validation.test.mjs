@@ -9,6 +9,29 @@ import { LocalValidation, VALIDATION_VERSION, validationEnvironment, materialize
 import { validateLocalReview } from '../local-reviewer-instructions.mjs';
 import { LOCAL_EVIDENCE_VERSION, budgetLocalPacket } from '../local-evidence.mjs';
 import { contract } from './helpers.mjs';
+import { assertLocalValidationCompatibility } from '../controller.mjs';
+
+for (const command of ['git diff --check', '/usr/bin/git status', 'true && git diff --check', 'true;git log',
+  'true | git diff', 'env LANG=C git status', 'command git status', 'sh -c "git diff --check"',
+  "'git' diff --check", 'git\ndiff --check', 'g\\\nit diff --check']) {
+  test(`source-only admission rejects literal Git command: ${JSON.stringify(command)}`, () => {
+    assert.throws(() => assertLocalValidationCompatibility(['true', command]), error => {
+      assert.equal(error.code, 'LOCAL_VALIDATION_GIT_COMMAND_UNSUPPORTED');
+      assert.equal(error.diagnostic.command_index, 1);
+      assert.match(error.diagnostic.action, /Replace this required command with source-only validation/);
+      assert.match(error.diagnostic.coverage, /not shell parsing/);
+      return true;
+    });
+  });
+}
+
+test('source-only admission supports normal tests without claiming arbitrary scripts are Git-independent', () => {
+  for (const command of ['python3 -B -m unittest discover', 'python3 -B -c \'print("validation-ok")\'', 'npm test',
+    'node --test test/*.test.mjs', 'test -f answer.txt', 'python3 -B check_git.py', './check.sh', '$TOOL diff --check']) {
+    assert.doesNotThrow(() => assertLocalValidationCompatibility([command]));
+  }
+  assert.doesNotThrow(() => assertLocalValidationCompatibility([]));
+});
 
 async function fixture(context) {
   const root = await fs.mkdtemp('/tmp/pab-independent-validation-'), repo = path.join(root, 'repo');

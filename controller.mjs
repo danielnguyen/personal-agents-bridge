@@ -6,7 +6,7 @@ import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMetho
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
-import { localReviewerInstructions, validateLocalReview, localExecutionQualified } from './local-reviewer-instructions.mjs';
+import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding } from './local-reviewer-instructions.mjs';
 import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { GitHubRegistration, RegistrationError, validName } from './github-registration.mjs';
@@ -88,6 +88,17 @@ Use python3 -B when running Python. Report actual test commands and exit results
 export function contractMarkdown(c, backend = 'agents_api') {
   const rules = backend === 'local_codex' ? `This contract is authoritative. Never modify TASK.md, .codex, Git history/index/configuration, or the normal checkout.\n${localInstructions}\nUse native human requests when available and wait for the human response; otherwise stop and state the question. Native workspace-write restrictions are not PAB repository sandbox attestation.\n` : executionRules;
   return `# Task contract\n\n## Goal\n${c.goal}\n\n## Allowed files\n${c.allowed_files.map(x => `- ${x}`).join('\n')}\n\n## Requirements\n${c.requirements.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Invariants\n${c.invariants.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Required test commands\n${c.test_commands.map(x => '```sh\n' + x + '\n```').join('\n')}\n\n## Execution rules\n${rules}`;
+}
+export function assertLocalValidationCompatibility(commands) {
+  for (const [index, command] of commands.entries()) {
+    if (/(?:^|[\s;&|()"'`/])git(?=$|[\s;&|()"'`])/.test(command.replaceAll(/\\\r?\n/g, ''))) {
+      throw Object.assign(new BridgeError('LOCAL_VALIDATION_GIT_COMMAND_UNSUPPORTED'), { diagnostic: {
+        command_index: index, environment: 'source_only_git_tree_export_without_dot_git',
+        action: 'Replace this required command with source-only validation before starting a local task. Git metadata is unavailable, including for git diff --check.',
+        coverage: 'Conservative literal Git-token detection, including shell lists and simple wrappers; not shell parsing or proof that scripts, aliases, variables or generated commands are Git-independent.',
+      } });
+    }
+  }
 }
 // Built only from the controller's successful executor startup acknowledgement.
 // Never accept an attestation from a contract, repository file, or model output.
@@ -432,6 +443,7 @@ export class Controller {
     if (execution_backend === 'local_codex' && !repository_id) throw new BridgeError('LOCAL_CODEX_REQUIRES_REPOSITORY');
     if (!repository_id && input.base_ref !== undefined) throw new BridgeError('BASE_REF_REQUIRES_REPOSITORY');
     this.rejectSecret(contract);
+    if (execution_backend === 'local_codex') assertLocalValidationCompatibility(contract.test_commands);
     for (const name of contract.allowed_files) safeRelative(name);
     if (execution_backend === 'local_codex' && contract.allowed_files.some(name => name.split('/').some(part => ['TASK.md', '.codex'].includes(part)))) throw new BridgeError('INVALID_WORKSPACE_PATH');
     for (const name of Object.keys(contract.initial_files || {})) safeRelative(name);
@@ -998,17 +1010,20 @@ export class Controller {
     }
     const changed = repositoryChanges || [...new Set([...git(repo, 'diff', '--name-only', t.baseline).trim().split('\n'), ...git(repo, 'ls-files', '--others').trim().split('\n')].filter(Boolean))];
     if (t.execution_backend === 'local_codex') {
+      const markdown = contractMarkdown(contract, 'local_codex');
       const data = { ...localEvidencePacket(t, contract.test_commands, repo, reviewedState),
         local_scope: { version: 'pab.local-scope.bounded.v1', provenance: 'controller', contract_sha256: digest(contract),
           protected_before: t.local_protected_before || null, protected_at_review: await this.localProtectedState(repo) },
         reviewed_git_state: reviewedState, controller_evidence: await repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this)),
         file_byte_evidence: fileBytes, baseline_state: JSON.parse(await fs.readFile(path.join(root, 'baseline-state.json'), 'utf8')),
         current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
-        contract: contractMarkdown(contract, 'local_codex'), baseline_commit: t.baseline, current_commit: git(repo, 'rev-parse', 'HEAD').trim(),
+        contract: markdown, contract_binding: localContractBinding(contract, markdown), baseline_commit: t.baseline, current_commit: git(repo, 'rev-parse', 'HEAD').trim(),
         staged_files: git(repo, 'diff', '--cached', '--name-only'), changed_files: changed, unauthorized_files: changed.filter(name => !contract.allowed_files.includes(name)),
         baseline, current, diff: await this.repositoryDiff(repo, t.baseline) };
       if (JSON.stringify(await publicationState(repo)) !== JSON.stringify(reviewedState.state)) throw new BridgeError('WORKTREE_CHANGED_DURING_REVIEW');
-      const packet = budgetLocalPacket(JSON.parse(this.safe(JSON.stringify(data))));
+      const sanitized = JSON.parse(this.safe(JSON.stringify(data)));
+      if (sanitized.contract !== markdown || digest(sanitized.contract_binding) !== digest(data.contract_binding)) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
+      const packet = budgetLocalPacket(sanitized);
       return { ...packet, hash: digest(packet.text) };
     }
     const tests = [], commands = [], candidates = []; let count = 0, commandBytes = 0, omitted = 0, complete = true;
@@ -1089,6 +1104,9 @@ export class Controller {
     const text = await fs.readFile(file, 'utf8');
     if (digest(text) !== ref.packet_hash) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const packet = JSON.parse(text);
+    const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8')), markdown = contractMarkdown(contract, 'local_codex');
+    if (packet.contract !== markdown || packet.local_scope?.contract_sha256 !== digest(contract) ||
+        digest(packet.contract_binding ?? null) !== digest(localContractBinding(contract, markdown))) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
     if (JSON.stringify(await this.localProtectedState(path.join(root, 'repo'))) !== JSON.stringify(packet.local_scope?.protected_at_review)) throw new BridgeError('LOCAL_REVIEW_PROTECTED_PATH_CHANGED');
     if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state) ||
         JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
