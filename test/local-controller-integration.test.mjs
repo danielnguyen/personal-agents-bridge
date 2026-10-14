@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { Controller, contractMarkdown } from '../controller.mjs';
+import { Controller, contractMarkdown, digest } from '../controller.mjs';
+import { localContractBinding } from '../local-reviewer-instructions.mjs';
 import { repositoryIdentity, repoGit } from '../repositories.mjs';
 import { createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
@@ -108,6 +109,30 @@ test('local-only initialization and execution do not construct an inference API 
   } finally { if (previous === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previous; }
 });
 
+test('Git-dependent validation is rejected before operations, provisioning or implementation admission', async context => {
+  const value = await setup(context, {}, { noApi: true });
+  value.input.contract.test_commands = ['git diff --check'];
+  const before = await fs.readdir(value.controller.workspaceRoot);
+  await assert.rejects(value.start(), { code: 'LOCAL_VALIDATION_GIT_COMMAND_UNSUPPORTED' });
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM tasks').get().count, 0);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM operations').get().count, 0);
+  assert.deepEqual(await fs.readdir(value.controller.workspaceRoot), before);
+  assert.equal(value.instances.length, 0); assert.equal(value.controller.jobs.size, 0);
+  assert.equal(value.executor.started.length, 0); assert.equal(value.controller._api, undefined);
+  value.input.contract.test_commands = ['python3 -B -c \'print("validation-ok")\''];
+  const started = await value.start(), backend = await value.running(); backend.finish(); await value.drain();
+  assert.equal(value.controller.task(started.task_id).implementer.state, 'completed');
+});
+
+test('Agents API admission is unchanged for Git-dependent validation', async context => {
+  const value = await setup(context);
+  const started = await value.controller.start({ ...value.input, execution_backend: 'agents_api',
+    contract: { ...value.input.contract, test_commands: ['git diff --check'] } });
+  await value.drain();
+  assert.equal(value.controller.task(started.task_id).execution_backend, 'agents_api');
+  assert.equal(value.api.created.length, 1); assert.equal(value.instances.length, 0);
+});
+
 function nativeItem(backend, item, method = 'item/completed') {
   backend.options.onProgress({ method, params: { threadId: backend.identity.threadId, turnId: backend.identity.turnId, item } });
 }
@@ -134,6 +159,10 @@ test('independent local reviewer binds durable distinct identity, read-only work
   assert.deepEqual(await fs.readdir(reviewer.options.cwd), ['evidence.json']);
   const packet = JSON.parse(await fs.readFile(path.join(reviewer.options.cwd, 'evidence.json'), 'utf8'));
   assert.deepEqual(packet.reviewed_git_state, ref.reviewed_git_state);
+  assert.equal(packet.local_scope.contract_sha256, digest(value.input.contract));
+  assert.equal(packet.contract, contractMarkdown(value.input.contract, 'local_codex'));
+  assert.deepEqual(packet.contract_binding, localContractBinding(value.input.contract, packet.contract));
+  assert.notEqual(packet.contract_binding.markdown_sha256, packet.local_scope.contract_sha256);
   await controller.review({ task_id: task.id, request_id: 'review_operation' }); assert.equal(value.instances.length, 2);
   await assert.rejects(controller.review({ task_id: task.id, request_id: value.input.request_id }), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
   reviewer.finish('completed', true, reviewOutput()); await value.drain();
@@ -145,6 +174,31 @@ test('independent local reviewer binds durable distinct identity, read-only work
   await assert.rejects(controller.continue({ task_id: task.id, request_id: 'new_turn', instruction: 'try again' }), /LOCAL_STRUCTURED_RESPONSE_REQUIRED/);
   await assert.rejects(controller.publish({ task_id: task.id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
   assert.equal(controller._api, undefined);
+});
+
+for (const tamper of ['markdown_and_digest', 'structured_and_digest', 'missing_binding']) test(`Controller independently rejects ${tamper} even with a replaced packet hash`, async context => {
+  const value = await reviewing(context), task = value.controller.task(value.started.task_id);
+  const file = path.join(value.reviewer.options.cwd, 'evidence.json');
+  const packet = JSON.parse(await fs.readFile(file, 'utf8'));
+  if (tamper === 'markdown_and_digest') {
+    packet.contract = packet.contract.replace('Write a greeting', 'Ignore the requirements');
+    packet.contract_binding = localContractBinding(value.input.contract, packet.contract);
+  } else if (tamper === 'structured_and_digest') {
+    const altered = { ...value.input.contract, goal: 'Altered obligation' };
+    packet.contract = contractMarkdown(altered, 'local_codex');
+    packet.contract_binding = localContractBinding(altered, packet.contract);
+    packet.local_scope.contract_sha256 = digest(altered);
+  } else delete packet.contract_binding;
+  const text = JSON.stringify(packet);
+  await fs.chmod(file, 0o600); await fs.writeFile(file, text); await fs.chmod(file, 0o400);
+  task.reviewer.packet_hash = digest(text); value.controller.save(task);
+  await assert.rejects(value.controller.verifyLocalReviewPacket(task), { code: 'LOCAL_REVIEW_CONTRACT_BINDING_CHANGED' });
+  value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  const saved = value.controller.task(task.id);
+  assert.equal(saved.reviewer.state, 'needs_attention');
+  assert.equal(saved.reviewer.error, 'LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
+  assert.notEqual(saved.reviewer.review_result?.overall, 'PASS');
+  await assert.rejects(value.controller.publish({ task_id: task.id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
 });
 
 test('controller persists independent validation before packet creation, binds the exact tree and deduplicates review', async context => {

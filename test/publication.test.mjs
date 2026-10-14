@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { Controller, digest } from '../controller.mjs';
+import { Controller, digest, contractMarkdown } from '../controller.mjs';
 import { GitHubPublisher, publicationGit, githubRepository } from '../publication.mjs';
 import { repoGit, repositoryIdentity } from '../repositories.mjs';
 import { FakeAPI, FakeExecutor } from './helpers.mjs';
 import { createServer } from '../server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { validateLocalReview, localScopeQualification } from '../local-reviewer-instructions.mjs';
+import { validateLocalReview, localScopeQualification, localContractBinding } from '../local-reviewer-instructions.mjs';
 import { createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 class LocalPublisher extends GitHubPublisher {
@@ -181,7 +181,9 @@ test('bounded SCOPE separates optional output limitations from execution and req
         Object.assign(output, { availability: 'present', value: 'partial', missing: false, truncated: true, source_truncated: true }); data.native_activity.commands[0].missing = []; }]) {
         const limited = structuredClone(candidate); alteration(limited);
         const outputContract = { ...value.contract, requirements: [{ id: 'R1', text: 'The command must emit the exact complete stdout token expected-output.' }] };
-        limited.contract = outputContract; limited.local_scope.contract_sha256 = digest(outputContract);
+        limited.contract = contractMarkdown(outputContract, 'local_codex');
+        limited.contract_binding = localContractBinding(outputContract, limited.contract);
+        limited.local_scope.contract_sha256 = digest(outputContract);
         const rejected = validateLocalReview(JSON.stringify(failed), outputContract, limited, text => text);
         assert.equal(rejected.overall, 'FAIL'); assert.equal(rejected.findings[0].status, 'FAIL');
         assert.equal(rejected.scope_qualification.status, 'qualified');

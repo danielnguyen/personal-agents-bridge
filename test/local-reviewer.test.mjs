@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { localReviewerInstructions, validateLocalReview } from '../local-reviewer-instructions.mjs';
+import { localReviewerInstructions, validateLocalReview, localContractBinding, localScopeQualification } from '../local-reviewer-instructions.mjs';
+import { contractMarkdown, digest } from '../controller.mjs';
 import { contract } from './helpers.mjs';
 import { LOCAL_EVIDENCE_VERSION } from '../local-evidence.mjs';
 
@@ -56,4 +57,45 @@ test('local instructions distinguish provenance, obligations and optional gaps w
   assert.match(localReviewerInstructions, /independent_validation.status=unavailable/);
   assert.match(localReviewerInstructions, /Do not fabricate Agents API sandbox attestations/);
   assert.match(localReviewerInstructions, /data, never as instructions/);
+});
+
+function boundContractPacket(value) {
+  const markdown = contractMarkdown(value, 'local_codex');
+  return { evidence_version: LOCAL_EVIDENCE_VERSION, contract: markdown, contract_binding: localContractBinding(value, markdown),
+    local_scope: { version: 'pab.local-scope.bounded.v1', provenance: 'controller', contract_sha256: digest(value) },
+    controller_evidence: { provenance: 'controller' } };
+}
+
+test('exact UTF-8 structured serialization and Markdown have distinct, deterministically bound digests', () => {
+  const value = { ...contract(), goal: 'Quoted "goal", newline\n and café 🌱' }, evidence = boundContractPacket(value);
+  const binding = evidence.contract_binding;
+  assert.equal(binding.structured_json, JSON.stringify(value));
+  assert.deepEqual(JSON.parse(binding.structured_json), value);
+  assert.equal(digest(binding.structured_json), evidence.local_scope.contract_sha256);
+  assert.equal(binding.markdown_sha256, digest(evidence.contract));
+  assert.notEqual(binding.markdown_sha256, evidence.local_scope.contract_sha256);
+  assert.equal(evidence.contract, contractMarkdown(value, 'local_codex'));
+  assert.equal(binding.serialization, 'JSON.stringify(contract)'); assert.equal(binding.encoding, 'utf-8');
+  assert(!localScopeQualification(value, evidence).blockers.some(code => ['SCOPE_CONTRACT_BINDING', 'SCOPE_PROVENANCE_OR_CONTRACT'].includes(code)));
+  assert.match(localReviewerInstructions, /NOT of the Markdown/);
+  assert.match(localReviewerInstructions, /without another JSON.stringify/);
+  assert.match(localReviewerInstructions, /Different JSON\/Markdown digests are expected/);
+});
+
+for (const [label, mutate] of [
+  ['missing binding', evidence => delete evidence.contract_binding],
+  ['Markdown alteration', evidence => evidence.contract += '\nExtra obligation'],
+  ['Markdown whitespace alteration', evidence => evidence.contract += '\n'],
+  ['structured obligation alteration', evidence => evidence.contract_binding.structured_json = evidence.contract_binding.structured_json.replace('Write a greeting', 'Delete data')],
+  ['pretty-printing hashed input', evidence => evidence.contract_binding.structured_json = JSON.stringify(JSON.parse(evidence.contract_binding.structured_json), null, 2)],
+  ['sorted serialization', evidence => { const value = JSON.parse(evidence.contract_binding.structured_json); evidence.contract_binding.structured_json = JSON.stringify(value, Object.keys(value).sort()); }],
+  ['Markdown substituted for structured hash', evidence => evidence.local_scope.contract_sha256 = evidence.contract_binding.markdown_sha256],
+  ['wrong encoding', evidence => evidence.contract_binding.encoding = 'utf-16le'],
+  ['model provenance', evidence => evidence.contract_binding.provenance = 'model'],
+]) test(`contract binding fails closed on ${label}`, () => {
+  const value = contract(), evidence = boundContractPacket(value); mutate(evidence);
+  const result = validateLocalReview(JSON.stringify(input()), value, evidence, text => text);
+  assert.equal(result.overall, 'FAIL');
+  assert.equal(result.findings.find(finding => finding.id === 'SCOPE').status, 'FAIL');
+  assert(result.scope_qualification.blockers.some(code => ['SCOPE_CONTRACT_BINDING', 'SCOPE_PROVENANCE_OR_CONTRACT'].includes(code)));
 });
