@@ -54,6 +54,27 @@ or killed: unknown ownership/termination remains a cleanup blocker.
 
 ### Bounded review packaging and explicit pre-execution retry
 
+Local contracts may optionally select `reference_files`, for example
+`["browser_trust_inspector.py", "README.md"]`, separately from `allowed_files`.
+The Controller captures only those unchanged UTF-8 regular files from the pinned
+baseline Git tree: at most four files and 32 KiB total. Paths must be repository-relative,
+unique, outside protected paths and disjoint from edit scope. Missing, non-text,
+symlinked, modified, oversized or secret-redacted required references fail closed.
+Admission checks baseline availability before execution. Review and publication
+checks bind baseline commit/tree, blob IDs, content SHA-256, lengths and modes and
+compare the candidate reference files against the baseline again. Context is
+untrusted source data, not reviewer instructions, runtime proof or independent
+validation. Existing contracts select no files implicitly; Agents API contracts
+do not support this optional field. The whole packet still has the same 128 KiB bound.
+
+Native notification retention keeps the existing 24,576-byte/64-record budgets,
+but optional command output now retains at most 256 characters per event instead
+of 2,048. Missing, malformed, redacted, truncated and upstream-unverified output
+remain explicit; output-dependent requirements may still FAIL. Required command,
+identity, lifecycle, exit and file-operation fields are not reduced. Genuine
+essential-evidence overflow still increments `omitted_events` and blocks SCOPE.
+Previously omitted events cannot be reconstructed and historical FAILs are unchanged.
+
 Local evidence remains limited to 131,072 UTF-8 JSON bytes. When a full packet
 overflows, the Controller may encode repeated complete-file patch bodies as
 `pab.exact-diff-references.v1` references into the existing baseline/current maps.
@@ -226,11 +247,19 @@ file detection and Git state checks. Agents API packet behavior is unchanged;
 native notifications never populate Agents API or file-RPC evidence structures.
 
 Limits: at most 64 command/file records together and 24 KiB of record JSON;
-commands/output are each bounded to 2048 characters, cwd to 1024, and file-change
+command text is bounded to 2048 characters and optional output to 256 characters,
+cwd to 1024, and file-change
 records to 16 entries with 1024-character paths/diffs. Overflow is counted, not
 silently treated as complete history. Packets share the existing 128 KiB UTF-8
 limit and reject overflow without dropping required sections. Sensitive text uses
 existing controller redaction; evidence remains private operational data.
+Bounded output length/SHA-256 comparisons of UTF-8 JSON strings distinguish consistent start/completion
+prefixes from conflicts beyond the retained text. Truncation still does not imply
+independently verified output completeness. Reference reads pin Linux descriptors
+without following symlinks or opening special files for content, and recheck path
+identities. Reference Git checks authenticate raw commit, root/intermediate tree
+and blob bytes, not only the final blob. These checks do not establish a filesystem
+freeze or exhaustive historical compliance.
 
 Required tests correlate only exact command strings at the approved cwd, not
 substrings or inferred shell wrappers. References to native records are **not

@@ -20,6 +20,7 @@ const requirement = z.object({ id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,39
 export const contractSchema = z.object({
   goal: z.string().min(1).max(8000),
   allowed_files: z.array(z.string().min(1).max(200)).min(1).max(30),
+  reference_files: z.array(z.string().min(1).max(200)).max(4).optional().describe('Local Codex repository tasks only: unchanged baseline text files for reviewer context, separate from allowed edits; at most 4 files and 32768 UTF-8 bytes total.'),
   requirements: z.array(requirement).min(1).max(30),
   invariants: z.array(requirement).max(20).default([]),
   test_commands: z.array(z.string().min(1).max(1000)).max(10).default([]),

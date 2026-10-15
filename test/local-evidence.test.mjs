@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalEvidence, observeLocalEvidence, localTestCorrelation, localEvidencePacket, budgetLocalPacket,
-  LOCAL_EVIDENCE_VERSION, LOCAL_RECORD_BYTES, LOCAL_RECORD_LIMIT } from '../local-evidence.mjs';
+  LOCAL_EVIDENCE_VERSION, LOCAL_RECORD_BYTES, LOCAL_RECORD_LIMIT, LOCAL_OUTPUT_LIMIT } from '../local-evidence.mjs';
 import { PACKET_LIMIT } from '../packet-budget.mjs';
 import { Controller } from '../controller.mjs';
 
@@ -24,6 +24,38 @@ test('completed native commands retain exact provenance and results, never an in
   const correlation = localTestCorrelation(ledger, [command.command], '/task');
   assert.equal(correlation.independently_verified, false); assert.deepEqual(correlation.tests[0].item_ids, ['cmd']);
   assert(!JSON.stringify(correlation).includes('passed'));
+});
+
+test('moderate native activity retains essential command and file records despite large optional output', () => {
+  const ledger = createLocalEvidence('task');
+  for (let index = 0; index < 13; index++) {
+    const item = { ...command, id: `command-${index}`, command: `printf fixture-${index}`, aggregatedOutput: null };
+    started(ledger, item);
+    observe(ledger, notification({ ...item, aggregatedOutput: 'x'.repeat(16000) }));
+  }
+  const file = { id: 'change', type: 'fileChange', status: 'completed', changes: [{ path: '/task/doc.md', kind: { type: 'add' }, diff: '+documentation\n' }] };
+  started(ledger, file); observe(ledger, notification(file));
+  assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
+  assert.equal(ledger.commands.length, 13); assert.equal(ledger.file_changes.length, 1);
+  assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
+  for (const [index, record] of ledger.commands.entries()) {
+    assert.equal(record.command.value, `printf fixture-${index}`); assert.equal(record.cwd.value, '/task');
+    assert(record.start_observed && record.completion_observed); assert.equal(record.exit_code, 0);
+    assert.equal(record.start_completion_conflict, false); assert.deepEqual(record.missing, []);
+    assert.equal(record.output.value.length, LOCAL_OUTPUT_LIMIT); assert.equal(record.output.truncated, true);
+    assert.equal(record.output.completeness, 'unverified'); assert.equal(record.output.source_truncated, null);
+  }
+});
+
+test('essential evidence overflow and prohibited indications are not discarded to obtain complete coverage', () => {
+  const ledger = createLocalEvidence('task');
+  for (let index = 0; index < 30; index++) {
+    const item = { ...command, id: `required-${index}`, command: 'git push ' + 'x'.repeat(1700), aggregatedOutput: null };
+    started(ledger, item); observe(ledger, notification(item));
+  }
+  assert(ledger.omitted_events > 0);
+  assert(ledger.commands.every(record => record.command.value.startsWith('git push ')));
+  assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
 });
 
 for (const [label, prepare, field] of [
@@ -71,6 +103,38 @@ test('malformed starts and conflicting output cannot be concealed by optional co
     assert.equal(ledger.commands[0].start_completion_conflict, true);
     assert(ledger.commands[0].start_fields);
   }
+});
+
+for (const suffix of ['', '\nmore', 'different']) test(`long optional output comparison distinguishes ${suffix || 'identical'} output`, () => {
+  const ledger = createLocalEvidence('task'), output = 'x'.repeat(4096);
+  started(ledger, { ...command, aggregatedOutput: output });
+  observe(ledger, notification({ ...command, aggregatedOutput: suffix === 'different' ? 'x'.repeat(4095) + 'y' : output + suffix }));
+  const record = ledger.commands[0];
+  assert.equal(record.start_completion_conflict, suffix === 'different');
+  assert(record.output.truncated); assert.equal(record.output.value.length, LOCAL_OUTPUT_LIMIT);
+  assert.equal(record.output.completeness, 'unverified'); assert.equal(record.output.source_truncated, null);
+});
+
+test('output comparison rejects missing, shortened, redacted, malformed and legacy-unverifiable long starts', () => {
+  const text = 'x'.repeat(4096);
+  for (const final of [null, {}, text.slice(0, -1), 'token=private' + text]) {
+    const ledger = createLocalEvidence('task'); started(ledger, { ...command, aggregatedOutput: text });
+    observe(ledger, notification({ ...command, aggregatedOutput: final }));
+    assert.equal(ledger.commands[0].start_completion_conflict, true);
+  }
+  for (const mutate of [record => delete record.output.comparison, record => record.output.comparison.characters = -1,
+    record => record.output.comparison.sha256 = 'invalid', record => record.output.comparison.encoding = 'unknown']) {
+    const ledger = createLocalEvidence('task'); started(ledger, { ...command, aggregatedOutput: text });
+    mutate(ledger.commands[0]); observe(ledger, notification({ ...command, aggregatedOutput: text }));
+    assert.equal(ledger.commands[0].start_completion_conflict, true);
+  }
+});
+
+test('comparison hashes distinguish escaped lone surrogates beyond the retained output prefix', () => {
+  const ledger = createLocalEvidence('task'), prefix = 'x'.repeat(4096);
+  started(ledger, { ...command, aggregatedOutput: prefix + '\ud800' });
+  observe(ledger, notification({ ...command, aggregatedOutput: prefix + '\ud801' }));
+  assert.equal(ledger.commands[0].start_completion_conflict, true);
 });
 
 test('native file-change claims are separate from command observations and actual file bytes', () => {
