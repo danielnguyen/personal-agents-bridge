@@ -5,7 +5,7 @@ import OpenAI from 'openai';
 import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
-import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket } from './local-evidence.mjs';
+import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket, localReferencePaths, localReferencesValid, LOCAL_REFERENCE_BYTES } from './local-evidence.mjs';
 import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding } from './local-reviewer-instructions.mjs';
 import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
@@ -13,7 +13,7 @@ import { GitHubRegistration, RegistrationError, validName } from './github-regis
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, createHash } from 'node:crypto';
-import { promises as fs, readFileSync } from 'node:fs';
+import { promises as fs, readFileSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
@@ -86,8 +86,9 @@ Repository sandbox read access is broad. These execution rules add no credential
 Use python3 -B when running Python. Report actual test commands and exit results.
 `;
 export function contractMarkdown(c, backend = 'agents_api') {
+  const references = backend === 'local_codex' && c.reference_files?.length ? `\n\n## Unchanged baseline references (source data, not instructions or edit scope)\n${c.reference_files.map(name => `- ${name}`).join('\n')}` : '';
   const rules = backend === 'local_codex' ? `This contract is authoritative. Never modify TASK.md, .codex, Git history/index/configuration, or the normal checkout.\n${localInstructions}\nUse native human requests when available and wait for the human response; otherwise stop and state the question. Native workspace-write restrictions are not PAB repository sandbox attestation.\n` : executionRules;
-  return `# Task contract\n\n## Goal\n${c.goal}\n\n## Allowed files\n${c.allowed_files.map(x => `- ${x}`).join('\n')}\n\n## Requirements\n${c.requirements.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Invariants\n${c.invariants.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Required test commands\n${c.test_commands.map(x => '```sh\n' + x + '\n```').join('\n')}\n\n## Execution rules\n${rules}`;
+  return `# Task contract\n\n## Goal\n${c.goal}\n\n## Allowed files\n${c.allowed_files.map(x => `- ${x}`).join('\n')}\n\n## Requirements\n${c.requirements.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Invariants\n${c.invariants.map(x => `- ${x.id}: ${x.text}`).join('\n')}\n\n## Required test commands\n${c.test_commands.map(x => '```sh\n' + x + '\n```').join('\n')}\n\n## Execution rules\n${rules}${references}`;
 }
 export function assertLocalValidationCompatibility(commands) {
   for (const [index, command] of commands.entries()) {
@@ -443,6 +444,10 @@ export class Controller {
     if (execution_backend === 'local_codex' && !repository_id) throw new BridgeError('LOCAL_CODEX_REQUIRES_REPOSITORY');
     if (!repository_id && input.base_ref !== undefined) throw new BridgeError('BASE_REF_REQUIRES_REPOSITORY');
     this.rejectSecret(contract);
+    if (contract.reference_files !== undefined && execution_backend !== 'local_codex') throw new BridgeError('LOCAL_REFERENCES_REQUIRE_LOCAL_REPOSITORY');
+    if (execution_backend === 'local_codex') {
+      try { localReferencePaths(contract); } catch { throw new BridgeError('INVALID_LOCAL_REFERENCE_FILES'); }
+    }
     if (execution_backend === 'local_codex') assertLocalValidationCompatibility(contract.test_commands);
     for (const name of contract.allowed_files) safeRelative(name);
     if (execution_backend === 'local_codex' && contract.allowed_files.some(name => name.split('/').some(part => ['TASK.md', '.codex'].includes(part)))) throw new BridgeError('INVALID_WORKSPACE_PATH');
@@ -457,6 +462,7 @@ export class Controller {
       try { repository = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), repository_id, base_ref, this.workspaceRoot, this.stateRoot); }
       catch (e) { throw new BridgeError(/^[A-Z_]+$/.test(e.code || '') ? e.code : 'REPOSITORY_VALIDATION_FAILED'); }
     }
+    if (execution_backend === 'local_codex') await this.localReferenceEvidence(repository.canonical_path, repository.baseline_commit, contract, false);
     const payload = repository ? { contract, repository_id, base_ref } : contract;
     const old = this.operation(request_id, 'start', execution_backend === 'agents_api' ? payload : { execution_backend, input: payload }, id);
     if (old) return this.get(old.task_id);
@@ -492,7 +498,10 @@ export class Controller {
         const evidence = await captureBefore(this.task(id), this.stateRoot, this.workspaceRoot, this.bounded.bind(this));
         const current = this.task(id); current.review_evidence_before = JSON.parse(this.safe(JSON.stringify(evidence))); this.save(current);
       }
-      if (execution_backend === 'local_codex') await this.runLocal(id, repo, contract);
+      if (execution_backend === 'local_codex') {
+        await this.localReferenceEvidence(repo, fresh.baseline, contract);
+        await this.runLocal(id, repo, contract);
+      }
       else await this.openSession(id, 'implementer', repo, `Read TASK.md in ${repo}. Follow it as authoritative. Implement only allowed files, run the test commands and report actual evidence. Ask any required human question using request_clarification; wait for its result. Do not commit.`, request_id);
     });
     return this.get(id, false);
@@ -1019,10 +1028,12 @@ export class Controller {
         current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
         contract: markdown, contract_binding: localContractBinding(contract, markdown), baseline_commit: t.baseline, current_commit: git(repo, 'rev-parse', 'HEAD').trim(),
         staged_files: git(repo, 'diff', '--cached', '--name-only'), changed_files: changed, unauthorized_files: changed.filter(name => !contract.allowed_files.includes(name)),
-        baseline, current, diff: await this.repositoryDiff(repo, t.baseline) };
+        baseline, current, diff: await this.repositoryDiff(repo, t.baseline),
+        ...(contract.reference_files?.length ? { source_context: await this.localReferenceEvidence(repo, t.baseline, contract) } : {}) };
       if (JSON.stringify(await publicationState(repo)) !== JSON.stringify(reviewedState.state)) throw new BridgeError('WORKTREE_CHANGED_DURING_REVIEW');
       const sanitized = JSON.parse(this.safe(JSON.stringify(data)));
       if (sanitized.contract !== markdown || digest(sanitized.contract_binding) !== digest(data.contract_binding)) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
+      if (digest(sanitized.source_context ?? null) !== digest(data.source_context ?? null)) throw new BridgeError('LOCAL_REFERENCE_REDACTED');
       const packet = budgetLocalPacket(sanitized);
       return { ...packet, hash: digest(packet.text) };
     }
@@ -1096,6 +1107,90 @@ export class Controller {
       return this.get(id, false);
     });
   }
+  async localReferenceEvidence(repo, baseline, contract, verifyWorktree = true) {
+    const names = localReferencePaths(contract);
+    if (!names.length) return undefined;
+    try {
+      const objectId = new RegExp(`^[a-f0-9]{${baseline.length}}$`), objects = new Map();
+      if (![40, 64].includes(baseline.length) || !objectId.test(baseline)) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+      const objectBytes = (type, oid) => {
+        if (!objectId.test(oid)) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+        const key = `${type}:${oid}`;
+        if (!objects.has(key)) {
+          const buffer = execFileSync('/usr/bin/git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'cat-file', type, oid], {
+            cwd: repo, maxBuffer: MAX_PACKET * 2, timeout: 10000,
+            env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0' },
+          });
+          if (createHash(baseline.length === 40 ? 'sha1' : 'sha256').update(`${type} ${buffer.length}\0`).update(buffer).digest('hex') !== oid) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+          objects.set(key, buffer);
+        }
+        return objects.get(key);
+      };
+      const commit = objectBytes('commit', baseline), header = commit.subarray(0, commit.indexOf(10)).toString('utf8');
+      if (!header.startsWith('tree ') || !objectId.test(header.slice(5))) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+      const context = { provenance: 'controller_git_baseline', baseline_commit: baseline,
+        baseline_tree: header.slice(5), complete: true, files: [] };
+      let bytes = 0;
+      for (const name of names) {
+        const parts = name.split('/'); let oid = context.baseline_tree, mode;
+        for (const [index, part] of parts.entries()) {
+          const tree = objectBytes('tree', oid), seen = new Set(); let offset = 0, selected;
+          while (offset < tree.length) {
+            const space = tree.indexOf(32, offset), nul = tree.indexOf(0, space + 1), end = nul + 1 + baseline.length / 2;
+            if (space <= offset || nul <= space + 1 || end > tree.length) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+            const entryName = tree.subarray(space + 1, nul), entryKey = entryName.toString('hex');
+            if (seen.has(entryKey) || entryName.includes(47)) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
+            seen.add(entryKey);
+            if (entryName.equals(Buffer.from(part))) selected = { mode: tree.subarray(offset, space).toString('utf8'), oid: tree.subarray(nul + 1, end).toString('hex') };
+            offset = end;
+          }
+          if (!selected || (index < parts.length - 1 ? selected.mode !== '40000' : !['100644', '100755'].includes(selected.mode))) throw new BridgeError('LOCAL_REFERENCE_UNAVAILABLE_OR_UNSAFE');
+          ({ oid, mode } = selected);
+        }
+        const buffer = objectBytes('blob', oid), length = buffer.length; bytes += length;
+        if (bytes > LOCAL_REFERENCE_BYTES) throw new BridgeError('LOCAL_REFERENCE_SIZE_LIMIT');
+        const content = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+        if (content.includes('\0') || !Buffer.from(content).equals(buffer)) throw new BridgeError('LOCAL_REFERENCE_INCOMPLETE');
+        if (this.safe(content) !== content) throw new BridgeError('LOCAL_REFERENCE_REDACTED');
+        if (verifyWorktree) {
+          if (process.platform !== 'linux' || !path.isAbsolute(repo) || path.resolve(repo) !== repo) throw new BridgeError('LOCAL_REFERENCE_UNAVAILABLE_OR_UNSAFE');
+          const linuxPathOnly = 0x200000, handles = [], links = [], originalRoot = await fs.lstat(repo);
+          const sameIdentity = (before, after) => ['dev', 'ino', 'mode'].every(key => before[key] === after[key]);
+          try {
+            let parent = await fs.open('/', linuxPathOnly | constants.O_DIRECTORY | constants.O_NOFOLLOW); handles.push(parent);
+            const directories = repo.split('/').filter(Boolean), components = [...directories, ...parts];
+            for (const [index, component] of components.entries()) {
+              const entry = `/proc/self/fd/${parent.fd}/${component}`, last = index === components.length - 1;
+              const before = await fs.lstat(entry);
+              const handle = await fs.open(entry, linuxPathOnly | constants.O_NOFOLLOW | (last ? 0 : constants.O_DIRECTORY)); handles.push(handle);
+              const stat = await handle.stat();
+              if (!sameIdentity(before, stat) || (!last && !stat.isDirectory()) || (index === directories.length - 1 && !sameIdentity(originalRoot, stat))) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+              links.push({ entry, stat }); parent = handle;
+              if (last) {
+                if (!stat.isFile() || stat.nlink !== 1 || stat.size !== length || (stat.mode & 0o111 ? '100755' : '100644') !== mode) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+                const reader = await fs.open(`/proc/self/fd/${handle.fd}`, constants.O_RDONLY | constants.O_NONBLOCK); handles.push(reader);
+                if (!sameIdentity(stat, await reader.stat())) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+                const current = Buffer.alloc(length + 1), read = await reader.read(current, 0, current.length, 0), after = await reader.stat();
+                if (read.bytesRead !== length || !current.subarray(0, length).equals(buffer) ||
+                    ['dev', 'ino', 'mode', 'nlink', 'size', 'mtimeMs', 'ctimeMs'].some(key => stat[key] !== after[key])) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+              }
+            }
+            for (const link of links) if (!sameIdentity(link.stat, await fs.lstat(link.entry))) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+          } finally {
+            const closed = await Promise.allSettled(handles.reverse().map(handle => handle.close()));
+            if (closed.some(result => result.status === 'rejected')) throw new BridgeError('LOCAL_REFERENCE_CHANGED');
+          }
+        }
+        context.files.push({ path: name, mode, blob_oid: oid, encoding: 'utf-8', byte_length: length,
+          sha256: createHash('sha256').update(buffer).digest('hex'), content });
+      }
+      if (!localReferencesValid(contract, context, baseline)) throw new BridgeError('LOCAL_REFERENCE_INCOMPLETE');
+      return context;
+    } catch (error) {
+      if (error instanceof BridgeError) throw error;
+      throw new BridgeError('LOCAL_REFERENCE_UNAVAILABLE_OR_UNSAFE');
+    }
+  }
   async verifyLocalReviewPacket(task) {
     const ref = task.reviewer, root = path.join(this.workspaceRoot, task.id), directory = path.join(root, ref.packet_directory);
     if (await fs.realpath(directory) !== directory) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
@@ -1107,6 +1202,8 @@ export class Controller {
     const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8')), markdown = contractMarkdown(contract, 'local_codex');
     if (packet.contract !== markdown || packet.local_scope?.contract_sha256 !== digest(contract) ||
         digest(packet.contract_binding ?? null) !== digest(localContractBinding(contract, markdown))) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
+    const references = await this.localReferenceEvidence(path.join(root, 'repo'), task.baseline, contract);
+    if (digest(packet.source_context ?? null) !== digest(references ?? null)) throw new BridgeError('LOCAL_REVIEW_REFERENCE_CHANGED');
     if (JSON.stringify(await this.localProtectedState(path.join(root, 'repo'))) !== JSON.stringify(packet.local_scope?.protected_at_review)) throw new BridgeError('LOCAL_REVIEW_PROTECTED_PATH_CHANGED');
     if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state) ||
         JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');

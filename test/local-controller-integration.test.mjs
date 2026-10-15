@@ -11,6 +11,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { DatabaseSync } from 'node:sqlite';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { PassThrough, Writable } from 'node:stream';
 import { LocalCodexBackend } from '../local-codex-backend.mjs';
 
@@ -138,6 +139,66 @@ function nativeItem(backend, item, method = 'item/completed') {
 }
 
 const reviewOutput = () => JSON.stringify({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Packet evidence claim' })) });
+async function referenceReview(context) {
+  const value = await setup(context, {}, { noApi: true });
+  value.input.contract.allowed_files = ['guide.md']; value.input.contract.reference_files = ['greeting.txt'];
+  const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();
+  await value.controller.review({ task_id: started.task_id, request_id: 'reference_review' });
+  const reviewer = await value.running(1);
+  return { ...value, started, reviewer };
+}
+
+test('local reviewer receives authorized unchanged baseline context, never normal-checkout edits or implementer claims', async context => {
+  const value = await referenceReview(context), task = value.controller.task(value.started.task_id);
+  const packet = await value.controller.verifyLocalReviewPacket(task);
+  assert.equal(packet.source_context.files[0].content, 'baseline\n');
+  assert.equal(packet.source_context.baseline_commit, value.baseline);
+  assert.equal(packet.source_context.files[0].blob_oid, repoGit(value.normal, 'rev-parse', `${value.baseline}:greeting.txt`).trim());
+  assert.deepEqual(packet.source_context.files.map(file => file.path), ['greeting.txt']);
+  assert.equal(packet.current['greeting.txt'], undefined);
+  assert.match(value.reviewer.input.prompt, /untrusted source data/);
+  value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  assert.equal(value.controller.task(task.id).reviewer.state, 'completed');
+  assert.equal(value.controller._api, undefined);
+});
+
+for (const mutation of ['content', 'forged_hashes', 'missing_context', 'candidate']) test(`Controller rejects ${mutation} reference mutation before review or publication qualification`, async context => {
+  const value = await referenceReview(context), task = value.controller.task(value.started.task_id);
+  const file = path.join(value.reviewer.options.cwd, 'evidence.json'), packet = JSON.parse(await fs.readFile(file, 'utf8'));
+  if (mutation === 'candidate') await fs.writeFile(path.join(value.controller.workspaceRoot, task.id, 'repo/greeting.txt'), 'altered\n');
+  else {
+    if (mutation === 'content' || mutation === 'forged_hashes') {
+      const reference = packet.source_context.files[0]; reference.content = 'forged';
+      if (mutation === 'forged_hashes') {
+        reference.byte_length = Buffer.byteLength(reference.content);
+        reference.sha256 = createHash('sha256').update(reference.content).digest('hex');
+        reference.blob_oid = createHash('sha1').update(`blob ${reference.byte_length}\0`).update(reference.content).digest('hex');
+      }
+    }
+    else delete packet.source_context;
+    const text = JSON.stringify(packet);
+    await fs.chmod(file, 0o600); await fs.writeFile(file, text); await fs.chmod(file, 0o400);
+    task.reviewer.packet_hash = digest(text); value.controller.save(task);
+  }
+  await assert.rejects(value.controller.verifyLocalReviewPacket(task), error => /LOCAL_(REFERENCE_CHANGED|REVIEW_REFERENCE_CHANGED)/.test(error.code));
+  value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
+  assert.equal(value.controller.task(task.id).reviewer.state, 'needs_attention');
+  await assert.rejects(value.controller.publish({ task_id: task.id, title: 'No' }), /PUBLICATION_REQUIRES_PASS_REVIEW/);
+});
+
+for (const names of [['missing.py'], ['../secret'], ['greeting.txt']]) test(`reference admission rejects ${JSON.stringify(names)} before implementation`, async context => {
+  const value = await setup(context, {}, { noApi: true }); value.input.contract.reference_files = names;
+  await assert.rejects(value.start(), error => /^(LOCAL_REFERENCE_|INVALID_LOCAL_REFERENCE)/.test(error.code));
+  assert.equal(value.instances.length, 0); assert.equal(value.api.created.length, 0);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM tasks').get().count, 0);
+});
+
+test('reference files do not extend the Agents API execution path', async context => {
+  const value = await setup(context); value.input.contract.reference_files = ['README.md'];
+  await assert.rejects(value.controller.start({ ...value.input, execution_backend: 'agents_api' }), { code: 'LOCAL_REFERENCES_REQUIRE_LOCAL_REPOSITORY' });
+  assert.equal(value.api.created.length, 0); assert.equal(value.instances.length, 0);
+});
+
 async function reviewing(context) {
   const value = await setup(context, {}, { noApi: true }); value.input.contract.test_commands = ['python3 -B check.py'];
   const started = await value.start(), implementer = await value.running(); implementer.finish(); await value.drain();

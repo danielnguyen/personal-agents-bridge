@@ -4,8 +4,12 @@ import { createHash } from 'node:crypto';
 export const LOCAL_EVIDENCE_VERSION = 'pab.local-codex-review.v1';
 export const LOCAL_RECORD_LIMIT = 64;
 export const LOCAL_RECORD_BYTES = 24576;
+export const LOCAL_OUTPUT_LIMIT = 256;
+export const LOCAL_REFERENCE_LIMIT = 4;
+export const LOCAL_REFERENCE_BYTES = 32768;
 const size = value => Buffer.byteLength(JSON.stringify(value));
 const count = value => Math.min(Number.MAX_SAFE_INTEGER, value + 1);
+const outputHash = value => createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 
 export function createLocalEvidence(taskId) {
   return { version: 1, task_id: taskId, provenance: 'controller_retained_codex_app_server_notifications',
@@ -13,6 +17,7 @@ export function createLocalEvidence(taskId) {
     exhaustive: false, output_completeness: 'unverified',
     limitations: ['Notifications are not independent command or filesystem verification.',
       'Missing notifications and operations outside these channels cannot be ruled out.',
+      'Optional command output retains at most 256 characters per event; truncation does not imply empty or complete output.',
       'No negative claim about prohibited operations or independent test PASS follows from this ledger.'] };
 }
 
@@ -48,17 +53,30 @@ export function observeLocalEvidence(ledger, event, identity, bound) {
     record.command = retained(item.command, 2048, bound);
     record.cwd = retained(item.cwd, 1024, bound);
     record.exit_code = completed && Number.isInteger(item.exitCode) ? item.exitCode : null;
-    record.output = retained(item.aggregatedOutput, 2048, bound);
+    record.output = retained(item.aggregatedOutput, LOCAL_OUTPUT_LIMIT, bound);
     record.output.availability = item.aggregatedOutput === undefined ? 'absent' : item.aggregatedOutput === null ? 'null' :
       typeof item.aggregatedOutput !== 'string' ? 'malformed' : item.aggregatedOutput === '' ? 'empty' : 'present';
     record.output.source_truncated = item.truncated === true || item.outputTruncated === true || item.output_truncated === true ? true : null;
     record.output.completeness = 'unverified';
+    const outputText = typeof item.aggregatedOutput === 'string' && !record.output.redacted ? item.aggregatedOutput : null;
+    if (outputText) record.output.comparison = { encoding: 'json-string-utf8', characters: outputText.length, sha256: outputHash(outputText) };
+    let outputConflict = false;
+    if (previous?.output.value) {
+      const comparison = previous.output.comparison;
+      if (comparison) {
+        const prefix = outputText === null ? null : outputText.slice(0, comparison.characters);
+        const prefixHash = prefix === null ? null : outputHash(prefix);
+        record.start_output_comparison = { ...comparison, completion_prefix_sha256: prefixHash };
+        outputConflict = previous.output.redacted || comparison.encoding !== 'json-string-utf8' || !Number.isSafeInteger(comparison.characters) || comparison.characters < previous.output.value.length ||
+          !/^[a-f0-9]{64}$/.test(comparison.sha256) || outputText === null || outputText.length < comparison.characters || prefixHash !== comparison.sha256;
+      } else outputConflict = previous.output.truncated || previous.output.redacted || record.output.missing || !record.output.value.startsWith(previous.output.value);
+    }
     for (const field of ['command', 'cwd', 'output']) if (record[field].missing || (field !== 'output' && !record[field].value)) record.missing.push(field);
     if (record.exit_code === null) record.missing.push('exit_code');
     if (record.output.availability === 'malformed') record.missing.push('output_format');
     record.start_completion_conflict = !!previous && (previous.status.value !== 'inProgress' || previous.output.availability === 'malformed' ||
       ['command', 'cwd'].some(field => previous[field].value !== record[field].value || previous[field].truncated || previous[field].redacted) ||
-      (!!previous.output.value && (previous.output.truncated || previous.output.redacted || record.output.missing || !record.output.value.startsWith(previous.output.value))));
+      outputConflict);
     if (record.start_completion_conflict) record.start_fields = { command: previous.command, cwd: previous.cwd, status: previous.status, output: previous.output };
   } else {
     record.changes = [];
@@ -93,6 +111,33 @@ export function localTestCorrelation(ledger, required, cwd) {
       return { required_command: command, status: matches.length ? 'native_observations_only' : 'unmatched',
         item_ids: matches.map(record => record.item_id) };
     }) };
+}
+
+export function localReferencePaths(contract) {
+  const names = contract.reference_files === undefined ? [] : contract.reference_files;
+  if (!Array.isArray(names) || names.length > LOCAL_REFERENCE_LIMIT || new Set(names).size !== names.length || names.some(name =>
+    typeof name !== 'string' || !name || name.length > 200 || /[\\\\\x00-\x1f\x7f]/.test(name) || name.startsWith('/') ||
+    name.split('/').some(part => ['', '.', '..', '.git', '.codex', 'TASK.md'].includes(part)) || contract.allowed_files.includes(name))) {
+    throw Object.assign(new Error('INVALID_LOCAL_REFERENCE_FILES'), { code: 'INVALID_LOCAL_REFERENCE_FILES' });
+  }
+  return names;
+}
+
+export function localReferencesValid(contract, context, baseline) {
+  try {
+    const names = localReferencePaths(contract);
+    if (!names.length) return context === undefined;
+    if (!context || context.provenance !== 'controller_git_baseline' || context.complete !== true || context.baseline_commit !== baseline ||
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(context.baseline_tree || '') || !Array.isArray(context.files) || context.files.length !== names.length) return false;
+    let bytes = 0;
+    return context.files.every((file, index) => {
+      if (!file || file.path !== names[index] || !['100644', '100755'].includes(file.mode) || file.encoding !== 'utf-8' ||
+          typeof file.content !== 'string' || file.content.includes('\0') || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(file.blob_oid || '')) return false;
+      const buffer = Buffer.from(file.content, 'utf8'); bytes += buffer.length;
+      return bytes <= LOCAL_REFERENCE_BYTES && buffer.length === file.byte_length && createHash('sha256').update(buffer).digest('hex') === file.sha256 &&
+        createHash(file.blob_oid.length === 40 ? 'sha1' : 'sha256').update(`blob ${buffer.length}\0`).update(buffer).digest('hex') === file.blob_oid;
+    });
+  } catch { return false; }
 }
 
 export function localEvidencePacket(task, required, cwd, reviewedState) {
