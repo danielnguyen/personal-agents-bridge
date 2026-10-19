@@ -2,6 +2,14 @@
 
 ## Tool list
 
+- `list_tasks({})`: list up to 50 persisted task summaries with active tasks first,
+  then most recent history. Returns task ID, backend, stored implementer/reviewer
+  states, repository ID, creation/expiry times and attention flag, plus a
+  truncation indicator. No remote refresh, session replay or new work is executed.
+  Stored states may be stale; use `get_task` to inspect and reconcile a specific
+  task before deciding whether to act. Externally launched Codex sessions are
+  not discoverable through this tool.
+
 - `list_registered_repositories({})`: read registered logical IDs, bounded GitHub
   identity, baseline and availability without host paths or network requests.
 - `register_github_repository({repository: "owner/repository"})`: after user consent,
