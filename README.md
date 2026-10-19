@@ -833,6 +833,7 @@ or production acceptance. No live registration is part of implementation validat
 | `register_github_repository` | Controller-register an eligible GitHub user-owned repository; never starts execution. |
 | `start_task` | Start a contract in a disposable workspace or allowlisted repository worktree. |
 | `get_task` | Inspect bounded progress, clarification, review and publication state. |
+| `list_tasks` | Discover up to 50 persisted task summaries (active first). Snapshots may be stale; use get_task for reconciliation. |
 | `continue_task` | Answer clarification or explicitly request further implementation. |
 | `review_task` | Freeze evidence and request independent review in a separate session. |
 | `publish_task` | Freeze a completed PASS-reviewed repository task and create a draft PR. |
