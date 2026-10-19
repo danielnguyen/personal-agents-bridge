@@ -82,8 +82,8 @@ not forward that override. Consult `tunnel-client help quickstart` for CLI detai
 
 Require `process_running`, `healthy` and `ready` before discovery. Connect the
 verified tunnel from ChatGPT developer-mode plugin settings and inspect all six
-MCP task tools plus `list_registered_repositories` and `register_github_repository`
-(eight total). Discovery should not start a task.
+MCP task tools plus `list_registered_repositories`, `register_github_repository`, and `list_tasks`
+(nine total). Discovery should not start a task.
 Use a disposable example repository for the first explicitly authorized execution.
 
 Before restart, inspect owned sessions/turns and executor processes. Do not stop

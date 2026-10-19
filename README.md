@@ -3,7 +3,7 @@
 A single-owner demonstration of **ChatGPT → MCP → Agents API → self-hosted Codex
 → sandboxed Git worktree → independent review → exact-tree draft PR publication**.
 
-ChatGPT invokes eight MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
+ChatGPT invokes nine MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
 API sessions and connects a local Codex executor. For an allowlisted repository,
 implementation happens in an isolated Git worktree backed by a task-private Git
 store. Command networking is disabled; writes are confined to the task worktree
@@ -833,6 +833,7 @@ or production acceptance. No live registration is part of implementation validat
 | `register_github_repository` | Controller-register an eligible GitHub user-owned repository; never starts execution. |
 | `start_task` | Start a contract in a disposable workspace or allowlisted repository worktree. |
 | `get_task` | Inspect bounded progress, clarification, review and publication state. |
+| `list_tasks` | Discover up to 50 persisted task summaries (active first). Snapshots may be stale; use get_task for reconciliation. |
 | `continue_task` | Answer clarification or explicitly request further implementation. |
 | `review_task` | Freeze evidence and request independent review in a separate session. |
 | `publish_task` | Freeze a completed PASS-reviewed repository task and create a draft PR. |

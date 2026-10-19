@@ -10,9 +10,11 @@ test('actual stdio MCP process initializes and returns stable task IDs', async t
   const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./stdio-server.mjs', import.meta.url)), root], env: { PATH: '/usr/bin:/bin', LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || '' }, stderr: 'pipe' });
   const client = new Client({ name: 'stdio-verifier', version: '1' });
   t.after(async () => { await client.close(); await fs.rm(root, { recursive: true, force: true }); });
-  await client.connect(transport); assert.equal((await client.listTools()).tools.length, 8);
+  await client.connect(transport); assert.equal((await client.listTools()).tools.length, 9);
   const started = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'stdio_start' } });
   assert(started.structuredContent.task_id);
   const got = await client.callTool({ name: 'get_task', arguments: { task_id: started.structuredContent.task_id } });
   assert.equal(got.structuredContent.task_id, started.structuredContent.task_id);
+  const tasks = await client.callTool({ name: 'list_tasks', arguments: {} });
+  assert.equal(tasks.structuredContent.tasks.some(x => x.task_id === started.structuredContent.task_id), true);
 });
