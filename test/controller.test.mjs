@@ -137,17 +137,23 @@ test('tunnel owner confirmation accepts 30 days, rejects longer and stale claims
     /LIVE_TUNNEL_ASSOCIATION_MISMATCH/,
   );
 });
-test('MCP advertises exactly eight tools; schema/authorization failures cannot execute', async t => {
+test('MCP advertises nine tools; schema/authorization failures cannot execute', async t => {
   const { c, api } = await setup(t); let allowed = false;
   const server = createServer(c, async () => { if (!allowed) throw Error('private'); });
   const client = new Client({ name: 'local-test', version: '1' }); const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
   t.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
+  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'list_registered_repositories', 'list_tasks', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
   assert.equal(list.tools.find(x => x.name === 'get_task').annotations.readOnlyHint, true);
+  assert.equal(list.tools.find(x => x.name === 'list_tasks').annotations.readOnlyHint, true);
   assert.equal(list.tools.find(x => x.name === 'cleanup_task').annotations.destructiveHint, true);
   const input = { name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_request' } };
   assert.equal((await client.callTool(input)).isError, true); assert.equal(api.created.length, 0);
+  assert.equal((await client.callTool({ name: 'list_tasks', arguments: {} })).isError, true);
   allowed = true; const result = await client.callTool(input); assert(result.structuredContent.task_id);
+  const discovered = await client.callTool({ name: 'list_tasks', arguments: {} });
+  assert.equal(discovered.structuredContent.tasks[0].task_id, result.structuredContent.task_id);
+  assert.equal(discovered.structuredContent.truncated, false);
+  assert.equal((await client.callTool({ name: 'list_tasks', arguments: { limit: 1000 } })).isError, true);
   assert.equal((await client.callTool({ name: 'start_task', arguments: {} })).isError, true);
 });
 test('oversized or symlink evidence fails closed without starting a reviewer', async t => {
