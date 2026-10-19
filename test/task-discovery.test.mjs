@@ -59,15 +59,15 @@ test('listTasks returns bounded stored summaries with active records first and n
 
 test('listTasks reads persisted state across controller restart without claiming runtime reconciliation', async t => {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'pab-discovery-restart-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  let after;
+  t.after(async () => { if (after) await after.close(); await fs.rm(root, { recursive: true, force: true }); });
   const stateRoot = path.join(root, 'state'), workspaceRoot = path.join(root, 'work');
   const options = { stateRoot, workspaceRoot, api: new FakeAPI(), executor: new FakeExecutor(), timeoutMs: 600000 };
   const before = await new Controller(options).init();
   const original = record(Date.now(), { execution_backend: 'local_codex', reviewer: { state: 'completed' } });
   before.save(original);
   await before.close();
-  const after = await new Controller(options).init();
-  t.after(() => after.close());
+  after = await new Controller(options).init();
   const found = await after.listTasks();
   assert.equal(found.tasks.length, 1);
   assert.equal(found.tasks[0].task_id, original.id);
