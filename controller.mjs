@@ -780,6 +780,29 @@ export class Controller {
     this.save(fresh);
     return view;
   }
+  async listTasks() {
+    if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+    // Stored summaries only: discovery must not resume, refresh or execute work.
+    const records = this.db.prepare('SELECT value FROM tasks').all()
+      .map(row => JSON.parse(row.value))
+      .sort((a, b) => Number(Boolean(a.cleaned)) - Number(Boolean(b.cleaned)) || b.created - a.created);
+    const limit = 50;
+    const tasks = records.slice(0, limit).map(t => ({
+      task_id: t.id,
+      execution_backend: t.execution_backend || 'agents_api',
+      state: t.cleaned ? 'cleaned' : t.implementer?.state || 'unknown',
+      reviewer_state: t.reviewer?.state || null,
+      repository_id: t.repository?.repository_id || null,
+      created_at: new Date(t.created).toISOString(),
+      expires_at: new Date(t.deadline).toISOString(),
+      human_attention_required: Boolean(
+        t.implementer?.local?.human_attention_required || t.reviewer?.local?.human_attention_required ||
+        ['needs_attention', 'waiting_for_approval', 'waiting_for_clarification'].includes(t.implementer?.state) ||
+        ['needs_attention', 'waiting_for_approval', 'waiting_for_clarification'].includes(t.reviewer?.state)
+      ),
+    }));
+    return { tasks, truncated: records.length > limit };
+  }
   async get(id, refresh = true) {
     let t = this.task(id);
     const result = { ...(t.review_packet_diagnostic ? { review_packet_diagnostic: t.review_packet_diagnostic } : {}), task_id: id, state: t.cleaned ? 'cleaned' : t.implementer.state, implementer: null, reviewer: null, cleanup: t.cleanup || null, expires_at: new Date(t.deadline).toISOString() };
