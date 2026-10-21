@@ -21,6 +21,9 @@ test('Agents API remains the default and explicit default selection preserves re
   c.localBackendFactory = () => { assert.fail('Default tasks must not instantiate local Codex'); };
   const first = await started(c);
   assert.equal(first.execution_backend, 'agents_api'); assert.equal(c.task(first.task_id).execution_backend, 'agents_api');
+  assert.equal(c.task(first.task_id).automatic, undefined); assert.equal(first.automatic, undefined);
+  assert.equal(c.db.prepare('SELECT fingerprint FROM operations WHERE id=?').get('request_start').fingerprint, digest({ kind: 'start', payload: contract() }));
+  assert.equal(c.automaticJobs.size, 0); assert.equal(c.automaticTimers.size, 0);
   const repeated = await c.start({ contract: contract(), request_id: 'request_start', execution_backend: 'agents_api' });
   assert.equal(repeated.task_id, first.task_id); assert.equal(api.created.length, 1);
   const legacy = c.task(first.task_id); delete legacy.execution_backend; c.save(legacy);

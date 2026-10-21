@@ -28,7 +28,7 @@ class LocalPublisher extends GitHubPublisher {
     return this.pr;
   }
 }
-async function setup(t, allowed = ['one.txt'], local = false, commands = []) {
+async function setup(t, allowed = ['one.txt'], local = false, commands = [], automaticMode) {
   const root = await fs.mkdtemp('/var/tmp/personal-agents-bridge/publication-test-');
   const normal = path.join(root, 'normal'), remote = path.join(root, 'remote.git');
   await fs.mkdir(normal); await fs.mkdir(remote);
@@ -37,23 +37,40 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = []) {
   repoGit(normal, 'add', '.'); repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   repoGit(normal, 'remote', 'add', 'origin', remote); repoGit(normal, 'push', 'origin', 'HEAD:refs/heads/main');
   const baseline = repoGit(normal, 'rev-parse', 'HEAD').trim();
-  const api = new FakeAPI(), executor = new FakeExecutor(), publisher = new LocalPublisher(remote);
+  const api = new FakeAPI(), executor = new FakeExecutor(), publisher = new LocalPublisher(remote), localCalls = [];
+  if (automaticMode?.publisher) automaticMode.publisher(publisher);
   const c = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'tasks'), api, executor, publisher, secrets: [],
     ...(local ? { localBackendFactory: options => ({
-      async run() {
+      async run(input) {
+        localCalls.push(options.reviewOnly ? 'reviewer' : 'implementer');
         const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'independent-reviewer' : 'implementer-thread', turnId: 'fixture-turn',
           turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
         options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
+        if (automaticMode) {
+          automaticMode.onOptions?.(options);
+          if (!options.reviewOnly) {
+            const item = { id: 'automatic-write', type: 'commandExecution', command: "printf 'exact\\n' > one.txt", cwd: options.cwd };
+            options.onProgress({ method: 'item/started', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'inProgress' } } });
+            await fs.writeFile(path.join(options.cwd, 'one.txt'), 'exact\n');
+            options.onProgress({ method: 'item/completed', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'completed', exitCode: 0 } } });
+            await automaticMode.implementation?.(options, identity, input);
+          } else await automaticMode.review?.(options, identity, input);
+        }
         options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
-        const findings = ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Synthetic independent reviewer assessment.' }));
+        const overall = automaticMode?.verdict || 'PASS';
+        const findings = ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: overall, evidence: 'Synthetic independent reviewer assessment.' }));
         return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: [], commands: [],
-          messages: options.reviewOnly ? [{ provenance: 'model', text: JSON.stringify({ overall: 'PASS', findings }) }] : [] };
-      }, async cancel() {}, async close() { return true; },
+          ...(!options.reviewOnly ? automaticMode?.result : {}),
+          messages: options.reviewOnly ? [{ provenance: 'model', text: automaticMode?.reviewOutput || JSON.stringify({ overall, findings }) }] : [] };
+      }, async cancel() {}, async close() { return !(automaticMode?.closeFailure === (options.reviewOnly ? 'reviewer' : 'implementer')); },
     }) } : {}) }).init();
   t.after(async () => { await c.close(); await fs.rm(root, { recursive: true, force: true }); });
   await fs.writeFile(path.join(root, 'state/repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   const contract = { goal: 'Local publication fixture', allowed_files: allowed, requirements: [{ id: 'R1', text: 'Make the exact fixture change.' }], invariants: [], test_commands: commands, initial_files: {} };
-  const started = await c.start({ request_id: 'start_publication', repository_id: 'fixture', contract, ...(local ? { execution_backend: 'local_codex' } : {}) }); await Promise.all([...c.jobs.values()]);
+  const automatic = { publish: { title: 'Automatic isolated fixture', body: 'Explicit test authorization', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 };
+  const startInput = { request_id: 'start_publication', repository_id: 'fixture', contract, ...(local ? { execution_backend: 'local_codex' } : {}), ...(automaticMode ? { automatic } : {}) };
+  automaticMode?.configure?.(c, startInput);
+  const started = await c.start(startInput); await Promise.all([...c.jobs.values()]);
   const id = started.task_id, work = path.join(c.workspaceRoot, id, 'repo');
   const review = async (verdict = 'PASS') => {
     if (local) {
@@ -68,8 +85,185 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = []) {
     assert.equal((await c.get(id)).reviewer.overall, verdict);
   };
   const input = { task_id: id, title: 'Publish isolated fixture' };
-  return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract };
+  return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls };
 }
+
+async function automaticSettled(value) {
+  await Promise.all([...value.c.automaticJobs.values()]);
+  return value.c.task(value.id);
+}
+
+test('authorized automatic task validates, independently reviews and publishes the exact tree without observation driving work', async context => {
+  const value = await setup(context, ['one.txt'], true, ['test "$(cat one.txt)" = exact'], {});
+  const task = await automaticSettled(value), { c, publisher, remote, baseline, id } = value;
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.equal(task.deadline, task.automatic.deadline);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']);
+  assert.equal(task.local_validation.results[0].status, 'passed');
+  assert.equal(task.local_validation.termination_confirmed, true);
+  assert.equal(task.reviewer.review_result.overall, 'PASS');
+  assert.notEqual(task.implementer.local.thread_id, task.reviewer.local.thread_id);
+  assert.equal(task.implementer.local.server_closed, true); assert.equal(task.reviewer.local.server_closed, true);
+  assert.equal(repoGit(remote, 'rev-parse', `${task.publication.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(repoGit(remote, 'rev-parse', 'main').trim(), baseline);
+  assert.equal(task.publication.draft, undefined);
+  assert.equal(publisher.pr.draft, true); assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1);
+  assert.equal(value.api.created.length, 0); assert.equal(value.executor.started.length, 0);
+  const before = JSON.stringify(c.db.prepare('SELECT * FROM tasks').all());
+  const views = await Promise.all([c.get(id), c.get(id), c.start(value.startInput)]);
+  assert(views.every(view => view.state === 'succeeded' && view.publication.draft));
+  assert.equal(JSON.stringify(c.db.prepare('SELECT * FROM tasks').all()), before);
+  assert.deepEqual(views[0].automatic.usage, { implementer_turn_submissions_attempted: 1, reviewer_turn_submissions_attempted: 1,
+    correction_turns: 0, token_usage: null, subscription_billing_attribution: 'unverified' });
+  assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'accepted');
+  const audit = c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value));
+  assert(audit.some(row => row.tool === 'review_task' && row.codex_thread_id === task.reviewer.local.thread_id));
+  assert(audit.some(row => row.tool === 'publish_task' && row.publication.commit_sha === task.publication.commit_sha));
+  await assert.rejects(c.review({ task_id: id, request_id: 'manual_duplicate' }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  await assert.rejects(c.publish(value.input), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  await assert.rejects(c.continue({ task_id: id, request_id: 'manual_continue' }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  await assert.rejects(c.start({ ...value.startInput, automatic: { ...value.startInput.automatic, publish: { title: 'Changed authority', draft: true } } }), /REQUEST_ID_REUSED/);
+  assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1);
+  await c.cleanup({ task_id: id });
+  assert.equal((await c.get(id)).automatic.status, 'succeeded');
+});
+
+for (const [label, commands, mode, expectedCalls] of [
+  ['failed independent test', ['exit 1'], {}, ['implementer']],
+  ['review FAIL', [], { verdict: 'FAIL' }, ['implementer', 'reviewer']],
+  ['invalid findings', [], { reviewOutput: '{"overall":"PASS","findings":[]}' }, ['implementer', 'reviewer']],
+  ['failed implementation', [], { result: { status: 'failed' } }, ['implementer']],
+  ['uncertain implementation', [], { result: { status: 'uncertain', terminalObserved: false } }, ['implementer']],
+  ['unconfirmed implementer closure', [], { closeFailure: 'implementer' }, ['implementer']],
+  ['unconfirmed reviewer closure', [], { closeFailure: 'reviewer' }, ['implementer', 'reviewer']],
+  ['execution uncertainty', [], { result: { uncertainties: ['Unknown command execution'] } }, ['implementer']],
+  ['protected path mutation', [], { implementation: async options => fs.appendFile(path.join(options.cwd, 'TASK.md'), '\nmutated') }, ['implementer']],
+  ['candidate mutation during review', [], { review: async options => fs.appendFile(path.join(options.cwd, '..', 'repo', 'one.txt'), 'changed') }, ['implementer', 'reviewer']],
+]) test(`automatic ${label} stops without publication or correction`, async context => {
+  const value = await setup(context, ['one.txt'], true, commands, mode), task = await automaticSettled(value);
+  assert(['stopped', 'uncertain'].includes(task.automatic.status), JSON.stringify(task.automatic));
+  assert(task.automatic.reason); assert.equal(task.automatic.human_attention_required, true);
+  assert.deepEqual(value.localCalls, expectedCalls);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  await value.c.get(value.id); await value.c.start(value.startInput);
+  assert.deepEqual(value.localCalls, expectedCalls);
+  assert.equal(task.deadline, task.automatic.deadline);
+});
+
+for (const method of ['item/commandExecution/requestApproval', 'item/tool/requestUserInput']) test(`automatic native ${method} stops and never supplies a human response`, async context => {
+  const value = await setup(context, ['one.txt'], true, [], { implementation: async (options, identity, input) => {
+    options.onLifecycle({ ...identity, phase: 'human_request', request: { id: 7, method,
+      params: { threadId: identity.threadId, turnId: identity.turnId, command: 'printf harmless',
+        ...(method.endsWith('requestUserInput') ? { questions: [{ id: 'choice', question: 'Which value?' }] } : {}) } } });
+    assert.equal(input.signal.aborted, true);
+  } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.automatic.reason, 'AUTOMATIC_HUMAN_ATTENTION_REQUIRED');
+  assert.equal(task.implementer.local.human_requests.length, 1); assert.equal(task.implementer.local.human_requests[0].delivery, 'not_attempted');
+  assert.deepEqual(value.localCalls, ['implementer']); assert.equal(value.publisher.pushes, 0);
+});
+
+test('concurrent manual requests cannot race automatic review and publication', async context => {
+  let release, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const value = await setup(context, ['one.txt'], true, [], { review: async () => { entered(); await new Promise(resolve => { release = resolve; }); } });
+  await ready;
+  const results = await Promise.allSettled([value.c.review({ task_id: value.id, request_id: 'competing_review' }), value.c.publish(value.input),
+    value.c.start(value.startInput), value.c.start(value.startInput)]);
+  assert(results.slice(0, 2).every(result => result.status === 'rejected' && result.reason.code === 'AUTOMATIC_TASK_OWNS_TRANSITIONS'));
+  assert(results.slice(2).every(result => result.status === 'fulfilled' && result.value.task_id === value.id));
+  release(); assert.equal((await automaticSettled(value)).automatic.status, 'succeeded');
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']); assert.equal(value.publisher.creates, 1);
+});
+
+test('uncertain GitHub publication is not replayed by observations, retries or restart', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { publisher: publisher => { publisher.losePRResponse = true; } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'uncertain'); assert.equal(task.publication.pr_attempted, true);
+  assert.equal(value.publisher.creates, 1); assert.equal(value.publisher.pushes, 1);
+  await value.c.start(value.startInput); await value.c.get(value.id);
+  await assert.rejects(value.c.publish(value.input), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  await value.c.close();
+  const restarted = await new Controller({ stateRoot: value.c.stateRoot, workspaceRoot: value.c.workspaceRoot, api: value.api,
+    publisher: value.publisher, secrets: [], localBackendFactory: () => { throw Error('REPLAY FORBIDDEN'); } }).init();
+  try {
+    assert.equal((await restarted.get(value.id)).automatic.status, 'uncertain');
+    assert.equal(restarted.automaticJobs.size, 0); assert.equal(value.publisher.creates, 1); assert.equal(value.publisher.pushes, 1);
+  } finally { await restarted.close(); }
+});
+
+test('overall deadline expires during review without renewal or publication', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { configure: (controller, input) => { input.automatic.max_duration_seconds = 1; },
+    review: async (options, identity, input) => { await new Promise(resolve => {
+      if (input.signal.aborted) resolve(); else input.signal.addEventListener('abort', resolve, { once: true });
+    }); } });
+  const task = await automaticSettled(value);
+  assert.equal(task.deadline, task.automatic.deadline); assert(task.deadline <= task.created + 1000);
+  assert.notEqual(task.automatic.status, 'succeeded'); assert.equal(task.automatic.reason, 'TASK_EXPIRED');
+  assert.equal(value.publisher.pushes, 0);
+});
+
+test('expiry after an acknowledged push cannot authorize a later draft PR', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { publisher: publisher => {
+    const push = publisher.push.bind(publisher);
+    publisher.push = async (...args) => { await push(...args); const task = value.c.task(value.id); task.deadline = Date.now() - 1; value.c.save(task); };
+  } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'uncertain'); assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 0);
+});
+
+for (const action of ['cleanup', 'close']) test(`automatic ${action} cancels an active reviewer without self-wait or publication`, { timeout: 15000 }, async context => {
+  let entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const value = await setup(context, ['one.txt'], true, [], { review: async (options, identity, input) => {
+    entered(); await new Promise(resolve => input.signal.addEventListener('abort', resolve, { once: true }));
+  } });
+  await ready;
+  if (action === 'cleanup') {
+    await value.c.cleanup({ task_id: value.id }); await automaticSettled(value);
+    assert.notEqual(value.c.task(value.id).automatic.status, 'progressing');
+    assert.equal((await fs.lstat(value.work)).isDirectory(), true);
+  } else await value.c.close();
+  assert.equal(value.c.automaticJobs.size, 0); assert.equal(value.c.localRuns.size, 0);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']);
+});
+
+test('uncertain validation termination blocks reviewer creation and publication', async context => {
+  const value = await setup(context, ['one.txt'], true, ['true'], { configure: controller => {
+    controller.localValidationFactory = () => ({ terminationConfirmed: false, async run() {}, cancel() {} });
+  } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'uncertain'); assert.equal(task.local_validation.termination_confirmed, false);
+  assert.deepEqual(value.localCalls, ['implementer']); assert.equal(value.publisher.pushes, 0);
+});
+
+test('lost push response retains intent and cannot trigger a second push or PR', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { publisher: publisher => {
+    const push = publisher.push.bind(publisher);
+    publisher.push = async (...args) => { await push(...args); throw Error('lost push acknowledgment'); };
+  } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'uncertain'); assert.equal(task.publication.push_attempted, true);
+  assert.equal(task.publication.pr_attempted, false); assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 0);
+  await value.c.start(value.startInput); await value.c.get(value.id);
+  assert.equal(value.publisher.pushes, 1);
+});
+
+test('cleanup records cancellation before waiting for an automatic publication lock', async context => {
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const value = await setup(context, ['one.txt'], true, [], { publisher: publisher => {
+    const target = publisher.target.bind(publisher);
+    publisher.target = async (...args) => { entered(); await new Promise(resolve => { release = resolve; }); return target(...args); };
+  } });
+  await ready;
+  const cleanup = value.c.cleanup({ task_id: value.id });
+  assert.equal(value.c.task(value.id).automatic.status, 'stopped');
+  release(); await cleanup; await automaticSettled(value);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  assert.equal(value.c.task(value.id).automatic.reason, 'AUTOMATIC_CANCELLED');
+});
 
 test('qualified local PASS publishes the exact tree through the existing publisher, once, without Agents API identities', async context => {
   const value = await setup(context, ['one.txt'], true, ['test "$(cat one.txt)" = exact']);
