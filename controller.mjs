@@ -26,6 +26,7 @@ const MAX_PACKET = 128 * 1024;
 const MAX_FILES = 100;
 const DEBUG_WINDOW = 30 * 86400000;
 const automaticTransition = Symbol('controller automatic transition');
+const sqliteFailure = error => String(error?.code).startsWith('ERR_SQLITE') || error?.code === 'ERR_INVALID_STATE';
 const message = text => ({ type: 'agent.session.input.message', input: [{ role: 'user', content: [{ type: 'input_text', text }] }] });
 async function settledWithin(promise, timeout = 3000) {
   let timer;
@@ -218,6 +219,7 @@ export class Controller {
     this.executor.onExit = status => this.executorExited(status);
     this.timeoutMs = timeoutMs; this.jobs = new Map(); this.streams = new Map(); this.cache = new Map(); this.locks = new Map(); this.closed = false;
     this.automaticJobs = new Map(); this.automaticTimers = new Map();
+    this.persistenceFailures = new Set(); this.pendingReviewResults = new Map();
   }
   get api() { return this._api ||= new OpenAI({ maxRetries: 0, timeout: 30000, logLevel: 'off' }).beta.agents.sessions; }
   async registerGitHubRepository(input) {
@@ -288,7 +290,15 @@ export class Controller {
     this.sweeper = setInterval(() => this.expire().catch(() => {}), 30000); this.sweeper.unref();
     return this;
   }
-  save(t) {
+  save(t, { packetText, operation } = {}) {
+    // SAVEPOINT composes with the existing human-response transaction. No await
+    // may separate these writes: acceptance, evidence and task state commit together.
+    let savepointOpen = false;
+    try {
+    if (t.automatic && this.db.isTransaction) throw new BridgeError('AUTOMATIC_EVIDENCE_TRANSACTION_UNRESOLVED');
+    this.db.exec('SAVEPOINT task_save');
+    savepointOpen = true;
+    if (packetText !== undefined) this.retainAutomaticAttempt(t, packetText);
     if (t.automatic && (t.reviewer?.review_result || t.automatic.status !== 'progressing')) this.retainAutomaticAttempt(t);
     this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?)').run(t.id, JSON.stringify(t));
     for (const row of this.db.prepare('SELECT id,value FROM audit').all()) {
@@ -306,6 +316,25 @@ export class Controller {
         this.db.prepare('UPDATE audit SET value=? WHERE id=?').run(JSON.stringify(a), row.id);
       }
     }
+    if (operation) this.opDone(operation.id, operation.status);
+    this.db.exec('RELEASE task_save');
+    savepointOpen = false;
+    } catch (error) {
+      if (savepointOpen) try { this.db.exec('ROLLBACK TO task_save; RELEASE task_save'); } catch { /* Storage may be unavailable; never infer a commit. */ }
+      if (!t.automatic) throw error;
+      this.persistenceFailures.add(t.id);
+      throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
+    }
+  }
+  persistenceAttention(id) {
+    // Best-effort attention marking is not recovery. Durable pending markers and
+    // the receipt below remain authoritative; the in-memory latch grants nothing.
+    try {
+      const task = this.task(id);
+      Object.assign(task.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true });
+      if (task.reviewer) task.reviewer.local.human_attention_required = true;
+      this.save(task);
+    } catch { /* Explicit reconciliation is still required, even if this write fails. */ }
   }
   pruneDiagnostics() {
     this.db.prepare('DELETE FROM failures WHERE expires < ?').run(Date.now());
@@ -432,7 +461,9 @@ export class Controller {
   opDone(id, status = 'accepted') { this.db.prepare('UPDATE operations SET status=? WHERE id=?').run(status, id); }
   launch(taskId, role, fn) {
     const key = `${taskId}:${role}`;
-    const job = fn().catch(e => { if (!this.closed) { const t = this.task(taskId); t[role] ||= {}; t[role].error = e instanceof BridgeError ? e.code : `REMOTE_OPERATION_FAILED${e.status ? `_${e.status}` : ''}`; t[role].state = 'needs_attention';
+    const job = fn().catch(e => { if (sqliteFailure(e)) this.persistenceFailures.add(taskId);
+      if (this.persistenceFailures.has(taskId)) { this.persistenceAttention(taskId); return; }
+      if (!this.closed) { const t = this.task(taskId); t[role] ||= {}; t[role].error = e instanceof BridgeError ? e.code : `REMOTE_OPERATION_FAILED${e.status ? `_${e.status}` : ''}`; t[role].state = 'needs_attention';
       if (t.execution_backend === 'local_codex') {
         t[role].error = this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED');
         Object.assign(t[role].local, { execution_state: t[role].local.turn_submission_attempted ? 'uncertain' : 'failed', phase: 'failed', result_received: true, human_attention_required: true,
@@ -443,6 +474,7 @@ export class Controller {
       }
       this.save(t); } }).finally(() => {
         this.jobs.delete(key);
+        if (this.persistenceFailures.has(taskId)) return;
         if (!this.closed && this.task(taskId).automatic?.status === 'stopped' && this.automaticUncertain(this.task(taskId))) this.finishAutomatic(taskId, 'uncertain', 'AUTOMATIC_EXECUTION_UNCONFIRMED');
         if (role === 'implementer' && !this.closed) this.scheduleAutomatic(taskId);
       });
@@ -464,6 +496,7 @@ export class Controller {
   }
   automaticGuard(task) {
     if (!task.automatic) return;
+    if (this.persistenceFailures.has(task.id)) throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
     if (this.closed || task.automatic.owner_instance !== this.instanceId) throw new BridgeError('AUTOMATIC_OWNER_UNAVAILABLE');
     if (task.automatic.status !== 'progressing' || task.cleaned) throw new BridgeError('AUTOMATIC_TASK_STOPPED');
     if (task.deadline !== task.automatic.deadline || Date.now() >= task.deadline) throw new BridgeError('TASK_EXPIRED');
@@ -500,8 +533,58 @@ export class Controller {
       correction_eligibility: localCorrectionEligibility(ref?.review_result, { validationQualified, executionQualified, authorityValid }) };
     // Append-only application history: never UPDATE/REPLACE/delete observations.
     // This is not physical immutability against privileged database tampering.
-    this.db.prepare('INSERT OR IGNORE INTO automatic_attempts VALUES (?,?,?,?)')
+    this.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?) ON CONFLICT(task_id,attempt_id,observation_sha256) DO NOTHING')
       .run(task.id, evidence.attempt_id, digest(evidence), JSON.stringify(evidence));
+  }
+  verifyAutomaticEvidence(task) {
+    if (this.db.isTransaction) throw new BridgeError('AUTOMATIC_EVIDENCE_TRANSACTION_UNRESOLVED');
+    const ref = task.reviewer;
+    const records = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => {
+      const value = JSON.parse(row.value);
+      if (digest(value) !== row.observation_sha256 || value.task_id !== task.id || value.attempt_id !== task.automatic.review_request_id ||
+          value.baseline_commit !== task.baseline ||
+          (value.packet_utf8 !== undefined && (digest(value.packet_utf8) !== value.review_packet?.sha256 || Buffer.byteLength(value.packet_utf8) !== value.review_packet.bytes)) ||
+          (value.review_result && digest(value.review_result) !== value.findings_sha256)) throw new BridgeError('AUTOMATIC_RETAINED_EVIDENCE_INVALID');
+      return value;
+    });
+    if (ref?.packet_hash && !records.some(record => record.packet_utf8 !== undefined && record.review_packet.sha256 === ref.packet_hash)) throw new BridgeError('AUTOMATIC_PACKET_NOT_RETAINED');
+    if (ref?.pending_review_result || ['pending', 'awaiting_receipt'].includes(ref?.evidence_retention?.review)) throw new BridgeError(
+      ref.pending_review_result ? 'AUTOMATIC_REVIEW_RETENTION_UNRESOLVED' : 'AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED');
+    if (ref?.findings_sha256 && !records.some(record => record.review_result && record.findings_sha256 === ref.findings_sha256 &&
+        record.review_result.packet_hash === ref.packet_hash)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
+    if (!records.some(record => record.kind === 'outcome' && record.outcome === task.automatic.status && record.stop_reason === task.automatic.reason)) throw new BridgeError('AUTOMATIC_OUTCOME_NOT_RETAINED');
+    if (ref?.evidence_retention?.packet === 'pending' || this.persistenceFailures.has(task.id)) throw new BridgeError('AUTOMATIC_EVIDENCE_RECONCILIATION_REQUIRED');
+  }
+  async reconcileAutomaticEvidence(id) {
+    let task = this.task(id), ref = task.reviewer;
+    if (!task.automatic || task.workspace_deleted) return;
+    // Only explicit non-destructive cleanup calls this. It never resumes a model,
+    // validation or publication and cannot extend authority or restore progression.
+    if (task.automatic.status === 'progressing') throw new BridgeError('AUTOMATIC_TASK_STILL_ACTIVE');
+    const pending = ref?.pending_review_result || this.pendingReviewResults.get(id);
+    if (pending) {
+      if (digest(pending.result) !== pending.sha256 || pending.result.packet_hash !== ref.packet_hash ||
+          pending.result.thread_id !== ref.local.thread_id || pending.result.turn_id !== ref.local.turn_id ||
+          JSON.stringify(pending.result.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+      ref.pending_review_result = pending; ref.evidence_retention.review = 'pending';
+      this.save(task); // Any memory-only receipt must first become durable.
+    }
+    if (ref?.packet_hash) {
+      await this.verifyLocalReviewPacket(task);
+      task = this.task(id); ref = task.reviewer;
+      const packetText = await fs.readFile(path.join(this.workspaceRoot, id, ref.packet_directory, 'evidence.json'), 'utf8');
+      if (pending) {
+        ref.review_result = pending.result; ref.findings_sha256 = pending.sha256;
+        delete ref.pending_review_result; ref.evidence_retention.review = 'retained';
+      }
+      if (ref.evidence_retention) ref.evidence_retention.packet = 'retained';
+      this.save(task, { packetText, ...(pending ? { operation: { id: ref.request_id, status: 'uncertain' } } : {}) });
+    } else this.save(task);
+    // A successful write is insufficient: reread/hash the committed records.
+    this.persistenceFailures.delete(id);
+    try { this.verifyAutomaticEvidence(this.task(id)); }
+    catch (error) { this.persistenceFailures.add(id); throw error; }
+    this.pendingReviewResults.delete(id);
   }
   finishAutomatic(id, status, reason) {
     if (this.dbClosed) return;
@@ -521,10 +604,13 @@ export class Controller {
   scheduleAutomatic(id) {
     if (this.closed || this.automaticJobs.has(id) || this.task(id).automatic?.status !== 'progressing') return;
     const job = Promise.resolve().then(() => this.runAutomatic(id)).catch(error => {
+      if (sqliteFailure(error)) this.persistenceFailures.add(id);
+      if (this.persistenceFailures.has(id)) { this.persistenceAttention(id); return; }
       if (!this.dbClosed) {
         const task = this.task(id), uncertain = this.automaticUncertain(task);
         this.opDone(task.automatic.publish_request_id, uncertain ? 'uncertain' : 'failed');
-        this.finishAutomatic(id, uncertain ? 'uncertain' : 'stopped', error instanceof BridgeError ? error.code : 'AUTOMATIC_OPERATION_UNCONFIRMED');
+        try { this.finishAutomatic(id, uncertain ? 'uncertain' : 'stopped', error instanceof BridgeError ? error.code : 'AUTOMATIC_OPERATION_UNCONFIRMED'); }
+        catch (failure) { if (!this.persistenceFailures.has(id)) throw failure; this.persistenceAttention(id); }
       }
     }).finally(() => this.automaticJobs.delete(id));
     this.automaticJobs.set(id, job);
@@ -597,7 +683,10 @@ export class Controller {
     if (automatic) {
       const timer = setTimeout(() => {
         this.finishAutomatic(id, this.automaticUncertain(this.task(id)) ? 'uncertain' : 'stopped', 'TASK_EXPIRED');
-        this.cleanup({ task_id: id }).catch(() => this.finishAutomatic(id, 'uncertain', 'AUTOMATIC_EXPIRY_CLEANUP_UNCONFIRMED'));
+        this.cleanup({ task_id: id }, automaticTransition).catch(() => {
+          try { this.finishAutomatic(id, 'uncertain', 'AUTOMATIC_EXPIRY_CLEANUP_UNCONFIRMED'); }
+          catch { this.persistenceAttention(id); }
+        });
       }, Math.max(1, t.deadline - Date.now()));
       timer.unref(); this.automaticTimers.set(id, timer);
     }
@@ -963,6 +1052,9 @@ export class Controller {
         usage: { implementer_turn_submissions_attempted: Number(t.implementer.local.turn_submission_attempted),
           reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns: 0,
           token_usage: null, subscription_billing_attribution: 'unverified' } };
+      if (t.reviewer?.evidence_retention) result.automatic.evidence_retention = { ...t.reviewer.evidence_retention,
+        reconciliation_required: this.persistenceFailures.has(id) || !!t.reviewer.pending_review_result ||
+          t.reviewer.evidence_retention.packet === 'pending' || t.reviewer.evidence_retention.review === 'awaiting_receipt' };
       const retained = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(id);
       if (retained) {
         const observation = JSON.parse(retained.value);
@@ -1487,6 +1579,10 @@ export class Controller {
       const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
       if (!independentValidationPassed(task.local_validation, contract.test_commands, task.reviewer.reviewed_git_state, id)) throw new BridgeError('AUTOMATIC_VALIDATION_FAILED');
     }
+    if (task.automatic) {
+      task.reviewer.evidence_retention = { packet: 'pending', review: 'not_started' };
+      this.save(task); // Intent must survive failure to bind a newly written packet.
+    }
     const packet = await this.packet(task);
     if (this.closed || this.task(id).reviewer.stopping) return;
     task = this.task(id);
@@ -1495,7 +1591,10 @@ export class Controller {
     Object.assign(task.reviewer, { packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory) });
     task.reviewer.local.phase = 'snapshot'; this.save(task);
     await this.verifyLocalReviewPacket(task);
-    if (task.automatic) this.retainAutomaticAttempt(task, await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
+    if (task.automatic) {
+      task.reviewer.evidence_retention.packet = 'retained';
+      this.save(task, { packetText: await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8') });
+    }
     if (this.closed || this.task(id).reviewer.stopping) return;
     const key = `${id}:reviewer`, abort = new AbortController();
     const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.executionTimeout(this.task(id)),
@@ -1521,7 +1620,9 @@ export class Controller {
         }
       } });
     this.localRuns.set(key, { backend, abort });
-    task = this.task(id); Object.assign(task.reviewer.local, { instance_started: true, owner_instance: this.instanceId }); this.save(task);
+    task = this.task(id); Object.assign(task.reviewer.local, { instance_started: true, owner_instance: this.instanceId });
+    if (task.automatic) task.reviewer.evidence_retention.review = 'awaiting_receipt';
+    this.save(task);
     let result;
     try {
       result = await backend.run({ prompt: localReviewerInstructions, allowedFiles: [], signal: abort.signal });
@@ -1557,12 +1658,31 @@ export class Controller {
       task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
       task.reviewer.state = 'completed'; task.reviewer.local.phase = 'finished';
     } catch (error) {
+      if (task.automatic && (this.persistenceFailures.has(id) || sqliteFailure(error))) {
+        this.persistenceFailures.add(id);
+        throw error; // Preserve awaiting_receipt; storage failure is not an invalid review.
+      }
       task = this.task(id); task.reviewer.state = 'needs_attention'; task.reviewer.review_result = null;
       task.reviewer.error ||= this.bounded(error.code || 'INVALID_LOCAL_REVIEW_OUTPUT', 128);
       task.reviewer.local.human_attention_required = true;
       task.reviewer.local.diagnostics.push(task.reviewer.error);
+      if (task.automatic) task.reviewer.evidence_retention.review = 'invalid';
     }
-    this.opDone(task.reviewer.request_id, task.reviewer.review_result ? 'accepted' : 'uncertain'); this.save(task);
+    if (task.automatic && task.reviewer.review_result) {
+      // Receive the qualified result in the existing task ledger before attempting
+      // the history/state transition. A failed history insert cannot erase it.
+      const receipt = { result: task.reviewer.review_result, sha256: task.reviewer.findings_sha256 };
+      this.pendingReviewResults.set(id, receipt);
+      task.reviewer.pending_review_result = receipt;
+      task.reviewer.review_result = null; task.reviewer.state = 'finishing';
+      task.reviewer.evidence_retention.review = 'pending';
+      this.save(task);
+      task.reviewer.review_result = receipt.result; task.reviewer.state = 'completed';
+      delete task.reviewer.pending_review_result;
+      task.reviewer.evidence_retention.review = 'retained';
+    }
+    this.save(task, { operation: { id: task.reviewer.request_id, status: task.reviewer.review_result ? 'accepted' : 'uncertain' } });
+    this.pendingReviewResults.delete(id);
   }
   async qualifyLocalPublication(task) {
     if (!task.reviewer || task.reviewer.stale || task.reviewer.state !== 'completed' || task.reviewer.review_result?.overall !== 'PASS') throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
@@ -1648,10 +1768,11 @@ export class Controller {
       }
     });
   }
-  async cleanup({ task_id: id, delete_workspace = false }) {
+  async cleanup({ task_id: id, delete_workspace = false }, owner) {
+    try {
     if (this.task(id).automatic?.status === 'progressing') this.finishAutomatic(id, 'stopped', 'AUTOMATIC_CANCELLED');
-    return this.locked(id, async () => {
-      if (this.task(id).execution_backend === 'local_codex') return this.cleanupLocal(id, delete_workspace);
+    return await this.locked(id, async () => {
+      if (this.task(id).execution_backend === 'local_codex') return this.cleanupLocal(id, delete_workspace, owner !== automaticTransition);
       // Provisioning is bounded. Wait before collecting all owned resources.
       await Promise.allSettled(['implementer', 'reviewer'].map(role => this.jobs.get(`${id}:${role}`)).filter(Boolean));
       for (const role of ['implementer', 'reviewer']) {
@@ -1732,8 +1853,35 @@ export class Controller {
       this.save(t);
       return this.get(id, false);
     });
+    } catch (error) {
+      if (!this.persistenceFailures.has(id) && !sqliteFailure(error)) throw error;
+      this.persistenceFailures.add(id);
+      // Stopping owned executors must not depend on SQLite availability. Never
+      // proceed to deletion or claim a durable cleanup outcome from this fallback.
+      await this.stopLocalWithoutStorage(id);
+      throw new BridgeError('EVIDENCE_STORAGE_UNAVAILABLE_CLEANUP_UNCONFIRMED');
+    }
+  }
+  async stopLocalWithoutStorage(id) {
+    this.validationRuns.get(id)?.cancel();
+    await Promise.allSettled([id, `${id}:reviewer`].map(async key => {
+      const owned = this.localRuns.get(key); if (!owned) return;
+      owned.abort.abort();
+      await settledWithin(Promise.resolve().then(() => owned.backend.cancel()));
+      const closed = await settledWithin(Promise.resolve().then(() => owned.backend.close()));
+      if (closed.ok && closed.value === true) this.localRuns.delete(key);
+    }));
   }
   async stopLocal(id, role = 'implementer') {
+    try { return await this.stopLocalState(id, role); }
+    catch (error) {
+      if (!this.persistenceFailures.has(id) && !sqliteFailure(error)) throw error;
+      this.persistenceFailures.add(id);
+      await this.stopLocalWithoutStorage(id);
+      throw error;
+    }
+  }
+  async stopLocalState(id, role = 'implementer') {
     let task = this.task(id); task[role].stopping = true;
     if (role === 'implementer') this.invalidateLocalRequests(task, 'LOCAL_CALLBACK_CANCELLED');
     this.save(task);
@@ -1770,7 +1918,7 @@ export class Controller {
     this.save(task);
     return { server_closed: local.server_closed, job_settled: job.ok, cancellation_confirmed: cancellationConfirmed, diagnostics: [...diagnostics] };
   }
-  async cleanupLocal(id, deleteWorkspace) {
+  async cleanupLocal(id, deleteWorkspace, reconcile = true) {
     if (this.task(id).automatic?.status === 'progressing') this.finishAutomatic(id, 'stopped', 'AUTOMATIC_CANCELLED');
     const stopped = await this.stopLocal(id), diagnostics = new Set(stopped.diagnostics);
     if (this.task(id).reviewer) {
@@ -1779,6 +1927,12 @@ export class Controller {
       for (const diagnostic of reviewer.diagnostics) diagnostics.add(`REVIEWER_${diagnostic}`);
     }
     let task = this.task(id); const workspace = path.join(this.workspaceRoot, id);
+    if (task.automatic && reconcile && !deleteWorkspace && (this.persistenceFailures.has(id) || task.reviewer?.pending_review_result ||
+        task.reviewer?.evidence_retention?.packet === 'pending' || task.reviewer?.evidence_retention?.review === 'awaiting_receipt')) {
+      try { await this.reconcileAutomaticEvidence(id); }
+      catch (error) { diagnostics.add(error instanceof BridgeError ? error.code : 'AUTOMATIC_EVIDENCE_RECONCILIATION_UNCONFIRMED'); }
+      task = this.task(id);
+    }
     task.cleaned = stopped.server_closed && stopped.job_settled && stopped.cancellation_confirmed;
     task.cleanup = { execution_backend: 'local_codex', executor_stopped: stopped.server_closed && stopped.job_settled && (!task.local_validation || task.local_validation.termination_confirmed === true),
       validation_termination_confirmed: task.local_validation?.termination_confirmed ?? null,
@@ -1792,6 +1946,18 @@ export class Controller {
       if (task.cleaned) {
         try {
           try { await this.repositoryEvidence(id); } catch { diagnostics.add('REPOSITORY_EVIDENCE_UNAVAILABLE'); }
+          if (task.automatic) {
+            try {
+              this.verifyAutomaticEvidence(this.task(id));
+              if (task.reviewer?.packet_hash) await this.verifyLocalReviewPacket(this.task(id));
+              // Verification above may sample repository evidence; require a final
+              // committed ledger read immediately before destructive operations.
+              this.verifyAutomaticEvidence(this.task(id));
+            } catch (error) {
+              diagnostics.add(error instanceof BridgeError ? error.code : 'AUTOMATIC_EVIDENCE_RETENTION_UNCONFIRMED');
+              throw new BridgeError('WORKSPACE_DELETE_BLOCKED_EVIDENCE_UNRESOLVED');
+            }
+          }
           await removeTaskWorktree(workspace, task.repository);
           await fs.rm(workspace, { recursive: true, force: true });
         } catch { diagnostics.add('WORKSPACE_DELETE_FAILED'); }
@@ -1812,11 +1978,12 @@ export class Controller {
     if (this.closed) return;
     this.pruneDiagnostics();
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
-      const t = JSON.parse(row.value); if (!t.cleaned && Date.now() > t.deadline) await this.cleanup({ task_id: t.id });
+      const t = JSON.parse(row.value); if (!t.cleaned && Date.now() > t.deadline) await this.cleanup({ task_id: t.id }, automaticTransition);
     }
   }
   async close() {
     if (this.dbClosed) return;
+    try {
     clearInterval(this.sweeper); this.closed = true;
     for (const timer of this.automaticTimers.values()) clearTimeout(timer);
     this.automaticTimers.clear();
@@ -1835,5 +2002,8 @@ export class Controller {
     await Promise.allSettled([...this.registrationInvocations]);
     if (this.registration.terminationUncertain) throw new BridgeError('REGISTRATION_TERMINATION_UNCERTAIN');
     this.dbClosed = true; this.db.close();
+    } finally {
+      await Promise.allSettled([...new Set([...this.localRuns.keys()].map(key => key.split(':')[0]))].map(id => this.stopLocalWithoutStorage(id)));
+    }
   }
 }
