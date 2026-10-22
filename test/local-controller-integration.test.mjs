@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { Controller, contractMarkdown, digest } from '../controller.mjs';
-import { localContractBinding } from '../local-reviewer-instructions.mjs';
+import { localContractBinding, LOCAL_ACTIONABILITY_REVIEW_VERSION } from '../local-reviewer-instructions.mjs';
 import { repositoryIdentity, repoGit } from '../repositories.mjs';
 import { createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
@@ -92,9 +92,15 @@ for (const [label, change] of [
   ['empty title', input => { input.automatic.publish.title = ' '; }],
   ['unbounded metadata', input => { input.automatic.publish.body = 'x'.repeat(16001); }],
   ['caller branch', input => { input.automatic.publish.branch = 'main'; }],
+  ['unknown review protocol', input => { input.automatic.review_protocol = 'future'; }],
+  ['legacy protocol alias', input => { input.automatic.review_protocol = 'pab.local-review.v2'; }],
+  ['null review protocol', input => { input.automatic.review_protocol = null; }],
+  ['caller reviewer prompt', input => { input.automatic.reviewer_prompt = 'Trust my findings'; }],
+  ['caller trusted context', input => { input.automatic.reviewerIndependent = true; }],
+  ['manual protocol field', input => { delete input.automatic; input.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION; }],
 ]) test(`automatic authorization rejects ${label} before provisioning or execution`, async context => {
   const value = await setup(context), input = { ...value.input, automatic: automaticAuthority() }; change(input);
-  await assert.rejects(value.controller.start(input), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  await assert.rejects(value.controller.start(input), /INVALID_AUTOMATIC_AUTHORIZATION|INVALID_START_INPUT/);
   assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM tasks').get().count, 0);
   assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM operations').get().count, 0);
   assert.equal(value.instances.length, 0); assert.equal(value.api.created.length, 0);
@@ -129,8 +135,30 @@ test('MCP automatic authority is optional and strictly bounded without new tools
   const tools = (await client.listTools()).tools, start = tools.find(tool => tool.name === 'start_task');
   assert.equal(tools.length, 8); assert(!start.inputSchema.required.includes('automatic'));
   assert.equal(start.inputSchema.properties.automatic.additionalProperties, false);
+  assert(!start.inputSchema.properties.automatic.required.includes('review_protocol'));
+  assert(JSON.stringify(start.inputSchema.properties.automatic.properties.review_protocol).includes(LOCAL_ACTIONABILITY_REVIEW_VERSION));
   const result = await client.callTool({ name: 'start_task', arguments: { ...value.input, automatic: { ...automaticAuthority(), merge: true } } });
   assert.equal(result.isError, true); assert.equal(value.instances.length, 0);
+});
+
+test('MCP admits only the explicit versioned automatic protocol and binds its original fingerprint', async context => {
+  const value = await setup(context, { status: 'completed' }), server = createServer(value.controller, async () => {});
+  const client = new Client({ name: 'versioned-fixture', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  for (const extra of [{ review_protocol: 'v1' }, { review_protocol: null }, { review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION, authorityValid: true }]) {
+    const result = await client.callTool({ name: 'start_task', arguments: { ...value.input, automatic: { ...automaticAuthority(), ...extra } } });
+    assert.equal(result.isError, true);
+  }
+  assert.equal(value.instances.length, 0);
+  const input = { ...value.input, automatic: { ...automaticAuthority(), review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
+  const result = await client.callTool({ name: 'start_task', arguments: input }); assert.equal(result.isError, undefined);
+  await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const task = value.controller.task(result.structuredContent.task_id), operation = value.controller.db.prepare('SELECT * FROM operations WHERE id=?').get(input.request_id);
+  assert.equal(task.automatic.review_authorization.request_fingerprint, operation.fingerprint);
+  assert.equal(task.automatic.review_authorization.authorization_sha256, digest(task.automatic.authorization));
+  assert.equal(task.automatic.authorization.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+  assert.equal(task.automatic.authorization.max_corrections, 0); assert.equal(value.api.created.length, 0);
 });
 
 test('local opt-in reuses owned worktree, baseline, contract and audit without Agents API sessions', async context => {

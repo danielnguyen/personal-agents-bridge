@@ -9,6 +9,7 @@ import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { repoGit, repositoryIdentity } from '../repositories.mjs';
+import { LOCAL_ACTIONABILITY_REVIEW_VERSION, localReviewerInstructions, localActionabilityReviewerInstructions } from '../local-reviewer-instructions.mjs';
 
 async function setup(t) {
   const root = await fs.mkdtemp('/var/tmp/personal-agents-bridge/unit-');
@@ -23,18 +24,19 @@ const attemptRows = (c, id) => c.db.prepare('SELECT * FROM automatic_attempts WH
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
   let active;
-  const reviewerActive = new Promise(resolve => active = resolve), stops = [];
+  const reviewerActive = new Promise(resolve => active = resolve), stops = [], prompts = [], publisherCalls = [];
   await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
   repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
-  c.publisher = { async target() { throw Error('Publication forbidden for failed review'); } };
+  c.publisher = { async target() { publisherCalls.push('target'); throw Error('Publication forbidden for failed review'); } };
   c.localBackendFactory = options => {
     let stopped;
     const wait = new Promise(resolve => stopped = resolve);
     return {
-    async run() {
+    async run(input) {
       calls.push(options.reviewOnly ? 'reviewer' : 'implementer');
+      if (options.reviewOnly) prompts.push(input.prompt);
       const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : 'implement-thread', turnId: 'fixture-turn',
         turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
       options.onLifecycle({ ...identity, terminalObserved: false, phase: 'turn_acknowledged' });
@@ -46,20 +48,26 @@ async function automaticAttempt(t, mode = {}) {
       options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
       const findings = ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: id === 'R1' ? 'FAIL' : 'PASS',
         evidence: id === 'R1' ? 'greeting.txt contains candidate; replace it with the required greeting.' : 'Synthetic complete evidence assessment.' }));
+      const output = mode.versioned ? { format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall: 'FAIL', findings: findings.map(finding => ({ ...finding,
+        classification: finding.status === 'PASS' ? null : mode.cause && mode.cause !== 'implementation_defect' ? { kind: mode.cause } :
+          { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: mode.remedy || 'Replace the incorrect greeting.', requires_human_approval: !!mode.humanApproval } } })) } : { overall: 'FAIL', findings };
+      if (options.reviewOnly) { mode.output?.(output); await mode.beforeResult?.(c, options); }
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
-        messages: options.reviewOnly ? [{ provenance: 'model', text: mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify({ overall: 'FAIL', findings }) }] : [] };
+        ...(options.reviewOnly ? mode.result : {}),
+        messages: options.reviewOnly ? [{ provenance: 'model', text: mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output) }] : [] };
     }, async close() { if (options.reviewOnly && mode.activeReviewer) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return true; },
     async cancel() { if (options.reviewOnly && mode.activeReviewer) { stops.push('cancel'); return mode.cancelResult ?? true; } },
   }; };
   if (mode.validationFailure) c.localValidationFactory = () => ({ terminationConfirmed: true, async run() { throw Error('Synthetic validator failure'); }, cancel() {} });
   const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
     automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
+  if (mode.versioned) input.automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
   if (mode.validationFailure) input.contract.test_commands = ['true'];
-  mode.configure?.(c);
+  mode.configure?.(c, input);
   const result = await c.start(input);
   if (mode.activeReviewer) await reviewerActive;
   else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]); }
-  return { ...value, id: result.task_id, calls, stops, input, normal };
+  return { ...value, id: result.task_id, calls, stops, input, normal, prompts, publisherCalls };
 }
 
 function sqliteAbort(c, table, predicate, event = 'INSERT') {
@@ -76,6 +84,139 @@ async function restartEvidenceController(t, value) {
     executor: value.executor, secrets: ['test-sensitive-value'], localBackendFactory: () => assert.fail('Model replay forbidden') }).init();
   t.after(() => c.close()); return c;
 }
+
+test('versioned automatic FAIL retains authenticated actionability without correction or publication', async t => {
+  const value = await automaticAttempt(t, { versioned: true, remedy: 'Do not execute this remedy: /private/work/secret --run-model' });
+  const { c, id, calls, input, prompts, publisherCalls } = value, task = c.task(id), result = task.reviewer.review_result;
+  assert.deepEqual(prompts, [localActionabilityReviewerInstructions]);
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.automatic.reason, 'PUBLICATION_REQUIRES_PASS_REVIEW');
+  assert.equal(result.validation_contract, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+  assert.deepEqual(result.controller_context, { reviewerIndependent: true, executionQualified: true, authorityValid: true, uncertaintyFree: true });
+  assert.equal(result.actionability_qualification.potentially_correctable, true); assert.equal(result.actionability_qualification.execution_authorized, false);
+  assert.equal(result.controller_binding.task_id, id); assert.equal(result.controller_binding.baseline_commit, task.baseline);
+  assert.equal(result.controller_binding.contract_sha256, digest(input.contract)); assert.equal(result.controller_binding.deadline, task.deadline);
+  assert.equal(result.controller_binding.packet_sha256, task.reviewer.packet_hash);
+  assert.deepEqual(result.controller_binding.reviewed_git_state, task.reviewer.reviewed_git_state);
+  assert.equal(result.controller_binding.reviewer.thread_id, task.reviewer.local.thread_id);
+  assert.equal(result.controller_binding.reviewer.turn_id, task.reviewer.local.turn_id);
+  const rows = attemptRows(c, id), retained = rows.map(row => JSON.parse(row.value));
+  assert(retained.some(row => row.findings_sha256 === digest(result) && row.review_protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION));
+  assert(retained.every(row => row.correction_eligibility.eligible === false));
+  const before = JSON.stringify(c.db.prepare('SELECT * FROM tasks').all());
+  for (const view of [await c.get(id), await c.get(id), await c.start(input)]) {
+    assert.equal(view.automatic.review.state, 'potentially_correctable_fail'); assert.equal(view.automatic.review.potentially_correctable, true);
+    assert.equal(view.automatic.review.execution_authorized, false); assert.equal(view.automatic.usage.correction_turns, 0);
+    assert.equal(view.reviewer.review_result, null); assert.equal(view.reviewer.findings, undefined);
+    assert(!JSON.stringify(view).includes('/private/work/secret')); assert(!JSON.stringify(view).includes('--run-model'));
+    assert.deepEqual(view.automatic.limits, c.automaticAuthorization(input));
+  }
+  assert.equal(JSON.stringify(c.db.prepare('SELECT * FROM tasks').all()), before); assert.deepEqual(attemptRows(c, id), rows);
+  await assert.rejects(c.start({ ...input, automatic: { ...input.automatic, review_protocol: undefined } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  const legacy = structuredClone(input); delete legacy.automatic.review_protocol;
+  await assert.rejects(c.start(legacy), /REQUEST_ID_REUSED/);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []); assert.equal(value.api.created.length, 0);
+  assert.equal(task.deadline, task.automatic.deadline); assert.equal(task.automatic.authorization.max_codex_turns, 2); assert.equal(task.automatic.authorization.max_corrections, 0);
+});
+
+for (const mode of [{ cause: 'missing_evidence' }, { cause: 'unknown_cause' }, { cause: 'human_decision_required' },
+  { cause: 'scope_or_security_failure' }, { humanApproval: true }]) test(`versioned automatic non-correctable FAIL: ${mode.cause || 'human approval'}`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, ...mode });
+  const task = c.task(id), view = await c.get(id);
+  assert.equal(task.reviewer.review_result.overall, 'FAIL'); assert.equal(task.reviewer.review_result.actionability_qualification.potentially_correctable, false);
+  assert.equal(view.automatic.review.state, 'non_correctable_fail'); assert.equal(view.automatic.review.execution_authorized, false);
+  assert.equal(view.automatic.usage.correction_turns, 0); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const gate of ['SCOPE', 'TEST_EVIDENCE']) test(`versioned reviewer ${gate} FAIL remains non-correctable in the Controller`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, output(raw) {
+    const finding = raw.findings.find(item => item.id === gate); finding.status = 'FAIL';
+    finding.classification = { kind: gate === 'SCOPE' ? 'scope_or_security_failure' : 'missing_evidence' };
+  } });
+  const task = c.task(id); assert.equal(task.reviewer.review_result.actionability_qualification.potentially_correctable, false);
+  assert.equal((await c.get(id)).automatic.review.state, 'non_correctable_fail');
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const conflict of ['validation', 'publication']) test(`versioned Controller derives uncertainty from ${conflict} evidence`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, beforeResult(controller) {
+    const task = JSON.parse(controller.db.prepare('SELECT value FROM tasks').get().value);
+    if (conflict === 'validation') task.local_validation.status = 'unavailable';
+    else task.publication_error = 'PUBLICATION_OUTCOME_UNCONFIRMED';
+    controller.save(task);
+  } });
+  const result = c.task(id).reviewer.review_result;
+  assert.equal(result.controller_context.uncertaintyFree, false); assert.equal(result.actionability_qualification.potentially_correctable, false);
+  assert.equal((await c.get(id)).automatic.review.execution_authorized, false);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const [label, mode] of [
+  ['wrong version', { output: raw => raw.format = 'pab.local-review.actionability.v999' }],
+  ['missing version', { output: raw => delete raw.format }],
+  ['model context injection', { output: raw => raw.reviewerIndependent = true }],
+  ['reviewer uncertainty', { uncertain: true }],
+  ['thread conflict', { result: { threadId: 'different-review-thread' } }],
+  ['turn conflict', { result: { turnId: 'different-review-turn' } }],
+  ['packet conflict', { beforeResult: async (_c, options) => { const file = path.join(options.cwd, 'evidence.json'); await fs.chmod(file, 0o600); await fs.appendFile(file, 'changed'); } }],
+  ['candidate conflict', { beforeResult: async (_c, options) => fs.appendFile(path.join(options.cwd, '..', 'repo', 'greeting.txt'), 'changed') }],
+]) test(`versioned automatic ${label} fails closed without replay`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, ...mode }), task = c.task(id);
+  assert.equal(task.reviewer.review_result, null); assert(['stopped', 'uncertain'].includes(task.automatic.status));
+  const view = await c.get(id); assert.equal(view.automatic.review.state, 'malformed_or_uncertain');
+  assert.equal(view.automatic.review.potentially_correctable, false); assert.equal(view.automatic.review.execution_authorized, false);
+  assert.equal(view.automatic.usage.correction_turns, 0); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('legacy automatic dispatch cannot be switched by a versioned model result', async t => {
+  const { c, id, prompts, calls } = await automaticAttempt(t, { versioned: true, configure: (_c, input) => delete input.automatic.review_protocol });
+  assert.deepEqual(prompts, [localReviewerInstructions]); assert.equal(c.task(id).reviewer.review_result, null);
+  assert.equal((await c.get(id)).automatic.review.protocol, 'pab.local-review.v2'); assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
+test('versioned automatic expiry derives invalid authority without extending its deadline', async t => {
+  let now;
+  const value = await automaticAttempt(t, { versioned: true, beforeResult(c) {
+    const task = JSON.parse(c.db.prepare('SELECT value FROM tasks').get().value);
+    now = t.mock.method(Date, 'now', () => task.deadline + 1);
+  } });
+  try {
+    const { c, id, calls, publisherCalls } = value, task = c.task(id), result = task.reviewer.review_result;
+    assert.equal(result.controller_context.authorityValid, false); assert.equal(result.actionability_qualification.potentially_correctable, false);
+    assert.equal(task.automatic.reason, 'TASK_EXPIRED'); assert.equal(task.deadline, task.automatic.review_authorization.deadline);
+    assert.equal((await c.get(id)).automatic.review.potentially_correctable, false);
+    assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  } finally { now?.mock.restore(); }
+});
+
+for (const boundary of ['packet', 'review', 'receipt']) test(`versioned SQLite ${boundary} failure preserves evidence and reconciles without model replay`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, configure(c) {
+    if (boundary === 'receipt') sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.reviewer.pending_review_result.sha256') IS NOT NULL");
+    else sqliteAbort(c, 'automatic_attempts', `json_extract(NEW.value,'$.kind')='${boundary === 'packet' ? 'review_packet' : 'review_result'}'`);
+  } });
+  const { c, id, calls, publisherCalls } = value, task = c.task(id), receipt = task.reviewer.pending_review_result || c.pendingReviewResults.get(id);
+  const packet = await fs.readFile(path.join(c.workspaceRoot, id, task.reviewer.packet_directory, 'evidence.json'), 'utf8');
+  if (boundary !== 'packet') { assert(receipt); assert.equal(receipt.result.validation_contract, LOCAL_ACTIONABILITY_REVIEW_VERSION); assert.equal(receipt.sha256, digest(receipt.result)); }
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  await c.cleanup({ task_id: id, delete_workspace: false });
+  const records = attemptRows(c, id).map(row => JSON.parse(row.value));
+  assert(records.some(record => record.packet_utf8 === packet));
+  if (receipt) assert(records.some(record => record.findings_sha256 === receipt.sha256 && digest(record.review_result) === receipt.sha256));
+  assert.equal((await c.get(id)).automatic.review.potentially_correctable, false);
+  const recovered = await restartEvidenceController(t, value);
+  assert.equal((await recovered.get(id)).automatic.review.execution_authorized, false);
+  assert.deepEqual(calls, boundary === 'packet' ? ['implementer'] : ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('versioned protocol is frozen after admission and restart never grants replay authority', async t => {
+  const value = await automaticAttempt(t, { versioned: true }), { c, id, calls } = value;
+  const changed = c.task(id); delete changed.automatic.authorization.review_protocol;
+  assert.throws(() => c.save(changed), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(c.task(id).automatic.authorization.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+  const recovered = await restartEvidenceController(t, value);
+  assert.equal(recovered.task(id).reviewer.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+  const view = await recovered.get(id); assert.equal(view.automatic.review.potentially_correctable, false); assert.equal(view.automatic.review.execution_authorized, false);
+  await recovered.start(value.input); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.equal(view.automatic.usage.correction_turns, 0);
+});
 
 for (const boundary of ['rollback', 'release']) for (const failure of ['deny', 'throw']) test(`SQLite ${boundary} ${failure} blocks authority across the entire connection`, async t => {
   const value = await setup(t), { c, api, executor } = value;

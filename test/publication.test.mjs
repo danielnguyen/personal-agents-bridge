@@ -10,7 +10,8 @@ import { FakeAPI, FakeExecutor } from './helpers.mjs';
 import { createServer } from '../server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { validateLocalReview, localScopeQualification, localContractBinding } from '../local-reviewer-instructions.mjs';
+import { validateLocalReview, localScopeQualification, localContractBinding, LOCAL_ACTIONABILITY_REVIEW_VERSION,
+  localActionabilityReviewerInstructions } from '../local-reviewer-instructions.mjs';
 import { createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 class LocalPublisher extends GitHubPublisher {
@@ -37,12 +38,13 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   repoGit(normal, 'add', '.'); repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   repoGit(normal, 'remote', 'add', 'origin', remote); repoGit(normal, 'push', 'origin', 'HEAD:refs/heads/main');
   const baseline = repoGit(normal, 'rev-parse', 'HEAD').trim();
-  const api = new FakeAPI(), executor = new FakeExecutor(), publisher = new LocalPublisher(remote), localCalls = [];
+  const api = new FakeAPI(), executor = new FakeExecutor(), publisher = new LocalPublisher(remote), localCalls = [], localPrompts = [];
   if (automaticMode?.publisher) automaticMode.publisher(publisher);
   const c = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'tasks'), api, executor, publisher, secrets: [],
     ...(local ? { localBackendFactory: options => ({
       async run(input) {
         localCalls.push(options.reviewOnly ? 'reviewer' : 'implementer');
+        if (options.reviewOnly) localPrompts.push(input.prompt);
         const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'independent-reviewer' : 'implementer-thread', turnId: 'fixture-turn',
           turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
         options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
@@ -58,16 +60,21 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
         }
         options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
         const overall = automaticMode?.verdict || 'PASS';
-        const findings = ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: overall, evidence: 'Synthetic independent reviewer assessment.' }));
+        const findings = ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: automaticMode?.versioned && id !== 'R1' ? 'PASS' : overall,
+          evidence: 'Synthetic independent reviewer assessment.' }));
+        const output = automaticMode?.versioned ? { format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall, findings: findings.map(finding => ({ ...finding,
+          classification: finding.status === 'PASS' ? null : { kind: 'implementation_defect', target_files: ['one.txt'],
+            remedy: { kind: 'edit_files', description: 'Correct the content of one.txt.', requires_human_approval: false } } })) } : { overall, findings };
         return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: [], commands: [],
           ...(!options.reviewOnly ? automaticMode?.result : {}),
-          messages: options.reviewOnly ? [{ provenance: 'model', text: automaticMode?.reviewOutput || JSON.stringify({ overall, findings }) }] : [] };
+          messages: options.reviewOnly ? [{ provenance: 'model', text: automaticMode?.reviewOutput || JSON.stringify(output) }] : [] };
       }, async cancel() {}, async close() { return !(automaticMode?.closeFailure === (options.reviewOnly ? 'reviewer' : 'implementer')); },
     }) } : {}) }).init();
   t.after(async () => { await c.close(); await fs.rm(root, { recursive: true, force: true }); });
   await fs.writeFile(path.join(root, 'state/repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   const contract = { goal: 'Local publication fixture', allowed_files: allowed, requirements: [{ id: 'R1', text: 'Make the exact fixture change.' }], invariants: [], test_commands: commands, initial_files: {} };
   const automatic = { publish: { title: 'Automatic isolated fixture', body: 'Explicit test authorization', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 };
+  if (automaticMode?.versioned) automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
   const startInput = { request_id: 'start_publication', repository_id: 'fixture', contract, ...(local ? { execution_backend: 'local_codex' } : {}), ...(automaticMode ? { automatic } : {}) };
   automaticMode?.configure?.(c, startInput);
   const started = await c.start(startInput); await Promise.all([...c.jobs.values()]);
@@ -85,8 +92,63 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
     assert.equal((await c.get(id)).reviewer.overall, verdict);
   };
   const input = { task_id: id, title: 'Publish isolated fixture' };
-  return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls };
+  return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls, localPrompts };
 }
+
+test('explicit versioned automatic PASS uses authenticated findings and exact-tree draft publication', async context => {
+  const value = await setup(context, ['one.txt'], true, ['test "$(cat one.txt)" = exact'], { versioned: true });
+  const task = await automaticSettled(value), { c, id, publisher, remote } = value;
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.equal(task.reviewer.review_result.validation_contract, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+  assert.equal(task.reviewer.review_result.actionability_qualification.execution_authorized, false);
+  assert.deepEqual(task.reviewer.review_result.controller_context, { reviewerIndependent: true, executionQualified: true, authorityValid: true, uncertaintyFree: true });
+  assert.deepEqual(value.localPrompts, [localActionabilityReviewerInstructions]); assert.deepEqual(value.localCalls, ['implementer', 'reviewer']);
+  assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1); assert.equal(publisher.pr.draft, true);
+  assert.equal(repoGit(remote, 'rev-parse', `${task.publication.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(repoGit(remote, 'rev-parse', 'main').trim(), value.baseline); assert.equal(value.api.created.length, 0);
+  assert.equal(task.deadline, task.automatic.review_authorization.deadline);
+  for (const view of [await c.get(id), await c.start(value.startInput)]) {
+    assert.equal(view.automatic.review.state, 'pass'); assert.equal(view.automatic.usage.correction_turns, 0); assert.equal(view.automatic.review.execution_authorized, false);
+  }
+  assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1);
+});
+
+test('versioned automatic FAIL never invokes the publisher despite potential actionability', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { versioned: true, verdict: 'FAIL' }), task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.reviewer.review_result.actionability_qualification.potentially_correctable, true);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  assert.equal((await value.c.get(value.id)).automatic.usage.correction_turns, 0);
+});
+
+for (const field of ['thread', 'turn', 'packet', 'tree', 'version', 'context']) test(`versioned publication rejects stale ${field} binding before push`, async context => {
+  let controlled, original, injected = false;
+  const value = await setup(context, ['one.txt'], true, [], { versioned: true, configure(c) { controlled = c; }, publisher(publisher) {
+    const target = publisher.target.bind(publisher);
+    publisher.target = async (...args) => {
+      const result = await target(...args), task = JSON.parse(controlled.db.prepare('SELECT value FROM tasks').get().value);
+      original = JSON.stringify(task);
+      if (field === 'thread') task.reviewer.local.thread_id = 'different-thread';
+      if (field === 'turn') task.reviewer.local.turn_id = 'different-turn';
+      if (field === 'packet') task.reviewer.packet_hash = '0'.repeat(64);
+      if (field === 'tree') task.reviewer.reviewed_git_state.tree_sha = '0'.repeat(40);
+      if (field === 'version') task.reviewer.review_result.validation_contract = 'pab.local-review.v2';
+      if (field === 'context') task.reviewer.review_result.controller_context.authorityValid = false;
+      // Fault injection changes only this fixture's ledger. Even an updated task
+      // hash cannot replace the independently retained original review record.
+      task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
+      controlled.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id); injected = true;
+      return result;
+    };
+  } });
+  const task = await automaticSettled(value);
+  assert(injected);
+  const view = await value.c.get(value.id);
+  assert(['stopped', 'uncertain'].includes(view.automatic.status)); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']); assert.equal(view.automatic.usage.correction_turns, 0);
+  // Explicitly restore this test's injected corruption for resource teardown;
+  // the Controller does not repair or replay an uncertain operation itself.
+  controlled.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(original, value.id);
+});
 
 async function automaticSettled(value) {
   await Promise.all([...value.c.automaticJobs.values()]);
