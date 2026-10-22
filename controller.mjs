@@ -25,6 +25,7 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const MAX_PACKET = 128 * 1024;
 const MAX_FILES = 100;
 const DEBUG_WINDOW = 30 * 86400000;
+const automaticTransition = Symbol('controller automatic transition');
 const message = text => ({ type: 'agent.session.input.message', input: [{ role: 'user', content: [{ type: 'input_text', text }] }] });
 async function settledWithin(promise, timeout = 3000) {
   let timer;
@@ -216,6 +217,7 @@ export class Controller {
     this.context = new AsyncLocalStorage(); this.instanceId = randomUUID();
     this.executor.onExit = status => this.executorExited(status);
     this.timeoutMs = timeoutMs; this.jobs = new Map(); this.streams = new Map(); this.cache = new Map(); this.locks = new Map(); this.closed = false;
+    this.automaticJobs = new Map(); this.automaticTimers = new Map();
   }
   get api() { return this._api ||= new OpenAI({ maxRetries: 0, timeout: 30000, logLevel: 'off' }).beta.agents.sessions; }
   async registerGitHubRepository(input) {
@@ -257,6 +259,10 @@ export class Controller {
     // No automatic replay of potentially accepted mutations after restart.
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
       const t = JSON.parse(row.value);
+      if (t.automatic?.status === 'progressing') {
+        Object.assign(t.automatic, { status: 'uncertain', reason: 'AUTOMATIC_RESTART_NO_REPLAY', human_attention_required: true });
+        this.save(t);
+      }
       if (t.execution_backend === 'local_codex') {
         if (t.local_validation && !['completed', 'unavailable', 'interrupted', 'uncertain'].includes(t.local_validation.status)) {
           t.local_validation.status = 'uncertain'; t.local_validation.diagnostic = 'VALIDATION_RESTART_NO_REPLAY';
@@ -433,13 +439,88 @@ export class Controller {
         else t[role].review_result = null;
         this.opDone(role === 'implementer' ? t.request_id : t[role].request_id, 'failed');
       }
-      this.save(t); } }).finally(() => this.jobs.delete(key));
+      this.save(t); } }).finally(() => {
+        this.jobs.delete(key);
+        if (!this.closed && this.task(taskId).automatic?.status === 'stopped' && this.automaticUncertain(this.task(taskId))) this.finishAutomatic(taskId, 'uncertain', 'AUTOMATIC_EXECUTION_UNCONFIRMED');
+        if (role === 'implementer' && !this.closed) this.scheduleAutomatic(taskId);
+      });
     this.jobs.set(key, job);
+  }
+  automaticAuthorization(input) {
+    if (input.automatic === undefined) return undefined;
+    const value = input.automatic, plain = object => object && typeof object === 'object' && !Array.isArray(object);
+    if (input.execution_backend !== 'local_codex' || !input.repository_id || !plain(value) ||
+        Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections'].includes(key)) ||
+        value.max_codex_turns !== 2 || value.max_corrections !== 0 || !Number.isInteger(value.max_duration_seconds) ||
+        value.max_duration_seconds < 1 || value.max_duration_seconds > 900 || !plain(value.publish) ||
+        Object.keys(value.publish).some(key => !['title', 'body', 'draft'].includes(key)) || value.publish.draft !== true ||
+        typeof value.publish.title !== 'string' || !value.publish.title.trim() || value.publish.title.length > 200 || /[\x00-\x1f]/.test(value.publish.title) ||
+        (value.publish.body !== undefined && (typeof value.publish.body !== 'string' || value.publish.body.length > 16000))) throw new BridgeError('INVALID_AUTOMATIC_AUTHORIZATION');
+    this.rejectSecret(value);
+    return { publish: { title: value.publish.title, body: value.publish.body || '', draft: true },
+      max_duration_seconds: value.max_duration_seconds, max_codex_turns: 2, max_corrections: 0 };
+  }
+  automaticGuard(task) {
+    if (!task.automatic) return;
+    if (this.closed || task.automatic.owner_instance !== this.instanceId) throw new BridgeError('AUTOMATIC_OWNER_UNAVAILABLE');
+    if (task.automatic.status !== 'progressing' || task.cleaned) throw new BridgeError('AUTOMATIC_TASK_STOPPED');
+    if (task.deadline !== task.automatic.deadline || Date.now() >= task.deadline) throw new BridgeError('TASK_EXPIRED');
+  }
+  executionTimeout(task) {
+    this.automaticGuard(task);
+    return task.automatic ? Math.max(1, task.deadline - Date.now()) : this.timeoutMs;
+  }
+  finishAutomatic(id, status, reason) {
+    if (this.dbClosed) return;
+    const task = this.task(id);
+    if (!task.automatic || task.automatic.status === 'succeeded') return;
+    if (task.automatic.status === 'progressing') Object.assign(task.automatic, { status, reason: this.bounded(reason, 256), human_attention_required: status !== 'succeeded' });
+    else if (status === 'uncertain') task.automatic.status = 'uncertain';
+    this.save(task);
+    clearTimeout(this.automaticTimers.get(id)); this.automaticTimers.delete(id);
+  }
+  automaticUncertain(task) {
+    return task.automatic.owner_instance !== this.instanceId || task.automatic.phase === 'publication' || task.local_validation?.termination_confirmed === false ||
+      [task.implementer, task.reviewer].some(ref => ref?.local && (ref.local.execution_state === 'uncertain' ||
+        (ref.local.instance_started && !ref.local.server_closed) ||
+        (ref.local.turn_submission_attempted && (!ref.local.turn_submission_acknowledged || !ref.local.terminal_observed))));
+  }
+  scheduleAutomatic(id) {
+    if (this.closed || this.automaticJobs.has(id) || this.task(id).automatic?.status !== 'progressing') return;
+    const job = Promise.resolve().then(() => this.runAutomatic(id)).catch(error => {
+      if (!this.dbClosed) {
+        const task = this.task(id), uncertain = this.automaticUncertain(task);
+        this.opDone(task.automatic.publish_request_id, uncertain ? 'uncertain' : 'failed');
+        this.finishAutomatic(id, uncertain ? 'uncertain' : 'stopped', error instanceof BridgeError ? error.code : 'AUTOMATIC_OPERATION_UNCONFIRMED');
+      }
+    }).finally(() => this.automaticJobs.delete(id));
+    this.automaticJobs.set(id, job);
+  }
+  async runAutomatic(id) {
+    let task = this.task(id); this.automaticGuard(task);
+    if (task.implementer.error || task.implementer.stopping || !localExecutionQualified(task.implementer.local) ||
+        task.implementer.local.human_requests.length || this.localRuns.has(id) || this.jobs.has(`${id}:implementer`)) throw new BridgeError('AUTOMATIC_IMPLEMENTATION_UNQUALIFIED');
+    task.automatic.phase = 'validation_and_review'; this.save(task);
+    await this.invoke('review_task', { task_id: id, request_id: task.automatic.review_request_id }, {},
+      input => this.review(input, automaticTransition));
+    await this.jobs.get(`${id}:reviewer`);
+    task = this.task(id); this.automaticGuard(task);
+    await this.qualifyLocalPublication(task);
+    task = this.task(id); this.automaticGuard(task);
+    const input = { task_id: id, ...task.automatic.authorization.publish };
+    if (this.operation(task.automatic.publish_request_id, 'automatic_publish', input, id)) throw new BridgeError('AUTOMATIC_PUBLICATION_REPLAY_FORBIDDEN');
+    task.automatic.phase = 'publication'; this.save(task);
+    await this.invoke('publish_task', { ...input, request_id: task.automatic.publish_request_id }, {}, () => this.publish(input, automaticTransition));
+    task = this.task(id); this.automaticGuard(task);
+    if (task.publication?.phase !== 'complete') throw new BridgeError('AUTOMATIC_PUBLICATION_UNCONFIRMED');
+    this.opDone(task.automatic.publish_request_id);
+    this.finishAutomatic(id, 'succeeded', null);
   }
   async start(input) {
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
     const { contract, request_id, repository_id, base_ref = 'HEAD', execution_backend = 'agents_api' } = input;
-    if (Object.keys(input).some(k => !['contract', 'request_id', 'repository_id', 'base_ref', 'execution_backend'].includes(k))) throw new BridgeError('INVALID_START_INPUT');
+    if (Object.keys(input).some(k => !['contract', 'request_id', 'repository_id', 'base_ref', 'execution_backend', 'automatic'].includes(k))) throw new BridgeError('INVALID_START_INPUT');
+    const automatic = this.automaticAuthorization(input);
     if (!['agents_api', 'local_codex'].includes(execution_backend)) throw new BridgeError('INVALID_EXECUTION_BACKEND');
     if (execution_backend === 'local_codex' && !repository_id) throw new BridgeError('LOCAL_CODEX_REQUIRES_REPOSITORY');
     if (!repository_id && input.base_ref !== undefined) throw new BridgeError('BASE_REF_REQUIRES_REPOSITORY');
@@ -463,16 +544,29 @@ export class Controller {
       catch (e) { throw new BridgeError(/^[A-Z_]+$/.test(e.code || '') ? e.code : 'REPOSITORY_VALIDATION_FAILED'); }
     }
     if (execution_backend === 'local_codex') await this.localReferenceEvidence(repository.canonical_path, repository.baseline_commit, contract, false);
-    const payload = repository ? { contract, repository_id, base_ref } : contract;
+    const payload = repository ? { contract, repository_id, base_ref, ...(automatic ? { automatic } : {}) } : contract;
     const old = this.operation(request_id, 'start', execution_backend === 'agents_api' ? payload : { execution_backend, input: payload }, id);
     if (old) return this.get(old.task_id);
     const active = this.db.prepare('SELECT value FROM tasks').all().filter(r => !JSON.parse(r.value).cleaned);
     if (active.length >= 3) { this.db.prepare('DELETE FROM operations WHERE id=?').run(request_id); throw new BridgeError('ACTIVE_TASK_LIMIT'); }
     const t = { id, execution_backend, created: Date.now(), deadline: Date.now() + this.timeoutMs, baseline: repository?.baseline_commit || null, ...(repository ? { repository } : {}), implementer: { state: 'starting' }, request_id };
+    if (automatic) {
+      t.deadline = t.created + Math.min(this.timeoutMs, automatic.max_duration_seconds * 1000);
+      t.automatic = { authorization: automatic, status: 'progressing', phase: 'implementation', reason: null,
+        deadline: t.deadline, owner_instance: this.instanceId, human_attention_required: false,
+        review_request_id: `automatic_review_${randomUUID()}`, publish_request_id: `automatic_publish_${randomUUID()}` };
+    }
     if (execution_backend === 'local_codex') t.implementer.local = { phase: 'provisioning', execution_state: 'starting', thread_id: null, turn_id: null, model: null,
       turn_submission_attempted: false, turn_submission_acknowledged: false, terminal_observed: false, result_received: false,
       instance_started: false, server_closed: false, human_attention_required: false, human_requests: [], diagnostics: [] };
     this.save(t);
+    if (automatic) {
+      const timer = setTimeout(() => {
+        this.finishAutomatic(id, this.automaticUncertain(this.task(id)) ? 'uncertain' : 'stopped', 'TASK_EXPIRED');
+        this.cleanup({ task_id: id }).catch(() => this.finishAutomatic(id, 'uncertain', 'AUTOMATIC_EXPIRY_CLEANUP_UNCONFIRMED'));
+      }, Math.max(1, t.deadline - Date.now()));
+      timer.unref(); this.automaticTimers.set(id, timer);
+    }
     this.launch(id, 'implementer', async () => {
       const taskRoot = path.join(this.workspaceRoot, id); const repo = path.join(taskRoot, 'repo');
       await fs.mkdir(taskRoot, { recursive: true, mode: 0o700 });
@@ -580,7 +674,7 @@ export class Controller {
     if (this.closed || this.task(id).implementer.stopping) return;
     task = this.task(id); task.local_protected_before = protectedState; task.local_execution_evidence = createLocalEvidence(id); this.save(task);
     const abort = new AbortController();
-    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.timeoutMs, deferHumanRequests: true, onLifecycle: event => {
+    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.executionTimeout(task), deferHumanRequests: true, onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
       const current = this.task(id), ref = current.implementer, local = ref.local;
       this.localIdentity(local, event); local.phase = this.bounded(event.phase, 64);
@@ -589,6 +683,10 @@ export class Controller {
       let unsupported = false;
       if (event.phase === 'human_request') {
         unsupported = !this.recordLocalRequest(current, event);
+        if (current.automatic) {
+          Object.assign(current.automatic, { status: 'stopped', reason: 'AUTOMATIC_HUMAN_ATTENTION_REQUIRED', human_attention_required: true });
+          unsupported = true;
+        }
       }
       if (['human_response_submitting', 'human_response_sent', 'human_request_resolved'].includes(event.phase)) {
         const request = local.human_requests.find(request => request.native_request_id === event.request?.id);
@@ -606,6 +704,7 @@ export class Controller {
         this.localHumanState(current);
       }
       this.save(current);
+      if (unsupported && current.automatic) this.finishAutomatic(id, 'stopped', 'AUTOMATIC_HUMAN_ATTENTION_REQUIRED');
       if (unsupported) abort.abort();
       if (ref.stopping && event.phase !== 'terminal_observed') throw new BridgeError('LOCAL_STOP_REQUESTED');
     }, onProgress: event => {
@@ -782,6 +881,7 @@ export class Controller {
   }
   async get(id, refresh = true) {
     let t = this.task(id);
+    if (t.automatic) refresh = false;
     const result = { ...(t.review_packet_diagnostic ? { review_packet_diagnostic: t.review_packet_diagnostic } : {}), task_id: id, state: t.cleaned ? 'cleaned' : t.implementer.state, implementer: null, reviewer: null, cleanup: t.cleanup || null, expires_at: new Date(t.deadline).toISOString() };
     result.execution_backend = t.execution_backend || 'agents_api';
     for (const role of ['implementer', 'reviewer']) {
@@ -809,7 +909,7 @@ export class Controller {
       }
     }
     if (t.repository) {
-      if (!t.workspace_deleted) {
+      if (!t.workspace_deleted && !t.automatic) {
         try { await this.repositoryEvidence(id); }
         catch { const fresh = this.task(id); fresh.repository_evidence_error = 'REPOSITORY_EVIDENCE_UNAVAILABLE'; this.save(fresh); }
       }
@@ -822,11 +922,21 @@ export class Controller {
     if (published) result.publication = published.phase === 'complete' ? publicationResult(published) : { phase: published.phase, reviewed_tree_sha: published.reviewed_tree_sha, commit_sha: published.commit_sha, error: this.task(id).publication_error || null };
     else if (this.task(id).publication_frozen) result.publication = { phase: 'frozen', error: this.task(id).publication_error || null };
     if (!t.cleaned) result.state = result.implementer.state;
+    if (t.automatic) {
+      result.automatic = { status: t.automatic.status, phase: t.automatic.phase, reason: t.automatic.reason,
+        human_attention_required: t.automatic.human_attention_required, limits: t.automatic.authorization,
+        review_request_id: t.automatic.review_request_id, publish_request_id: t.automatic.publish_request_id,
+        usage: { implementer_turn_submissions_attempted: Number(t.implementer.local.turn_submission_attempted),
+          reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns: 0,
+          token_usage: null, subscription_billing_attribution: 'unverified' } };
+      if (!t.cleaned) result.state = t.automatic.status;
+    }
     return result;
   }
   async continue({ task_id: id, instruction, request_id, human_response }) {
     return this.locked(id, async () => {
       let t = this.task(id);
+      if (t.automatic) throw new BridgeError('AUTOMATIC_TASK_OWNS_TRANSITIONS');
       if (t.execution_backend === 'local_codex' && t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION');
       if (t.execution_backend === 'local_codex') return this.continueLocal(t, { instruction, request_id, human_response });
       if (human_response !== undefined || typeof instruction !== 'string' || !instruction.trim()) throw new BridgeError('INVALID_CONTINUE_INPUT');
@@ -1087,9 +1197,11 @@ export class Controller {
     await fs.writeFile(path.join(dir, 'evidence.json'), packet.text, { mode: 0o400 });
     return { directory: dir, hash: packet.hash, bytes: packet.bytes };
   }
-  async review({ task_id: id, request_id }) {
+  async review({ task_id: id, request_id }, owner) {
     return this.locked(id, async () => {
       const t = this.task(id);
+      if (t.automatic && owner !== automaticTransition) throw new BridgeError('AUTOMATIC_TASK_OWNS_TRANSITIONS');
+      this.automaticGuard(t);
       if (t.execution_backend === 'local_codex' && t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION');
       if (t.execution_backend === 'local_codex') return this.reviewLocal(t, request_id);
       if (t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION'); if (t.cleaned) throw new BridgeError('TASK_CLEANED');
@@ -1269,7 +1381,9 @@ export class Controller {
     task.local_validation = { version: VALIDATION_VERSION, provenance: 'controller_process_observation', attempt_id: randomUUID(),
       request_id: requestId, task_id: task.id, reviewed_git_state: reviewedState, status: 'pending', results: [],
       original_unchanged: false, termination_confirmed: true, diagnostic: null };
-    task.deadline = Date.now() + this.timeoutMs; this.save(task);
+    this.automaticGuard(task);
+    if (!task.automatic) task.deadline = Date.now() + this.timeoutMs;
+    this.save(task);
     this.launch(task.id, 'reviewer', () => this.runLocalReview(task.id));
     return this.get(task.id, false);
   }
@@ -1283,7 +1397,7 @@ export class Controller {
     const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
     if (normal.status !== 'captured') throw new BridgeError('VALIDATION_NORMAL_SNAPSHOT_UNAVAILABLE');
     if (this.closed || this.task(id).reviewer.stopping) return;
-    const runner = this.localValidationFactory({ root, timeoutMs: this.timeoutMs, bound: this.bounded.bind(this) });
+    const runner = this.localValidationFactory({ root, timeoutMs: this.executionTimeout(this.task(id)), bound: this.bounded.bind(this) });
     this.validationRuns.set(id, runner);
     task = this.task(id); task.local_validation.status = 'running'; this.save(task);
     try {
@@ -1328,6 +1442,11 @@ export class Controller {
     task = this.task(id);
     if (!['completed', 'unavailable'].includes(task.local_validation.status) || !task.local_validation.termination_confirmed ||
         !task.local_validation.original_unchanged) throw new BridgeError('LOCAL_VALIDATION_UNRESOLVED');
+    this.automaticGuard(task);
+    if (task.automatic) {
+      const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
+      if (!independentValidationPassed(task.local_validation, contract.test_commands, task.reviewer.reviewed_git_state, id)) throw new BridgeError('AUTOMATIC_VALIDATION_FAILED');
+    }
     const packet = await this.packet(task);
     if (this.closed || this.task(id).reviewer.stopping) return;
     task = this.task(id);
@@ -1338,7 +1457,7 @@ export class Controller {
     await this.verifyLocalReviewPacket(task);
     if (this.closed || this.task(id).reviewer.stopping) return;
     const key = `${id}:reviewer`, abort = new AbortController();
-    const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.timeoutMs,
+    const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.executionTimeout(this.task(id)),
       onLifecycle: event => {
         if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
         const current = this.task(id), ref = current.reviewer, local = ref.local;
@@ -1433,14 +1552,16 @@ export class Controller {
         publication.review_overall !== 'PASS')) throw new BridgeError('LOCAL_PUBLICATION_BINDING_CHANGED');
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
   }
-  async publish(input) {
+  async publish(input, owner) {
     if (!input || Object.keys(input).some(k => !['task_id', 'title', 'body', 'draft'].includes(k)) ||
         typeof input.title !== 'string' || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title) ||
         (input.body !== undefined && (typeof input.body !== 'string' || input.body.length > 16000)) || (input.draft !== undefined && input.draft !== true)) throw new BridgeError('INVALID_PUBLISH_INPUT');
     this.rejectSecret(input);
     return this.locked(input.task_id, async () => {
       let t = this.task(input.task_id);
+      if (t.automatic && owner !== automaticTransition) throw new BridgeError('AUTOMATIC_TASK_OWNS_TRANSITIONS');
       try {
+        this.automaticGuard(t);
         if (!t.repository) throw new BridgeError('PUBLICATION_REQUIRES_REPOSITORY');
         if (['implementer', 'reviewer'].some(role => this.jobs.has(`${t.id}:${role}`))) throw new BridgeError('TASK_EXECUTION_PENDING');
         for (const role of ['implementer', 'reviewer']) if (t.execution_backend !== 'local_codex' && t[role]?.session_id && !t[role].deleted) await this.viewRole(t, role);
@@ -1450,13 +1571,25 @@ export class Controller {
         else if (!t.reviewer || t.reviewer.stale || t.reviewer.state !== 'completed' || t.reviewer.session_id === t.implementer.session_id ||
             t.reviewer.review_result?.overall !== 'PASS' || t.reviewer.review_result.packet_hash !== t.reviewer.packet_hash) throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
         const registered = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), t.repository.repository_id, t.repository.base_ref, this.workspaceRoot, this.stateRoot);
+        this.automaticGuard(this.task(t.id));
         if (JSON.stringify(registered.registered_identity) !== JSON.stringify(t.repository.registered_identity)) throw new BridgeError('REPOSITORY_PATH_CHANGED');
         for (const role of ['implementer', 'reviewer']) {
           t[role].stopping = true; this.save(t);
           if (t.execution_backend !== 'local_codex' && !await this.executor.stop(t[role].executor)) throw new BridgeError('EXECUTOR_NOT_STOPPED');
         }
         t = this.task(t.id);
-        const result = await publishReviewedTask(this, t, { title: input.title, body: input.body || '', draft: true });
+        let publicationController = this;
+        if (t.automatic) {
+          publicationController = Object.create(this);
+          publicationController.publisher = Object.fromEntries(['target', 'remoteHead', 'push', 'findPR', 'createPR'].map(method => [method, async (...args) => {
+            this.automaticGuard(this.task(t.id));
+            const result = await this.publisher[method](...args);
+            this.automaticGuard(this.task(t.id));
+            return result;
+          }]));
+          publicationController.save = value => { this.automaticGuard(this.task(t.id)); this.save(value); };
+        }
+        const result = await publishReviewedTask(publicationController, t, { title: input.title, body: input.body || '', draft: true });
         t = this.task(t.id); t.publication_error = null; this.save(t);
         const auditId = this.context.getStore();
         if (auditId) {
@@ -1475,6 +1608,7 @@ export class Controller {
     });
   }
   async cleanup({ task_id: id, delete_workspace = false }) {
+    if (this.task(id).automatic?.status === 'progressing') this.finishAutomatic(id, 'stopped', 'AUTOMATIC_CANCELLED');
     return this.locked(id, async () => {
       if (this.task(id).execution_backend === 'local_codex') return this.cleanupLocal(id, delete_workspace);
       // Provisioning is bounded. Wait before collecting all owned resources.
@@ -1596,6 +1730,7 @@ export class Controller {
     return { server_closed: local.server_closed, job_settled: job.ok, cancellation_confirmed: cancellationConfirmed, diagnostics: [...diagnostics] };
   }
   async cleanupLocal(id, deleteWorkspace) {
+    if (this.task(id).automatic?.status === 'progressing') this.finishAutomatic(id, 'stopped', 'AUTOMATIC_CANCELLED');
     const stopped = await this.stopLocal(id), diagnostics = new Set(stopped.diagnostics);
     if (this.task(id).reviewer) {
       const reviewer = await this.stopLocal(id, 'reviewer');
@@ -1642,10 +1777,14 @@ export class Controller {
   async close() {
     if (this.dbClosed) return;
     clearInterval(this.sweeper); this.closed = true;
+    for (const timer of this.automaticTimers.values()) clearTimeout(timer);
+    this.automaticTimers.clear();
     this.registration.cancel?.();
     const tasks = this.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value));
+    for (const task of tasks) if (task.automatic?.status === 'progressing') this.finishAutomatic(task.id, 'uncertain', 'AUTOMATIC_SHUTDOWN_NO_REPLAY');
     await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && !task.cleaned).map(task => this.stopLocal(task.id)));
     await Promise.allSettled(tasks.filter(task => task.execution_backend === 'local_codex' && task.reviewer && !task.cleaned).map(task => this.stopLocal(task.id, 'reviewer')));
+    if (!(await settledWithin(Promise.allSettled([...this.automaticJobs.values()]))).ok) throw new BridgeError('AUTOMATIC_JOB_UNRESOLVED');
     await Promise.allSettled([...this.jobs.entries()].filter(([key]) => this.task(key.split(':')[0]).execution_backend !== 'local_codex').map(([, job]) => job));
     for (const stream of this.streams.values()) stream?.controller?.abort();
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {

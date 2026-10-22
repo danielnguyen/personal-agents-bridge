@@ -75,6 +75,64 @@ async function setup(context, mode = {}, options = {}) {
   return { controller, config, api, executor, root, normal, baseline, input, instances, start, running, drain };
 }
 
+const automaticAuthority = () => ({ publish: { title: 'Explicit fixture draft', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 });
+
+for (const [label, change] of [
+  ['implicit backend', input => { delete input.execution_backend; }],
+  ['Agents API backend', input => { input.execution_backend = 'agents_api'; }],
+  ['no repository', input => { delete input.repository_id; }],
+  ['false authorization', input => { input.automatic = false; }],
+  ['null authorization', input => { input.automatic = null; }],
+  ['unknown field', input => { input.automatic.merge = true; }],
+  ['correction rounds', input => { input.automatic.max_corrections = 1; }],
+  ['extra turns', input => { input.automatic.max_codex_turns = 3; }],
+  ['missing deadline', input => { delete input.automatic.max_duration_seconds; }],
+  ['extended deadline', input => { input.automatic.max_duration_seconds = 901; }],
+  ['non-draft publication', input => { input.automatic.publish.draft = false; }],
+  ['empty title', input => { input.automatic.publish.title = ' '; }],
+  ['unbounded metadata', input => { input.automatic.publish.body = 'x'.repeat(16001); }],
+  ['caller branch', input => { input.automatic.publish.branch = 'main'; }],
+]) test(`automatic authorization rejects ${label} before provisioning or execution`, async context => {
+  const value = await setup(context), input = { ...value.input, automatic: automaticAuthority() }; change(input);
+  await assert.rejects(value.controller.start(input), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM tasks').get().count, 0);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS count FROM operations').get().count, 0);
+  assert.equal(value.instances.length, 0); assert.equal(value.api.created.length, 0);
+});
+
+test('automatic restart with unfinished durable intent requires attention without replay', async context => {
+  const value = await setup(context, { status: 'completed' });
+  const started = await value.controller.start({ ...value.input, automatic: automaticAuthority() });
+  await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const saved = value.controller.task(started.task_id);
+  await value.controller.close();
+  saved.automatic.status = 'progressing'; saved.automatic.phase = 'validation_and_review';
+  const database = new DatabaseSync(path.join(value.controller.stateRoot, 'controller.sqlite'));
+  database.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(saved), saved.id); database.close();
+  const before = value.instances.length;
+  const restarted = await new Controller(value.config).init();
+  try {
+    const view = await restarted.get(saved.id);
+    assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.reason, 'AUTOMATIC_RESTART_NO_REPLAY');
+    assert.equal(restarted.automaticJobs.size, 0); assert.equal(value.instances.length, before);
+    await restarted.start({ ...value.input, automatic: automaticAuthority() });
+    assert.equal(value.instances.length, before);
+  } finally { await restarted.close(); }
+});
+
+test('MCP automatic authority is optional and strictly bounded without new tools', async context => {
+  const value = await setup(context), server = createServer(value.controller, async () => {});
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'automatic-fixture', version: '1' });
+  context.after(async () => { await client.close(); await server.close(); });
+  await server.connect(serverTransport); await client.connect(clientTransport);
+  const tools = (await client.listTools()).tools, start = tools.find(tool => tool.name === 'start_task');
+  assert.equal(tools.length, 8); assert(!start.inputSchema.required.includes('automatic'));
+  assert.equal(start.inputSchema.properties.automatic.additionalProperties, false);
+  const result = await client.callTool({ name: 'start_task', arguments: { ...value.input, automatic: { ...automaticAuthority(), merge: true } } });
+  assert.equal(result.isError, true); assert.equal(value.instances.length, 0);
+});
+
 test('local opt-in reuses owned worktree, baseline, contract and audit without Agents API sessions', async context => {
   const value = await setup(context);
   const { controller, input, normal, baseline } = value;

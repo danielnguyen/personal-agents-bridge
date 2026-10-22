@@ -52,6 +52,75 @@ attention, with known IDs retained and **no automatic replay**. Completed record
 are retained. A process surviving a controller crash is not automatically reattached
 or killed: unknown ownership/termination remains a cleanup blocker.
 
+### Optional automatic draft publication
+
+Manual tasks are unchanged: omit `automatic` and explicitly call `review_task`
+and `publish_task` after implementation. For an allowlisted repository, the owner
+may instead authorize the entire successful local-Codex path in one `start_task`:
+
+```json
+{
+  "execution_backend": "local_codex",
+  "repository_id": "example",
+  "request_id": "unique_authorized_request",
+  "contract": {
+    "goal": "Write answer.txt containing 42 followed by a newline.",
+    "allowed_files": ["answer.txt"],
+    "requirements": [{"id": "ANSWER", "text": "answer.txt contains exactly 42 followed by a newline."}],
+    "invariants": [],
+    "test_commands": ["python3 -B -c 'from pathlib import Path; assert Path(\"answer.txt\").read_bytes() == b\"42\\n\"'"],
+    "initial_files": {}
+  },
+  "automatic": {
+    "publish": {"title": "Add answer fixture", "body": "Implement the authorized fixture.", "draft": true},
+    "max_duration_seconds": 900,
+    "max_codex_turns": 2,
+    "max_corrections": 0
+  }
+}
+```
+
+Before: authorize implementation, then separately request review and publication.
+After: explicitly authorize the bounded draft-publication path once; the Controller
+advances after implementation job settlement, independently validates the exact tree,
+runs a distinct reviewer and invokes the existing publisher only on qualified PASS.
+`get_task` observes persisted automatic progress; polling is not its execution engine.
+No new MCP tools, services, queues or task stores are introduced.
+
+All automatic fields are strictly checked and included in request fingerprinting.
+Only explicit `local_codex` repository tasks qualify. The metadata authorizes one
+draft PR, never merge, deployment, another repository or additional scope. Bounds
+are at most two submitted Codex turns (one implementer and one reviewer), zero
+corrections and an overall 1–900 second deadline, also capped by the Controller's
+configured task timeout. Review does not renew that deadline. These are turn/time
+limits, not token or monetary metering; token usage and billing attribution remain
+unknown. Agents API remains the default and its legacy fingerprints are unchanged.
+
+Tests failing, reviewer FAIL, invalid evidence, human requests, expiry, cleanup,
+shutdown or uncertainty stop automatic progression. No human answer is invented:
+native requests are retained and execution is interrupted, not automatically
+approved. Automatic tasks reject manual continue/review/publish transitions; the
+existing human-response and explicit pre-execution retry mechanisms remain available
+only for manual tasks. There is no correction loop, automatic retry or post-restart
+replay. Unfinished automatic records become attention-required after restart.
+
+Status includes `automatic.status` (`progressing`, `succeeded`, `stopped`, `uncertain`),
+phase, stop reason, authorization limits, operation IDs and known turn-submission
+counts, alongside existing validation results, thread identities, findings, packet
+hash, reviewed tree and publication result. Completed cleanup retains that evidence.
+Publication still verifies independent validation, distinct closed executors,
+qualified findings, frozen packet, normal checkout and exact reviewed tree.
+Deadline/ownership checks bracket publisher calls. An in-flight GitHub operation
+cannot be undone by expiry or cancellation; possible/partial effects remain
+uncertain, are never automatically replayed, and require operator reconciliation.
+The existing publisher's bounded subprocess calls can delay timer delivery; checks
+before each subsequent effect prevent an overdue push from authorizing PR creation.
+
+This is a deliberately bounded Controller lifecycle extension, not a generic
+orchestration framework. Offline mocks and local bare-Git publication fixtures do
+not constitute live end-to-end acceptance. Separately authorized successful and
+failed-path acceptance remains required before deployment.
+
 ### Bounded review packaging and explicit pre-execution retry
 
 Local contracts may optionally select `reference_files`, for example
