@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { localReviewerInstructions, validateLocalReview, localContractBinding, localScopeQualification } from '../local-reviewer-instructions.mjs';
+import { localReviewerInstructions, validateLocalReview, localContractBinding, localScopeQualification, localCorrectionEligibility } from '../local-reviewer-instructions.mjs';
 import { contractMarkdown, digest } from '../controller.mjs';
 import { contract } from './helpers.mjs';
 import { LOCAL_EVIDENCE_VERSION } from '../local-evidence.mjs';
@@ -8,6 +8,25 @@ import { LOCAL_EVIDENCE_VERSION } from '../local-evidence.mjs';
 const input = () => ({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Claim based on packet facts' })) });
 const packet = { evidence_version: LOCAL_EVIDENCE_VERSION, independent_validation: { status: 'unavailable' } };
 const validate = (raw = input(), overrides = {}) => validateLocalReview(JSON.stringify(raw), { ...contract(), ...overrides }, packet, value => value);
+
+test('FAIL and concrete prose cannot supply missing machine-verifiable correction actionability', () => {
+  const review = { overall: 'FAIL', model_overall: 'FAIL', validation_contract: 'pab.local-review.v2',
+    scope_qualification: { status: 'qualified' }, findings: input().findings };
+  review.findings[0] = { id: 'R1', status: 'FAIL', evidence: 'Change greeting.txt line 1 to the required exact greeting.' };
+  const context = { validationQualified: true, executionQualified: true, authorityValid: true };
+  assert.deepEqual(localCorrectionEligibility(review, context), { eligible: false,
+    blockers: ['ACTIONABILITY_EVIDENCE_UNAVAILABLE', 'CORRECTION_EXECUTION_DISABLED'] });
+  for (const key of Object.keys(context)) {
+    const result = localCorrectionEligibility(review, { ...context, [key]: false });
+    assert.equal(result.eligible, false); assert.equal(result.blockers.length, 3);
+  }
+  assert.equal(localCorrectionEligibility().eligible, false);
+});
+
+test('review output cannot smuggle an actionability classification past the strict schema', () => {
+  const raw = input(); raw.overall = 'FAIL'; raw.findings[0].status = 'FAIL'; raw.findings[0].actionable = true;
+  assert.throws(() => validate(raw), /INVALID_LOCAL_REVIEW_OUTPUT/);
+});
 
 test('controller downgrades model PASS for missing independent validation and bounded scope proof', () => {
   const result = validate(input(), { test_commands: ['python3 -B check.py'] });

@@ -20,6 +20,21 @@ export function localExecutionQualified(local) {
     Array.isArray(local.diagnostics) && local.diagnostics.every(value => coverageDiagnostics.has(value));
 }
 
+// The strict review schema has status/evidence, not an actionability classification.
+// Never infer correction authority from FAIL or prose. An execution implementation
+// must add explicit, authenticated findings classification (violation vs missing
+// proof, concrete scoped remedy, no uncertainty/approval), revalidate the original
+// contract/baseline and remaining limits, and bind a fresh candidate lineage.
+export function localCorrectionEligibility(review, { validationQualified = false, executionQualified = false, authorityValid = false } = {}) {
+  const blockers = [];
+  if (review?.validation_contract !== 'pab.local-review.v2' || review.overall !== 'FAIL' || review.model_overall !== 'FAIL') blockers.push('QUALIFIED_REVIEW_FAIL_REQUIRED');
+  if (review?.scope_qualification?.status !== 'qualified' || review?.findings?.find(finding => finding.id === 'SCOPE')?.status !== 'PASS') blockers.push('SCOPE_UNQUALIFIED');
+  if (!validationQualified || review?.findings?.find(finding => finding.id === 'TEST_EVIDENCE')?.status !== 'PASS') blockers.push('TEST_EVIDENCE_UNQUALIFIED');
+  if (!executionQualified) blockers.push('EXECUTION_UNQUALIFIED');
+  if (!authorityValid) blockers.push('ORIGINAL_AUTHORITY_UNCONFIRMED');
+  return { eligible: false, blockers: [...blockers, 'ACTIONABILITY_EVIDENCE_UNAVAILABLE', 'CORRECTION_EXECUTION_DISABLED'] };
+}
+
 export function localScopeQualification(contract, packet) {
   const blockers = [], require = (condition, code) => { if (!condition) blockers.push(code); };
   if (packet.diff !== undefined && typeof packet.diff !== 'string') {

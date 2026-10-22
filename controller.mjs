@@ -6,7 +6,7 @@ import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMetho
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket, localReferencePaths, localReferencesValid, LOCAL_REFERENCE_BYTES } from './local-evidence.mjs';
-import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding } from './local-reviewer-instructions.mjs';
+import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding, localCorrectionEligibility } from './local-reviewer-instructions.mjs';
 import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
 import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { GitHubRegistration, RegistrationError, validName } from './github-registration.mjs';
@@ -255,6 +255,7 @@ export class Controller {
     this.db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, task_id TEXT NOT NULL, status TEXT NOT NULL);');
     await fs.chmod(path.join(this.stateRoot, 'controller.sqlite'), 0o600);
     this.db.exec('CREATE TABLE IF NOT EXISTS failures (session_id TEXT, turn_id TEXT, expires INTEGER, value TEXT, PRIMARY KEY(session_id,turn_id)); CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, created INTEGER, value TEXT);');
+    this.db.exec('CREATE TABLE IF NOT EXISTS automatic_attempts (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, observation_sha256 TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(task_id,attempt_id,observation_sha256));');
     this.pruneDiagnostics();
     // No automatic replay of potentially accepted mutations after restart.
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
@@ -288,6 +289,7 @@ export class Controller {
     return this;
   }
   save(t) {
+    if (t.automatic && (t.reviewer?.review_result || t.automatic.status !== 'progressing')) this.retainAutomaticAttempt(t);
     this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?)').run(t.id, JSON.stringify(t));
     for (const row of this.db.prepare('SELECT id,value FROM audit').all()) {
       const a = JSON.parse(row.value); if (a.task_id !== t.id) continue;
@@ -470,6 +472,37 @@ export class Controller {
     this.automaticGuard(task);
     return task.automatic ? Math.max(1, task.deadline - Date.now()) : this.timeoutMs;
   }
+  retainAutomaticAttempt(task, packetText = null) {
+    if (!task.automatic) return;
+    const ref = task.reviewer, validation = task.local_validation, binding = task.automatic.contract_binding;
+    if (packetText !== null && digest(packetText) !== ref?.packet_hash) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+    const validationQualified = !!binding && independentValidationPassed(validation, binding.contract.test_commands, ref?.reviewed_git_state, task.id);
+    const executionQualified = [task.implementer, ref].every(role => role?.state === 'completed' && !role.error && !role.stale &&
+      !role.stopping && localExecutionQualified(role.local) && role.local.human_requests?.every(request => request.status === 'resolved')) &&
+      task.implementer.local.thread_id !== ref.local.thread_id;
+    const authorityValid = !!binding && binding.sha256 === digest(binding.contract) && task.baseline === task.repository?.baseline_commit &&
+      task.deadline === task.automatic.deadline && Date.now() < task.deadline && task.automatic.owner_instance === this.instanceId;
+    const identity = role => role?.local ? { thread_id: role.local.thread_id, turn_id: role.local.turn_id, model: role.local.model,
+      authentication: role.local.authentication || null, execution_state: role.local.execution_state, error: role.error || null } : null;
+    const evidence = { version: 1, task_id: task.id, attempt_id: task.automatic.review_request_id,
+      kind: packetText !== null ? 'review_packet' : task.automatic.status === 'progressing' ? 'review_result' : 'outcome',
+      baseline_commit: task.baseline, reviewed_git_state: ref?.reviewed_git_state || null,
+      original_contract: binding || null, limits: task.automatic.authorization, deadline: task.automatic.deadline,
+      independent_validation: validation || null, validation_sha256: validation ? digest(validation) : null,
+      validation_qualified: validationQualified,
+      review_packet: ref?.packet_hash ? { directory: ref.packet_directory, sha256: ref.packet_hash, bytes: ref.packet_bytes } : null,
+      // Exact frozen packet bytes preserve candidate source/diff evidence even after
+      // disposable workspace cleanup. Packet sanitization/coverage limits still apply.
+      ...(packetText !== null ? { packet_utf8: packetText } : {}),
+      review_result: ref?.review_result || null, findings_sha256: ref?.findings_sha256 || null,
+      implementer: identity(task.implementer), reviewer: identity(ref),
+      outcome: task.automatic.status, stop_reason: task.automatic.reason,
+      correction_eligibility: localCorrectionEligibility(ref?.review_result, { validationQualified, executionQualified, authorityValid }) };
+    // Append-only application history: never UPDATE/REPLACE/delete observations.
+    // This is not physical immutability against privileged database tampering.
+    this.db.prepare('INSERT OR IGNORE INTO automatic_attempts VALUES (?,?,?,?)')
+      .run(task.id, evidence.attempt_id, digest(evidence), JSON.stringify(evidence));
+  }
   finishAutomatic(id, status, reason) {
     if (this.dbClosed) return;
     const task = this.task(id);
@@ -553,6 +586,7 @@ export class Controller {
     if (automatic) {
       t.deadline = t.created + Math.min(this.timeoutMs, automatic.max_duration_seconds * 1000);
       t.automatic = { authorization: automatic, status: 'progressing', phase: 'implementation', reason: null,
+        contract_binding: { sha256: digest(contract), contract },
         deadline: t.deadline, owner_instance: this.instanceId, human_attention_required: false,
         review_request_id: `automatic_review_${randomUUID()}`, publish_request_id: `automatic_publish_${randomUUID()}` };
     }
@@ -929,6 +963,12 @@ export class Controller {
         usage: { implementer_turn_submissions_attempted: Number(t.implementer.local.turn_submission_attempted),
           reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns: 0,
           token_usage: null, subscription_billing_attribution: 'unverified' } };
+      const retained = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(id);
+      if (retained) {
+        const observation = JSON.parse(retained.value);
+        result.automatic.attempt_evidence = { attempt_id: observation.attempt_id,
+          latest_observation_sha256: retained.observation_sha256, correction_eligibility: observation.correction_eligibility };
+      }
       if (!t.cleaned) result.state = t.automatic.status;
     }
     return result;
@@ -1455,6 +1495,7 @@ export class Controller {
     Object.assign(task.reviewer, { packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory) });
     task.reviewer.local.phase = 'snapshot'; this.save(task);
     await this.verifyLocalReviewPacket(task);
+    if (task.automatic) this.retainAutomaticAttempt(task, await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
     if (this.closed || this.task(id).reviewer.stopping) return;
     const key = `${id}:reviewer`, abort = new AbortController();
     const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.executionTimeout(this.task(id)),

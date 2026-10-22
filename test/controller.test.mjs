@@ -7,6 +7,7 @@ import { authorizePersonalTunnel, createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { repoGit, repositoryIdentity } from '../repositories.mjs';
 
 async function setup(t) {
   const root = await fs.mkdtemp('/var/tmp/personal-agents-bridge/unit-');
@@ -16,6 +17,91 @@ async function setup(t) {
   return { c, api, executor, root };
 }
 async function started(c) { const x = await c.start({ contract: contract(), request_id: 'request_start' }); await Promise.all([...c.jobs.values()]); return await c.get(x.task_id); }
+
+const attemptRows = (c, id) => c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+async function automaticAttempt(t, mode = {}) {
+  const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
+  await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
+  await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
+  repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
+  await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
+  c.publisher = { async target() { throw Error('Publication forbidden for failed review'); } };
+  c.localBackendFactory = options => ({
+    async run() {
+      calls.push(options.reviewOnly ? 'reviewer' : 'implementer');
+      const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : 'implement-thread', turnId: 'fixture-turn',
+        turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
+      options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
+      if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), 'candidate\n');
+      options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
+      const findings = ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: id === 'R1' ? 'FAIL' : 'PASS',
+        evidence: id === 'R1' ? 'greeting.txt contains candidate; replace it with the required greeting.' : 'Synthetic complete evidence assessment.' }));
+      return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
+        messages: options.reviewOnly ? [{ provenance: 'model', text: mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify({ overall: 'FAIL', findings }) }] : [] };
+    }, async close() { return true; }, async cancel() {},
+  });
+  if (mode.validationFailure) c.localValidationFactory = () => ({ terminationConfirmed: true, async run() { throw Error('Synthetic validator failure'); }, cancel() {} });
+  const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
+    automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
+  if (mode.validationFailure) input.contract.test_commands = ['true'];
+  const result = await c.start(input);
+  await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
+  return { ...value, id: result.task_id, calls, input, normal };
+}
+
+test('qualified reviewer FAIL is durably retained without correction and repeated observations are idempotent', async t => {
+  const { c, id, calls, input } = await automaticAttempt(t), task = c.task(id);
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.reviewer.review_result.overall, 'FAIL');
+  assert.equal(task.reviewer.review_result.scope_qualification.status, 'qualified');
+  assert.equal(task.reviewer.review_result.findings.find(f => f.id === 'TEST_EVIDENCE').status, 'PASS');
+  const rows = attemptRows(c, id), observations = rows.map(row => JSON.parse(row.value));
+  assert.deepEqual(observations.map(item => item.kind), ['review_packet', 'review_result', 'outcome']);
+  assert.equal(new Set(observations.map(item => item.attempt_id)).size, 1);
+  const final = observations.at(-1), packet = observations[0];
+  assert.equal(digest(packet.packet_utf8), packet.review_packet.sha256);
+  assert.equal(JSON.parse(packet.packet_utf8).current['greeting.txt'], 'candidate\n');
+  assert.equal(final.baseline_commit, task.baseline); assert.deepEqual(final.reviewed_git_state, task.reviewer.reviewed_git_state);
+  assert.equal(final.validation_sha256, digest(task.local_validation)); assert.equal(final.validation_qualified, true);
+  assert.equal(final.findings_sha256, digest(task.reviewer.review_result));
+  assert.equal(final.implementer.thread_id, task.implementer.local.thread_id); assert.notEqual(final.implementer.thread_id, final.reviewer.thread_id);
+  assert.equal(final.stop_reason, task.automatic.reason); assert.equal(final.outcome, 'stopped');
+  assert.deepEqual(final.correction_eligibility.blockers, ['ACTIONABILITY_EVIDENCE_UNAVAILABLE', 'CORRECTION_EXECUTION_DISABLED']);
+  assert.equal(final.correction_eligibility.eligible, false);
+  await c.get(id); await c.get(id); await c.start(input); c.save(c.task(id));
+  assert.deepEqual(attemptRows(c, id), rows); assert.deepEqual(calls, ['implementer', 'reviewer']);
+  assert.equal((await c.get(id)).automatic.usage.correction_turns, 0);
+  assert.equal(c.task(id).deadline, task.deadline); assert.equal(c.task(id).publication, undefined);
+});
+
+for (const mode of [{ validationFailure: true }, { uncertain: true }, { incomplete: true }]) test(`unqualified attempt fails closed: ${Object.keys(mode)[0]}`, async t => {
+  const { c, id, calls } = await automaticAttempt(t, mode), task = c.task(id), records = attemptRows(c, id).map(row => JSON.parse(row.value));
+  assert(['stopped', 'uncertain'].includes(task.automatic.status)); assert.equal(task.reviewer.review_result, null);
+  assert(records.length > 0); assert(records.every(record => record.correction_eligibility.eligible === false));
+  assert(records.at(-1).correction_eligibility.blockers.includes(mode.validationFailure ? 'TEST_EVIDENCE_UNQUALIFIED' : 'QUALIFIED_REVIEW_FAIL_REQUIRED'));
+  assert.deepEqual(calls, mode.validationFailure ? ['implementer'] : ['implementer', 'reviewer']);
+  assert.equal(task.publication, undefined);
+});
+
+test('prior candidate and findings survive later task updates, workspace deletion and restart without replay', async t => {
+  const { c, id, calls, api, executor } = await automaticAttempt(t), prior = attemptRows(c, id);
+  const task = c.task(id); task.reviewer.review_result = null; task.reviewer.state = 'needs_attention'; task.reviewer.error = 'LOCAL_REVIEW_INTEGRITY_CHANGED';
+  c.save(task); assert.deepEqual(attemptRows(c, id).slice(0, prior.length), prior);
+  await c.cleanup({ task_id: id, delete_workspace: true }); assert.equal(c.task(id).workspace_deleted, true);
+  const after = attemptRows(c, id); assert.deepEqual(after.slice(0, prior.length), prior);
+  await c.close();
+  const restarted = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, api, executor, secrets: [],
+    localBackendFactory: () => { assert.fail('No replay'); } }).init();
+  try {
+    assert.deepEqual(attemptRows(restarted, id), after); assert.equal((await restarted.get(id)).automatic.status, 'stopped');
+    assert.equal(restarted.automaticJobs.size, 0); assert.deepEqual(calls, ['implementer', 'reviewer']);
+  } finally { await restarted.close(); }
+});
+
+test('automatic authorization still rejects every positive correction count', async t => {
+  const { c } = await setup(t);
+  for (const max_corrections of [1, 2, 10]) assert.throws(() => c.automaticAuthorization({ execution_backend: 'local_codex', repository_id: 'fixture',
+    automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+});
 test('Agents API remains the default and explicit default selection preserves request fingerprints', async t => {
   const { c, api } = await setup(t);
   c.localBackendFactory = () => { assert.fail('Default tasks must not instantiate local Codex'); };
