@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync, constants as sqlite } from 'node:sqlite';
 import { Controller, safeRelative, redact, digest } from '../controller.mjs';
 import { authorizePersonalTunnel, createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
@@ -21,33 +22,44 @@ async function started(c) { const x = await c.start({ contract: contract(), requ
 const attemptRows = (c, id) => c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
+  let active;
+  const reviewerActive = new Promise(resolve => active = resolve), stops = [];
   await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
   repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   c.publisher = { async target() { throw Error('Publication forbidden for failed review'); } };
-  c.localBackendFactory = options => ({
+  c.localBackendFactory = options => {
+    let stopped;
+    const wait = new Promise(resolve => stopped = resolve);
+    return {
     async run() {
       calls.push(options.reviewOnly ? 'reviewer' : 'implementer');
       const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : 'implement-thread', turnId: 'fixture-turn',
         turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
-      options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
+      options.onLifecycle({ ...identity, terminalObserved: false, phase: 'turn_acknowledged' });
+      if (options.reviewOnly && mode.activeReviewer) {
+        active(); await wait;
+        return { ...identity, terminalObserved: false, status: 'uncertain', authentication: 'chatgpt', uncertainties: ['INTERRUPTION_UNCONFIRMED'], messages: [] };
+      }
       if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), 'candidate\n');
       options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
       const findings = ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: id === 'R1' ? 'FAIL' : 'PASS',
         evidence: id === 'R1' ? 'greeting.txt contains candidate; replace it with the required greeting.' : 'Synthetic complete evidence assessment.' }));
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
         messages: options.reviewOnly ? [{ provenance: 'model', text: mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify({ overall: 'FAIL', findings }) }] : [] };
-    }, async close() { return true; }, async cancel() {},
-  });
+    }, async close() { if (options.reviewOnly && mode.activeReviewer) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return true; },
+    async cancel() { if (options.reviewOnly && mode.activeReviewer) { stops.push('cancel'); return mode.cancelResult ?? true; } },
+  }; };
   if (mode.validationFailure) c.localValidationFactory = () => ({ terminationConfirmed: true, async run() { throw Error('Synthetic validator failure'); }, cancel() {} });
   const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
     automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
   if (mode.validationFailure) input.contract.test_commands = ['true'];
   mode.configure?.(c);
   const result = await c.start(input);
-  await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
-  return { ...value, id: result.task_id, calls, input, normal };
+  if (mode.activeReviewer) await reviewerActive;
+  else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]); }
+  return { ...value, id: result.task_id, calls, stops, input, normal };
 }
 
 function sqliteAbort(c, table, predicate, event = 'INSERT') {
@@ -64,6 +76,193 @@ async function restartEvidenceController(t, value) {
     executor: value.executor, secrets: ['test-sensitive-value'], localBackendFactory: () => assert.fail('Model replay forbidden') }).init();
   t.after(() => c.close()); return c;
 }
+
+for (const boundary of ['rollback', 'release']) for (const failure of ['deny', 'throw']) test(`SQLite ${boundary} ${failure} blocks authority across the entire connection`, async t => {
+  const value = await setup(t), { c, api, executor } = value;
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  t.after(() => reader.close());
+  if (boundary === 'rollback') sqliteAbort(c, 'tasks', '1');
+  let hits = 0;
+  c.db.setAuthorizer((action, first) => {
+    if (action === sqlite.SQLITE_SAVEPOINT && first === boundary.toUpperCase()) {
+      hits++;
+      if (failure === 'throw') throw Error('authorizer failure without SQLite error code');
+      return sqlite.SQLITE_DENY;
+    }
+    return sqlite.SQLITE_OK;
+  });
+  await assert.rejects(c.start({ contract: contract(), request_id: 'first_manual' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+  assert(hits > 0); assert.equal(c.transactionUnresolved, true); assert.equal(c.db.isTransaction, true);
+  const committed = reader.prepare('SELECT * FROM operations').all();
+  assert.equal(committed.length, 1); assert.equal(committed[0].status, 'pending');
+  assert.equal(reader.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  const authority = { max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0, publish: { title: 'Fixture', draft: true } };
+  for (const input of [{ contract: contract(), request_id: 'second_manual' },
+    { contract: contract(), request_id: 'second_automatic', execution_backend: 'local_codex', repository_id: 'fixture', automatic: authority }]) {
+    await assert.rejects(c.start(input), /STORAGE_TRANSACTION_UNRESOLVED/);
+  }
+  assert.throws(() => c.opDone('first_manual'), /STORAGE_TRANSACTION_UNRESOLVED/);
+  await assert.rejects(c.continue({ task_id: 'anything' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+  await assert.rejects(c.registerGitHubRepository({}), /STORAGE_TRANSACTION_UNRESOLVED/);
+  assert.equal(api.created.length, 0); assert.equal(api.sent.length, 0); assert.equal(executor.started.length, 0);
+  assert.deepEqual(reader.prepare('SELECT * FROM operations').all(), committed);
+  // Explicitly remove the injected fault and roll back. Autocommit by itself
+  // cannot clear a failed-release/rollback latch or authorize another operation.
+  c.db.setAuthorizer(null); c.db.exec('ROLLBACK');
+  assert.equal(c.db.isTransaction, false);
+  await assert.rejects(c.start({ contract: contract(), request_id: 'still_blocked' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+  await c.close();
+  const recovered = await restartEvidenceController(t, value);
+  assert.equal(recovered.db.isTransaction, false); assert.equal(recovered.transactionUnresolved, false);
+  assert.equal(api.created.length, 0); assert.equal(api.sent.length, 0); // No replay on restart.
+  const create = api.create.bind(api);
+  api.create = async body => {
+    assert(reader.prepare('SELECT value FROM tasks WHERE id=?').get(body.metadata.bridge_task));
+    return create(body);
+  };
+  await recovered.start({ contract: contract(), request_id: 'new_committed_authority' });
+  await Promise.all([...recovered.jobs.values()]);
+  assert.equal(api.created.length, 1); assert.equal(api.sent.length, 1);
+  assert.equal(reader.prepare("SELECT count(*) AS n FROM operations WHERE status='accepted'").get().n, 1);
+  assert.equal(reader.prepare("SELECT status FROM operations WHERE id='first_manual'").get().status, 'pending');
+});
+
+async function localResponseFixture(t) {
+  const value = await setup(t), { c } = value;
+  const task = { id: 'task_response', request_id: 'initial_response', execution_backend: 'local_codex', created: Date.now(), deadline: Date.now() + 600000,
+    implementer: { state: 'waiting_for_approval', local: { owner_instance: c.instanceId, thread_id: 'thread', turn_id: 'turn',
+      execution_state: 'running', instance_started: true, human_requests: [], diagnostics: [] } } };
+  c.recordLocalRequest(task, { request: { id: 0, method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread', turnId: 'turn', command: 'node --version' } } });
+  c.save(task);
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  t.after(() => reader.close());
+  const responses = [];
+  c.localRuns.set(task.id, { abort: new AbortController(), backend: {
+    respondToRequest(response) {
+      assert.equal(c.db.isTransaction, false);
+      const committed = JSON.parse(reader.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value);
+      assert.equal(committed.implementer.local.human_requests[0].delivery, 'prepared');
+      assert.equal(reader.prepare('SELECT status FROM operations WHERE id=?').get('response_request').status, 'submitting');
+      responses.push(response);
+    }, async cancel() { return true; }, async close() { return true; },
+  } });
+  const input = { task_id: task.id, request_id: 'response_request', human_response: {
+    request_ref: task.implementer.local.human_requests[0].request_ref, thread_id: 'thread', turn_id: 'turn', decision: 'accept' } };
+  return { ...value, reader, responses, task, input };
+}
+
+test('owned human-response BEGIN IMMEDIATE permits nested save and delivers only committed authority', async t => {
+  const { c, input, responses, reader } = await localResponseFixture(t);
+  await c.continue(input);
+  assert.equal(c.db.isTransaction, false); assert.equal(c.transactionOwner, null); assert.equal(c.transactionUnresolved, false);
+  assert.equal(responses.length, 1);
+  assert.equal(reader.prepare('SELECT status FROM operations WHERE id=?').get(input.request_id).status, 'accepted');
+  await c.continue(input); assert.equal(responses.length, 1);
+});
+
+test('SQLite COMMIT failure in owned human response cannot release callback or acquire new authority', async t => {
+  const value = await localResponseFixture(t), { c, input, responses, reader } = value;
+  c.db.setAuthorizer((action, first) => action === sqlite.SQLITE_TRANSACTION && first === 'COMMIT' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+  await assert.rejects(c.continue(input), /LOCAL_RESPONSE_PERSISTENCE_FAILED/);
+  assert.equal(responses.length, 0); assert.equal(c.transactionUnresolved, true); assert.equal(c.db.isTransaction, false);
+  assert.equal(reader.prepare('SELECT * FROM operations WHERE id=?').get(input.request_id), undefined);
+  assert.equal(JSON.parse(reader.prepare('SELECT value FROM tasks WHERE id=?').get(input.task_id).value).implementer.local.human_requests[0].status, 'pending');
+  await assert.rejects(c.start({ contract: contract(), request_id: 'commit_failure_manual' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+  c.db.setAuthorizer(null);
+  await c.close().catch(() => {}); if (!c.dbClosed) { c.db.close(); c.dbClosed = true; }
+  const recovered = await restartEvidenceController(t, value);
+  assert.equal(responses.length, 0); assert.equal(recovered.task(input.task_id).implementer.state, 'needs_attention');
+  await assert.rejects(recovered.continue(input), /LOCAL_PENDING_REQUEST_NOT_FOUND/);
+});
+
+test('an unowned transaction permits read-only diagnostics and safe stopping but no workspace deletion', async t => {
+  const { c, api, executor } = await setup(t), task = await started(c);
+  const stopped = executor.stopped.length;
+  c.db.exec('BEGIN');
+  const state = await c.invoke('get_task', { task_id: task.task_id }, {}, input => c.get(input.task_id));
+  assert.equal(state.storage_diagnostic, 'STORAGE_TRANSACTION_UNRESOLVED');
+  await assert.rejects(c.cleanup({ task_id: task.task_id, delete_workspace: true }), /EVIDENCE_STORAGE_UNAVAILABLE_CLEANUP_UNCONFIRMED/);
+  assert(executor.stopped.length > stopped); assert.equal(api.deleted.length, 0);
+  assert(c.db.isTransaction); assert((await fs.stat(path.join(c.workspaceRoot, task.task_id))).isDirectory());
+  c.db.exec('ROLLBACK');
+});
+
+test('transaction failure during session creation prevents subsequent executor start and input submission', async t => {
+  const { c, api, executor } = await setup(t), create = api.create.bind(api);
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  t.after(() => reader.close());
+  api.create = async body => {
+    const session = await create(body);
+    sqliteAbort(c, 'tasks', '1');
+    c.db.setAuthorizer((action, first) => action === sqlite.SQLITE_SAVEPOINT && first === 'ROLLBACK' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+    assert.throws(() => c.save(c.task(body.metadata.bridge_task)), /STORAGE_TRANSACTION_UNRESOLVED/);
+    return session;
+  };
+  const initial = await c.start({ contract: contract(), request_id: 'inflight_authority' });
+  await Promise.all([...c.jobs.values()]);
+  assert.equal(api.created.length, 1); assert.equal(api.sent.length, 0); assert.equal(executor.started.length, 0);
+  assert.equal(reader.prepare('SELECT status FROM operations WHERE id=?').get('inflight_authority').status, 'pending');
+  assert.equal(JSON.parse(reader.prepare('SELECT value FROM tasks WHERE id=?').get(initial.task_id).value).implementer.session_id, undefined);
+  c.db.setAuthorizer(null); c.db.exec('ROLLBACK');
+  await assert.rejects(c.continue({ task_id: initial.task_id, instruction: 'do not replay', request_id: 'blocked_inflight' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+});
+
+test('automatic error handling contains a connection failure owned by a different task', async t => {
+  let fault;
+  const value = await automaticAttempt(t, { configure(c) {
+    const qualify = c.qualifyLocalPublication.bind(c);
+    c.qualifyLocalPublication = async task => {
+      fault = sqliteAbort(c, 'tasks', "NEW.id='fault_owner'");
+      c.db.setAuthorizer((action, first) => action === sqlite.SQLITE_SAVEPOINT && first === 'ROLLBACK' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+      assert.throws(() => c.save({ id: 'fault_owner' }), /STORAGE_TRANSACTION_UNRESOLVED/);
+      return qualify(task);
+    };
+  } });
+  const { c, id, calls } = value;
+  assert.equal(fault.hits, 1); assert.equal(c.transactionUnresolved, true); assert(c.persistenceFailures.has(id));
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+  await assert.rejects(c.cleanup({ task_id: id, delete_workspace: true }), /EVIDENCE_STORAGE_UNAVAILABLE_CLEANUP_UNCONFIRMED/);
+  assert((await fs.stat(path.join(c.workspaceRoot, id))).isDirectory());
+  c.db.setAuthorizer(null); c.db.exec('ROLLBACK');
+  await c.close().catch(() => {}); if (!c.dbClosed) { c.db.close(); c.dbClosed = true; }
+  const recovered = await restartEvidenceController(t, value);
+  assert.equal(recovered.task(id).automatic.status, 'uncertain');
+  assert.equal(recovered.task(id).reviewer.review_result.overall, 'FAIL');
+  await recovered.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal((await recovered.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
+for (const storage of ['write', 'read']) for (const confirmed of [true, false]) test(`active automatic expiry contains SQLite ${storage} failure with shutdown ${confirmed ? 'confirmed' : 'uncertain'}`, async t => {
+  const value = await automaticAttempt(t, { activeReviewer: true, cancelResult: confirmed, closeResult: confirmed });
+  const { c, id, calls, stops } = value, task = c.task(id), workspace = path.join(c.workspaceRoot, id);
+  const packetPath = path.join(workspace, task.reviewer.packet_directory, 'evidence.json');
+  const packet = await fs.readFile(packetPath, 'utf8'), before = attemptRows(c, id);
+  const owned = c.localRuns.get(`${id}:reviewer`); assert(owned);
+  let fault;
+  if (storage === 'write') fault = sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.automatic.status')<>'progressing'");
+  else c.db.setAuthorizer(action => action === sqlite.SQLITE_READ ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+  const timer = c.automaticTimers.get(id), now = t.mock.method(Date, 'now', () => task.deadline + 1);
+  try { await assert.doesNotReject(async () => timer._onTimeout()); }
+  finally { now.mock.restore(); c.db.setAuthorizer(null); }
+  if (fault) assert.equal(fault.hits, 1);
+  assert(owned.abort.signal.aborted); assert(stops.includes('cancel')); assert(stops.includes('close'));
+  assert.equal(c.expiryStops.get(id).confirmed, confirmed);
+  if (!confirmed) assert.deepEqual(c.expiryStops.get(id).diagnostics, ['LOCAL_CANCELLATION_UNCONFIRMED', 'LOCAL_CLOSE_UNCONFIRMED']);
+  assert.equal(c.automaticTimers.has(id), false);
+  await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.equal(c.task(id).publication, undefined);
+  assert.equal(c.task(id).deadline, task.deadline); assert.equal(c.task(id).automatic.deadline, task.deadline);
+  assert.equal(await fs.readFile(packetPath, 'utf8'), packet);
+  assert(before.every(row => attemptRows(c, id).some(saved => saved.value === row.value)));
+  const retained = attemptRows(c, id).map(row => JSON.parse(row.value));
+  assert(retained.some(row => row.packet_utf8 === packet && row.review_packet.sha256 === digest(packet)));
+  assert(!retained.some(row => row.review_result)); // No fabricated receipt from the interrupted backend.
+  const blocked = await c.cleanup({ task_id: id, delete_workspace: true });
+  assert.equal(blocked.cleanup.workspace_deleted, false); assert((await fs.stat(workspace)).isDirectory());
+  assert((await c.get(id)).automatic.human_attention_required);
+});
 
 for (const boundary of ['packet', 'review', 'task', 'receipt', 'operation', 'outcome']) test(`SQLite ABORT at ${boundary} preserves evidence and blocks deletion until explicit reconciliation`, async t => {
   let fault;
@@ -169,16 +368,20 @@ test('closed SQLite still permits owned cancellation and reports cleanup as unco
 });
 
 test('an unresolved SQLite transaction is not proof of committed evidence', async t => {
-  const { c, id } = await automaticAttempt(t), before = attemptRows(c, id);
+  const value = await automaticAttempt(t), { c, id } = value, before = attemptRows(c, id);
   c.db.exec('BEGIN');
   await assert.rejects(c.cleanup({ task_id: id, delete_workspace: true }), /EVIDENCE_STORAGE_UNAVAILABLE_CLEANUP_UNCONFIRMED/);
   assert(c.db.isTransaction); // Cleanup must not guess ownership or roll back an unknown transaction.
   assert((await fs.stat(path.join(c.workspaceRoot, id))).isDirectory());
   c.db.exec('ROLLBACK');
   assert.deepEqual(attemptRows(c, id), before);
-  await c.cleanup({ task_id: id, delete_workspace: false });
+  await assert.rejects(c.cleanup({ task_id: id, delete_workspace: false }), /EVIDENCE_STORAGE_UNAVAILABLE_CLEANUP_UNCONFIRMED/);
   assert.equal(c.db.isTransaction, false);
-  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  await c.close().catch(() => {});
+  if (!c.dbClosed) { c.db.close(); c.dbClosed = true; }
+  const recovered = await restartEvidenceController(t, value);
+  await recovered.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal((await recovered.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
 });
 
 test('packet binding failure leaves durable intent and cannot be mistaken for absent evidence after restart', async t => {
