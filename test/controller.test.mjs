@@ -43,27 +43,46 @@ async function statusFiles(...roots) {
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
   let active;
-  const reviewerActive = new Promise(resolve => active = resolve), stops = [], prompts = [], publisherCalls = [];
+  const reviewerActive = new Promise(resolve => active = resolve), stops = [], prompts = [], publisherCalls = [], submissions = [];
   await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
   repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   c.publisher = { async target() { publisherCalls.push('target'); throw Error('Publication forbidden for failed review'); } };
+  let implementations = 0;
   c.localBackendFactory = options => {
+    const corrective = !options.reviewOnly && implementations++ > 0;
     let stopped;
     const wait = new Promise(resolve => stopped = resolve);
     return {
     async run(input) {
-      calls.push(options.reviewOnly ? 'reviewer' : 'implementer');
+      calls.push(options.reviewOnly ? 'reviewer' : corrective ? 'corrector' : 'implementer');
+      if (corrective) {
+        await mode.beforeCorrection?.(c, options, input);
+        assert.equal(await fs.readFile(path.join(options.cwd, 'greeting.txt'), 'utf8'), 'candidate\n');
+        assert.equal(input.threadId, undefined);
+        assert.deepEqual(input.allowedFiles, contract().allowed_files);
+        options.onLifecycle({ phase: 'model_selected', model: mode.wrongModel ? 'other-model' : 'fixture-model' });
+        options.onLifecycle({ phase: 'thread_acknowledged', model: 'fixture-model', threadId: mode.reuseThread ? 'implement-thread' : 'correct-thread' });
+        options.onLifecycle({ phase: 'turn_submitting', model: 'fixture-model', threadId: 'correct-thread', turnSubmissionAttempted: true });
+        submissions.push('corrector');
+        if (mode.ackUnknown) return { status: 'uncertain', authentication: 'chatgpt', threadId: 'correct-thread', turnSubmissionAttempted: true, uncertainties: ['UNKNOWN_ACK'], messages: [] };
+        if (mode.activeCorrection) { active(); await wait; return { status: 'interrupted', authentication: 'chatgpt', messages: [], uncertainties: ['INTERRUPTED'] }; }
+      }
       if (options.reviewOnly) prompts.push(input.prompt);
-      const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : 'implement-thread', turnId: 'fixture-turn',
+      const identity = { model: corrective && mode.wrongModel ? 'other-model' : 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : corrective ? 'correct-thread' : 'implement-thread', turnId: corrective && !mode.reuseTurn ? 'correct-turn' : 'fixture-turn',
         turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
       options.onLifecycle({ ...identity, terminalObserved: false, phase: 'turn_acknowledged' });
+      if (corrective && mode.correctiveHuman) {
+        options.onLifecycle({ ...identity, terminalObserved: false, phase: 'human_request', request: { id: 'approval', method: 'item/commandExecution/requestApproval',
+          params: { threadId: identity.threadId, turnId: identity.turnId, command: 'unsupported operation', reason: 'Human decision required' } } });
+        return { ...identity, status: 'interrupted', authentication: 'chatgpt', terminalObserved: false, messages: [], uncertainties: ['HUMAN_REQUIRED'] };
+      }
       if (options.reviewOnly && mode.activeReviewer) {
         active(); await wait;
         return { ...identity, terminalObserved: false, status: 'uncertain', authentication: 'chatgpt', uncertainties: ['INTERRUPTION_UNCONFIRMED'], messages: [] };
       }
-      if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), 'candidate\n');
+      if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), corrective ? 'corrected\n' : 'candidate\n');
       options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
       const findings = ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: id === 'R1' ? 'FAIL' : 'PASS',
         evidence: id === 'R1' ? 'greeting.txt contains candidate; replace it with the required greeting.' : 'Synthetic complete evidence assessment.' }));
@@ -76,21 +95,26 @@ async function automaticAttempt(t, mode = {}) {
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
         ...(options.reviewOnly ? mode.result : {}),
         messages: options.reviewOnly ? [{ provenance: 'reasoning', text: 'Private reasoning must not be retained.' }, { provenance: 'model', text }] : [] };
-    }, async close() { if (options.reviewOnly && mode.activeReviewer) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return true; },
-    async cancel() { if (options.reviewOnly && mode.activeReviewer) { stops.push('cancel'); return mode.cancelResult ?? true; } },
+    }, async close() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection)) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return corrective && mode.correctiveCloseUncertain ? false : true; },
+    async cancel() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection)) { stops.push('cancel'); stopped(); return mode.cancelResult ?? true; } },
   }; };
   if (mode.validationFailure) c.localValidationFactory = () => ({ terminationConfirmed: true, async run() { throw Error('Synthetic validator failure'); }, cancel() {} });
+  if (mode.beforeDispatch) {
+    const run = c.runCorrection.bind(c);
+    c.runCorrection = async id => { await mode.beforeDispatch(c, id); return run(id); };
+  }
   const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
     automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
   if (mode.versioned) input.automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
+  if (mode.correction) Object.assign(input.automatic, { max_codex_turns: 3, max_corrections: 1 });
   if (mode.manual) delete input.automatic;
   if (mode.validationFailure) input.contract.test_commands = ['true'];
   await mode.configure?.(c, input);
   const result = await c.start(input);
-  if (mode.activeReviewer) await reviewerActive;
+  if (mode.activeReviewer || mode.activeCorrection) await reviewerActive;
   else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
     if (mode.manual) { await c.review({ task_id: result.task_id, request_id: 'manual_review' }); await Promise.all([...c.jobs.values()]); } }
-  return { ...value, id: result.task_id, calls, stops, input, normal, prompts, publisherCalls };
+  return { ...value, id: result.task_id, calls, stops, input, normal, prompts, publisherCalls, submissions };
 }
 
 function sqliteAbort(c, table, predicate, event = 'INSERT') {
@@ -107,6 +131,304 @@ async function restartEvidenceController(t, value) {
     executor: value.executor, secrets: ['test-sensitive-value'], localBackendFactory: () => assert.fail('Model replay forbidden') }).init();
   t.after(() => c.close()); return c;
 }
+
+test('single correction authorization accepts only explicit local versioned 3/1 or the existing 2/0 limits', async t => {
+  const { c, api } = await setup(t);
+  const input = { execution_backend: 'local_codex', repository_id: 'fixture', automatic: { publish: { title: 'Fixture', draft: true },
+    max_duration_seconds: 120, max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
+  assert.equal(c.automaticAuthorization(input).max_corrections, 1);
+  for (const changes of [{ max_codex_turns: 2 }, { max_codex_turns: 4 }, { max_corrections: 0 }, { max_corrections: 2 },
+    { review_protocol: undefined }, { review_protocol: 'legacy' }, { max_duration_seconds: 901 }])
+    assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...changes } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  for (const changes of [{ execution_backend: 'agents_api' }, { repository_id: undefined }])
+    assert.throws(() => c.automaticAuthorization({ ...input, ...changes }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  assert.equal(c.automaticAuthorization({ ...input, automatic: { ...input.automatic, max_codex_turns: 2, max_corrections: 0 } }).max_codex_turns, 2);
+  assert.equal(api.created.length, 0);
+});
+
+test('single correction preserves the rejected tree and evidence, runs once in a fresh workspace, and stops for review', async t => {
+  let rejected, before, history, seenPrompt;
+  const value = await automaticAttempt(t, { versioned: true, correction: true, async beforeCorrection(c, options, input) {
+    const parent = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => task.automatic);
+    rejected = parent; seenPrompt = input.prompt;
+    before = await statusFiles(path.join(c.workspaceRoot, parent.id), parent.repository.canonical_path);
+    history = attemptRows(c, parent.id);
+    const child = c.task(parent.automatic.correction.task_id);
+    assert.equal(child.correction_state, 'running'); assert.notEqual(options.cwd, path.join(c.workspaceRoot, parent.id, 'repo'));
+    assert.equal(repoGit(options.cwd, 'rev-parse', 'HEAD').trim(), parent.baseline);
+    assert.equal(repoGit(options.cwd, 'write-tree').trim(), parent.reviewer.reviewed_git_state.tree_sha);
+    assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(child.request_id).status, 'reserved');
+  } });
+  const { c, id, calls, publisherCalls, input } = value, parent = c.task(id), lineage = parent.automatic.correction;
+  assert(lineage, JSON.stringify(parent.automatic));
+  const child = c.task(lineage.task_id);
+  assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector']); assert.deepEqual(publisherCalls, []); assert.equal(value.api.created.length, 0);
+  assert.equal(child.correction_state, 'awaiting_review', JSON.stringify(child.implementer));
+  assert.equal(parent.automatic.reason, 'CORRECTION_REQUIRES_INDEPENDENT_REVIEW');
+  assert.equal(child.deadline, parent.deadline); assert.equal(child.baseline, parent.baseline);
+  assert.equal(lineage.rejected_tree_sha, rejected.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(child.implementer.local.thread_id, 'correct-thread'); assert.equal(child.implementer.local.turn_id, 'correct-turn');
+  assert.equal(await statusFiles(path.join(c.workspaceRoot, id), parent.repository.canonical_path), before);
+  assert.deepEqual(parent.reviewer, rejected.reviewer);
+  for (const row of history) assert(attemptRows(c, id).some(current => current.observation_sha256 === row.observation_sha256 && current.value === row.value));
+  assert(attemptRows(c, child.id).length > 3);
+  assert.match(seenPrompt, /Untrusted independent review findings/); assert.match(seenPrompt, /Replace the incorrect greeting/);
+  assert.equal(await fs.readFile(path.join(c.workspaceRoot, child.id, 'repo/greeting.txt'), 'utf8'), 'corrected\n');
+  assert.notEqual((await fs.stat(path.join(c.workspaceRoot, id, 'git-store/config'))).ino,
+    (await fs.stat(path.join(c.workspaceRoot, child.id, 'git-store/config'))).ino);
+  await assert.rejects(c.review({ task_id: child.id, request_id: 'forbidden_review' }), /CORRECTION_REQUIRES_SEPARATE_REVIEW_AUTHORIZATION/);
+  await assert.rejects(c.publish({ task_id: child.id, title: 'No' }), /CORRECTIVE_PUBLICATION_NOT_AUTHORIZED/);
+  await c.start(input); c.scheduleAutomatic(id); await Promise.all([...c.automaticJobs.values()]);
+  assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector']);
+  const { get } = await statusClient(t, c), ledger = statusLedger(c.db), files = await statusFiles(value.normal, c.workspaceRoot);
+  for (const taskId of [id, child.id, id, child.id]) {
+    const result = await get(taskId); assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent.correction.execution_authorized, false);
+    assert.equal(result.structuredContent.correction.attempted_corrections, 1);
+    assert.equal(result.structuredContent.correction.terminal_confirmed, true);
+  }
+  assert.equal(statusLedger(c.db), ledger); assert.equal(await statusFiles(value.normal, c.workspaceRoot), files);
+});
+
+for (const mode of [{ cause: 'missing_evidence' }, { cause: 'unknown_cause' }, { cause: 'human_decision_required' },
+  { cause: 'scope_or_security_failure' }, { humanApproval: true }, { uncertain: true }, { incomplete: true },
+  { validationFailure: true }, { label: 'scope', output: output => { output.findings.find(finding => finding.id === 'SCOPE').status = 'FAIL';
+    output.findings.find(finding => finding.id === 'SCOPE').classification = { kind: 'scope_or_security_failure' }; } },
+  { label: 'test evidence', output: output => { Object.assign(output.findings.find(finding => finding.id === 'TEST_EVIDENCE'), { status: 'FAIL', classification: { kind: 'missing_evidence' } }); } },
+  { label: 'outside target', output: output => { output.findings[0].classification.target_files = ['outside.txt']; } }])
+test(`single correction rejects unqualified evidence ${mode.label || mode.cause || JSON.stringify(Object.keys(mode))}`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, correction: true, ...mode });
+  assert.equal(c.task(id).automatic.correction, undefined); assert(!calls.includes('corrector')); assert.deepEqual(publisherCalls, []);
+});
+
+for (const mode of [{ reuseThread: true }, { reuseTurn: true }, { wrongModel: true }, { ackUnknown: true }, { correctiveCloseUncertain: true }, { correctiveHuman: true }])
+test(`single correction stops without replay for ${JSON.stringify(mode)}`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true, ...mode }), { c, id, calls, publisherCalls } = value;
+  const child = c.task(c.task(id).automatic.correction.task_id);
+  assert.notEqual(child.correction_state, 'awaiting_review'); assert.notEqual(c.task(id).automatic.status, 'succeeded');
+  if (mode.reuseThread || mode.wrongModel) assert.equal(value.submissions.length, 0);
+  assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector']); assert.deepEqual(publisherCalls, []);
+  await c.start(value.input); c.scheduleAutomatic(id); await Promise.all([...c.automaticJobs.values()]);
+  assert.equal(calls.length, 3);
+});
+
+for (const boundary of ['reservation', 'history', 'preflight', 'submission', 'acknowledgment', 'terminal', 'acceptance'])
+test(`single correction SQLite ABORT at ${boundary} cannot grant authority or replay execution`, async t => {
+  let fault;
+  const value = await automaticAttempt(t, { versioned: true, correction: true, configure(c) {
+    const field = { preflight: 'instance_started', submission: 'turn_submission_attempted', acknowledgment: 'turn_submission_acknowledged', terminal: 'terminal_observed' }[boundary];
+    if (boundary === 'history') fault = sqliteAbort(c, 'automatic_attempts', "json_extract(NEW.value,'$.kind')='corrective_execution'");
+    else if (boundary === 'acceptance') fault = sqliteAbort(c, 'operations', "NEW.id LIKE 'correct_%' AND NEW.status='accepted'", 'UPDATE');
+    else fault = sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.correction.parent_task_id') IS NOT NULL" +
+      (field ? ` AND json_extract(NEW.value,'$.implementer.local.${field}')=1` : ''));
+  } });
+  const { c, id, submissions, calls, publisherCalls } = value;
+  try {
+    assert.equal(fault.hits, 1); assert.notEqual(c.task(id).automatic.status, 'succeeded');
+    assert(c.task(id).reviewer.review_result); assert(attemptRows(c, id).some(row => JSON.parse(row.value).packet_utf8));
+    if (['reservation', 'history', 'preflight', 'submission'].includes(boundary)) assert.equal(submissions.length, 0);
+    else assert.equal(submissions.length, 1);
+    const count = calls.length;
+    c.scheduleAutomatic(id); await Promise.all([...c.automaticJobs.values()]); assert.equal(calls.length, count);
+    assert.deepEqual(publisherCalls, []);
+    if (c.task(id).automatic.correction) {
+      const child = c.task(c.task(id).automatic.correction.task_id);
+      assert.notEqual(child.correction_state, 'awaiting_review');
+      const cleanup = await c.cleanup({ task_id: child.id, delete_workspace: true });
+      assert.equal(cleanup.cleanup.workspace_deleted, false);
+    }
+  } finally { c.db.exec('DROP TRIGGER evidence_fault'); }
+});
+
+for (const change of ['tree', 'baseline', 'registry', 'contract', 'validation', 'packet', 'normal'])
+test(`single correction revalidates qualified retained FAIL against changed ${change}`, async t => {
+  let original;
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, correction: true, async beforeDispatch(c, id) {
+    const task = c.task(id); original = task.reviewer.review_result;
+    assert.equal(original.actionability_qualification.potentially_correctable, true);
+    const root = path.join(c.workspaceRoot, id);
+    if (change === 'tree' || change === 'baseline') {
+      const oid = change === 'tree' ? task.reviewer.reviewed_git_state.tree_sha : task.baseline;
+      await fs.unlink(path.join(root, 'git-store/objects', oid.slice(0, 2), oid.slice(2)));
+    }
+    if (change === 'registry') await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: {} }));
+    if (change === 'contract') await fs.writeFile(path.join(root, 'contract.json'), '{}');
+    if (change === 'validation') { task.local_validation.status = 'failed'; c.save(task); }
+    if (change === 'packet') { const file = path.join(root, task.reviewer.packet_directory, 'evidence.json'); await fs.chmod(file, 0o600); await fs.appendFile(file, 'changed'); }
+    if (change === 'normal') await fs.writeFile(path.join(task.repository.canonical_path, 'greeting.txt'), 'changed\n');
+  } });
+  assert.equal(c.task(id).automatic.correction, undefined); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  assert.deepEqual(c.task(id).reviewer.review_result, original);
+});
+
+test('single correction expiry before reservation preserves the original deadline and submits nothing', async t => {
+  const now = Date.now;
+  try {
+    const { c, id, calls, submissions } = await automaticAttempt(t, { versioned: true, correction: true, beforeDispatch(c, id) {
+      const deadline = c.task(id).deadline; Date.now = () => deadline;
+    } });
+    assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(submissions, []);
+    assert.equal(c.task(id).automatic.correction, undefined); assert.equal(c.task(id).automatic.reason, 'TASK_EXPIRED');
+    assert.equal(c.task(id).deadline, c.task(id).automatic.deadline);
+  } finally { Date.now = now; }
+});
+
+test('single correction requires committed history before native submission even when SQLite silently ignores an insert', async t => {
+  let ignored = 0;
+  const { c, id, submissions, publisherCalls } = await automaticAttempt(t, { versioned: true, correction: true, configure(c) {
+    c.db.function('ignore_corrective_observation', () => ignored++ === 0 ? 1 : 0);
+    c.db.exec(`CREATE TEMP TRIGGER ignore_history BEFORE INSERT ON automatic_attempts
+      WHEN json_extract(NEW.value,'$.kind')='corrective_execution' AND json_extract(NEW.value,'$.implementer.local.turn_submission_attempted')=1
+      AND json_extract(NEW.value,'$.implementer.local.turn_submission_acknowledged')=0 AND ignore_corrective_observation()
+      BEGIN SELECT RAISE(IGNORE); END;`);
+  } });
+  assert(ignored > 0); assert.deepEqual(submissions, []); assert.deepEqual(publisherCalls, []);
+  assert.notEqual(c.task(c.task(id).automatic.correction.task_id).correction_state, 'awaiting_review');
+  assert(c.task(id).reviewer.review_result); c.db.exec('DROP TRIGGER ignore_history');
+});
+
+for (const boundary of ['submission', 'acknowledgment', 'acceptance', 'submission operation', 'acceptance operation'])
+test(`corrective SQLite IGNORE at ${boundary} verifies intended writes and remains uncertain across a separate Controller restart`, async t => {
+  let ignored = 0, original;
+  const value = await automaticAttempt(t, { versioned: true, correction: true, async beforeCorrection(c) {
+    const parent = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => task.automatic);
+    original = { reviewer: JSON.stringify(parent.reviewer), rows: attemptRows(c, parent.id),
+      packet: await fs.readFile(path.join(c.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8') };
+  }, configure(c) {
+    c.db.function('count_ignored_correction', () => { ignored++; return 1; });
+    const operation = boundary.endsWith('operation');
+    const predicate = operation ? `NEW.id LIKE 'correct_%' AND NEW.status='${boundary.startsWith('submission') ? 'submitting' : 'accepted'}'` :
+      "json_extract(NEW.value,'$.correction.parent_task_id') IS NOT NULL AND " + (boundary === 'acceptance' ?
+        "json_extract(NEW.value,'$.correction_state')='awaiting_review'" :
+        `json_extract(NEW.value,'$.implementer.local.${boundary === 'submission' ? 'turn_submission_attempted' : 'turn_submission_acknowledged'}')=1`);
+    c.db.exec(`CREATE TEMP TRIGGER ignore_correction BEFORE ${operation ? 'UPDATE ON operations' : 'INSERT ON tasks'}
+      WHEN (${predicate}) AND count_ignored_correction() BEGIN SELECT RAISE(IGNORE); END;`);
+  } });
+  const { c, id, submissions, calls, publisherCalls } = value, parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  c.db.exec('DROP TRIGGER ignore_correction');
+  assert(ignored > 0);
+  const beforeSubmission = boundary.startsWith('submission');
+  assert.equal(submissions.length, beforeSubmission ? 0 : 1);
+  assert.notEqual(child.correction_state, 'awaiting_review');
+  assert.notEqual(c.db.prepare('SELECT status FROM operations WHERE id=?').get(child.request_id).status, 'accepted');
+  assert.equal(parent.automatic.status, 'uncertain'); assert.deepEqual(publisherCalls, []);
+  const check = async controller => {
+    const { get } = await statusClient(t, controller), ledger = statusLedger(controller.db);
+    for (const taskId of [id, child.id, id]) {
+      const response = await get(taskId); assert.notEqual(response.isError, true);
+      const status = response.structuredContent;
+      assert.equal(status.correction.retention_uncertain, true);
+      assert.equal(status.correction.terminal_confirmed, false);
+      assert.equal(status.correction.attempted_corrections, beforeSubmission ? null : 1);
+      if (status.automatic) assert.equal(status.automatic.usage.correction_turns, status.correction.attempted_corrections);
+    }
+    assert.equal(statusLedger(controller.db), ledger);
+    const currentReview = controller.task(id).reviewer, originalReview = JSON.parse(original.reviewer);
+    delete currentReview.stopping; delete originalReview.stopping;
+    delete currentReview.local.human_attention_required; delete originalReview.local.human_attention_required;
+    assert.deepEqual(currentReview, originalReview);
+    assert.equal(await fs.readFile(path.join(controller.workspaceRoot, id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'), original.packet);
+    for (const row of original.rows) assert(attemptRows(controller, id).some(current => current.value === row.value && current.observation_sha256 === row.observation_sha256));
+  };
+  await check(c);
+  const restarted = await restartEvidenceController(t, value);
+  await check(restarted);
+  await restarted.start(value.input); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(calls.length, 3); assert.deepEqual(publisherCalls, []);
+});
+
+for (const stale of ['task', 'operation']) test(`corrective status detects a stale ${stale} snapshot without losing attempted evidence across restart`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true }), { c, id, calls } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  assert.equal(child.correction_state, 'awaiting_review'); assert.equal(value.submissions.length, 1);
+  if (stale === 'task') {
+    const prior = attemptRows(c, child.id).map(row => JSON.parse(row.value)).find(row => row.state === 'running' && row.implementer.local.thread_id && !row.implementer.local.turn_submission_attempted);
+    assert(prior);
+    child.implementer = prior.implementer; child.correction_state = prior.state; child.correction_reason = prior.reason;
+    c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(child), child.id);
+  } else c.db.prepare('UPDATE operations SET status=? WHERE id=?').run('result_received', child.request_id);
+  const check = async controller => {
+    const { get } = await statusClient(t, controller), ledger = statusLedger(controller.db), files = await statusFiles(value.normal, controller.workspaceRoot);
+    for (const taskId of [id, child.id, id]) {
+      const response = await get(taskId); assert.notEqual(response.isError, true);
+      const status = response.structuredContent;
+      assert.equal(status.correction.attempted_corrections, 1); assert.equal(status.correction.retention_uncertain, true);
+      assert.equal(status.correction.terminal_confirmed, false); assert.equal(status.correction.state, 'needs_attention');
+      assert.equal(status.correction.execution_authorized, false);
+    }
+    assert.equal(statusLedger(controller.db), ledger); assert.equal(await statusFiles(value.normal, controller.workspaceRoot), files);
+    assert.deepEqual(controller.task(id).reviewer.review_result, parent.reviewer.review_result);
+  };
+  await check(c);
+  const restarted = await restartEvidenceController(t, value); await check(restarted);
+  await restarted.start(value.input); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(calls.length, 3); assert.deepEqual(value.publisherCalls, []);
+});
+
+test('single correction restart does not resume or replace a reserved attempt', async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true, activeCorrection: true });
+  const parent = value.c.task(value.id), child = value.c.task(parent.automatic.correction.task_id);
+  const restarted = await restartEvidenceController(t, value);
+  assert.notEqual(restarted.task(parent.id).automatic.status, 'progressing');
+  assert.equal(restarted.task(child.id).correction_state, 'needs_attention');
+  await restarted.start(value.input); restarted.scheduleAutomatic(parent.id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(value.calls.length, 3); assert.equal(restarted.automaticJobs.size, 0);
+  assert.deepEqual(restarted.task(parent.id).automatic.correction, parent.automatic.correction);
+});
+
+test('single correction duplicate dispatch cannot create another backend or submit another turn', async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true, activeCorrection: true }), { c, id } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  await assert.rejects(c.runAutomatic(id), /AUTOMATIC_REPLAY_FORBIDDEN/);
+  await assert.rejects(c.runCorrection(id), /CORRECTION_NOT_AUTHORIZED/);
+  await assert.rejects(c.runLocal(child.id, path.join(c.workspaceRoot, child.id, 'repo'), parent.automatic.contract_binding.contract), /CORRECTION_REPLAY_FORBIDDEN/);
+  assert.deepEqual(value.calls, ['implementer', 'reviewer', 'corrector']); assert.equal(value.submissions.length, 1);
+  await c.cleanup({ task_id: id });
+});
+
+test('single correction preserves the existing active task capacity limit', async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, correction: true, beforeDispatch(c, id) {
+    for (const suffix of ['a', 'b']) c.save({ id: `capacity_${suffix}`, execution_backend: 'agents_api', deadline: c.task(id).deadline,
+      implementer: { state: 'completed' }, request_id: `capacity_${suffix}` });
+  } });
+  assert.equal(c.task(id).automatic.reason, 'ACTIVE_TASK_LIMIT'); assert.equal(c.task(id).automatic.correction, undefined);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('single correction linked MCP status cannot fetch missing promisor objects or write any ledger rows', async t => {
+  const { c, id, root, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, correction: true });
+  const childId = c.task(id).automatic.correction.task_id, { get } = await statusClient(t, c);
+  const remote = path.join(root, 'local-promisor.git'); repoGit(normal, 'clone', '--bare', '--no-hardlinks', normal, remote);
+  repoGit(normal, 'remote', 'add', 'fixture', remote); repoGit(normal, 'config', 'remote.fixture.promisor', 'true');
+  const oid = c.task(id).baseline, object = path.join(normal, '.git/objects', oid.slice(0, 2), oid.slice(2)); await fs.unlink(object);
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  const before = statusLedger(reader), files = await statusFiles(normal, c.workspaceRoot, path.join(c.stateRoot, 'repositories.json'), remote), writes = [];
+  c.db.setAuthorizer((action, table) => { if ([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE].includes(action)) writes.push(table); return sqlite.SQLITE_OK; });
+  try {
+    for (const taskId of [id, childId, id, childId]) {
+      const result = await get(taskId); assert.notEqual(result.isError, true);
+      assert.equal(result.structuredContent.correction.execution_authorized, false);
+      if (taskId === id) assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      await assert.rejects(fs.access(object), { code: 'ENOENT' });
+      assert.equal(await statusFiles(normal, c.workspaceRoot, path.join(c.stateRoot, 'repositories.json'), remote), files);
+      assert.equal(statusLedger(reader), before);
+    }
+    assert.deepEqual(writes, []); assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector']); assert.deepEqual(publisherCalls, []);
+  } finally { c.db.setAuthorizer(null); reader.close(); }
+});
+
+for (const uncertain of [false, true]) test(`single correction expiry stops its owned backend without SQLite; uncertain=${uncertain}`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true, activeCorrection: true,
+    cancelResult: !uncertain, closeResult: !uncertain }), { c, id } = value;
+  c.db.setAuthorizer((action, table) => action === sqlite.SQLITE_READ && table === 'tasks' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+  try {
+    await assert.doesNotReject(c.expireAutomatic(id));
+    assert(value.stops.includes('cancel')); assert(value.stops.includes('close'));
+    assert.equal(c.expiryStops.get(id).confirmed, !uncertain);
+  } finally { c.db.setAuthorizer(null); }
+  await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
+  assert.equal(value.submissions.length, 1); assert.deepEqual(value.publisherCalls, []);
+});
 
 test('versioned automatic FAIL retains authenticated actionability without correction or publication', async t => {
   const value = await automaticAttempt(t, { versioned: true, remedy: 'Do not execute this remedy: /private/work/secret --run-model' });
