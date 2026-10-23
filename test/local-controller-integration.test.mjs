@@ -77,8 +77,10 @@ async function setup(context, mode = {}, options = {}) {
 
 const automaticAuthority = () => ({ publish: { title: 'Explicit fixture draft', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 });
 
-for (const reused of [false, true]) test(`corrective native adapter starts a fresh subscription thread and never resumes; reused=${reused}`, async context => {
-  const calls = []; let index = 0, fixtureFailure;
+for (const mode of [false, true, 'completed history', 'missing history', 'non-array history', 'null history', 'ignored submission', 'ignored acceptance'])
+test(`corrective native adapter starts a fresh subscription thread and never resumes; reused=${mode}`, async context => {
+  const reused = mode === true, qualified = mode === false;
+  const calls = []; let index = 0, fixtureFailure, original, ignored = 0;
   const value = await setup(context, {}, { noApi: true, localBackendFactory: options => {
     const execution = index++, thread = reused && execution === 2 ? 'native-0' : `native-${execution}`, turn = `turn-${execution}`;
     return new LocalCodexBackend({ ...options, spawnProcess(binary, args, config) {
@@ -113,6 +115,16 @@ for (const reused of [false, true]) test(`corrective native adapter starts a fre
                 send({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed' } } });
               });
             } else throw Error(`Unexpected native method ${message.method}`);
+            if (execution === 2 && message.method === 'thread/start') {
+              assert.equal(options.requireFreshThread, true);
+              const parent = value.controller.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => task.automatic);
+              original = { reviewer: JSON.stringify(parent.reviewer), packet: await fs.readFile(path.join(value.controller.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'),
+                rows: value.controller.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=?').all(parent.id) };
+              if (mode === 'completed history') result.thread.turns = [{ id: 'unseen-prior-turn', status: 'completed' }];
+              if (mode === 'missing history') delete result.thread.turns;
+              if (mode === 'non-array history') result.thread.turns = {};
+              if (mode === 'null history') result.thread.turns = null;
+            }
             send({ id: message.id, result });
           })().catch(error => { fixtureFailure = error; send({ id: message.id, error: { code: -32000, message: 'Fixture failure' } }); }); });
         }
@@ -122,18 +134,50 @@ for (const reused of [false, true]) test(`corrective native adapter starts a fre
     } });
   } });
   value.input.automatic = { ...automaticAuthority(), max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION };
+  if (typeof mode === 'string' && mode.startsWith('ignored')) {
+    value.controller.db.function('count_native_ignored_write', () => { ignored++; return 1; });
+    value.controller.db.exec(`CREATE TEMP TRIGGER native_ignored_write BEFORE INSERT ON tasks
+      WHEN json_extract(NEW.value,'$.correction.parent_task_id') IS NOT NULL AND ${mode === 'ignored submission' ?
+        "json_extract(NEW.value,'$.implementer.local.turn_submission_attempted')=1" : "json_extract(NEW.value,'$.correction_state')='awaiting_review'"}
+      AND count_native_ignored_write() BEGIN SELECT RAISE(IGNORE); END;`);
+  }
   let publishes = 0; value.controller.publisher = { target() { publishes++; throw Error('Publication forbidden'); } };
   const result = await value.start(); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
   assert.equal(fixtureFailure, undefined);
   const parent = value.controller.task(result.task_id);
   assert(parent.automatic.correction, JSON.stringify(parent.automatic));
   const child = value.controller.task(parent.automatic.correction.task_id);
-  assert.equal(child.correction_state, reused ? 'needs_attention' : 'awaiting_review', JSON.stringify(child.implementer));
+  assert.equal(child.correction_state, qualified ? 'awaiting_review' : 'needs_attention', JSON.stringify(child.implementer));
   assert.equal(calls.filter(call => call.method === 'thread/start').length, 3);
-  assert.equal(calls.filter(call => call.method === 'turn/start').length, reused ? 2 : 3);
+  assert.equal(calls.filter(call => call.method === 'turn/start').length, qualified || mode === 'ignored acceptance' ? 3 : 2);
   assert.equal(calls.filter(call => call.method === 'thread/resume').length, 0);
   assert.equal(publishes, 0); assert.equal(value.controller._api, undefined); assert.equal(value.executor.started.length, 0);
-  if (!reused) {
+  const originalReview = JSON.parse(original.reviewer), currentReview = structuredClone(parent.reviewer);
+  delete currentReview.stopping; delete originalReview.stopping;
+  delete currentReview.local.human_attention_required; delete originalReview.local.human_attention_required;
+  assert.deepEqual(currentReview, originalReview);
+  assert.equal(await fs.readFile(path.join(value.controller.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'), original.packet);
+  const retained = value.controller.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=?').all(parent.id);
+  for (const row of original.rows) assert(retained.some(current => current.value === row.value && current.observation_sha256 === row.observation_sha256));
+  if (typeof mode === 'string' && mode.startsWith('ignored')) {
+    assert(ignored > 0); value.controller.db.exec('DROP TRIGGER native_ignored_write');
+    assert.notEqual(value.controller.db.prepare('SELECT status FROM operations WHERE id=?').get(child.request_id).status, 'accepted');
+    const server = createServer(value.controller, async () => {}), client = new Client({ name: 'native-receipt-status', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+    context.after(async () => { await client.close(); await server.close(); });
+    const tables = ['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'];
+    const snapshot = () => JSON.stringify(tables.map(table => value.controller.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+    const before = snapshot();
+    for (let count = 0; count < 2; count++) {
+      const result = await client.callTool({ name: 'get_task', arguments: { task_id: parent.id } });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.structuredContent.correction.attempted_corrections, mode === 'ignored submission' ? null : 1);
+      assert.equal(result.structuredContent.correction.retention_uncertain, true);
+      assert.equal(result.structuredContent.correction.terminal_confirmed, false);
+    }
+    assert.equal(snapshot(), before);
+  }
+  if (qualified) {
     assert.equal(child.implementer.local.authentication, 'chatgpt'); assert.equal(child.implementer.local.thread_id, 'native-2');
     assert.equal(child.implementer.local.turn_id, 'turn-2'); assert.equal(child.deadline, parent.deadline);
     const submitted = calls.find(call => call.execution === 2 && call.method === 'turn/start').params;

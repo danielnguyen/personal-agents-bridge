@@ -129,13 +129,14 @@ class Rpc {
 
 export class LocalCodexBackend {
   constructor({ cwd, codexPath = 'codex', codexHome, env = process.env, onApproval, onQuestion, onProgress, onLifecycle,
-    timeoutMs = 180000, spawnProcess = spawn, deferHumanRequests = false, reviewOnly = false } = {}) {
+    timeoutMs = 180000, spawnProcess = spawn, deferHumanRequests = false, reviewOnly = false, requireFreshThread = false } = {}) {
     if (!path.isAbsolute(cwd || '')) throw error('ABSOLUTE_WORKSPACE_REQUIRED');
     this.cwd = cwd; this.binary = codexPath; this.env = childEnvironment(env, codexHome);
     this.onApproval = onApproval; this.onQuestion = onQuestion; this.onProgress = onProgress;
     this.onLifecycle = onLifecycle;
     this.deferHumanRequests = deferHumanRequests;
     this.reviewOnly = reviewOnly === true;
+    this.requireFreshThread = requireFreshThread === true;
     this.timeoutMs = timeoutMs; this.spawnProcess = spawnProcess; this.busy = false; this.closed = false;
   }
   async connect() {
@@ -192,6 +193,7 @@ export class LocalCodexBackend {
   }
   async run({ prompt, allowedFiles, threadId, signal } = {}) {
     if (this.busy) throw error('EXECUTION_ALREADY_ACTIVE');
+    if (this.requireFreshThread && threadId !== undefined) throw error('FRESH_THREAD_REQUIRED');
     if (this.reviewOnly && (threadId !== undefined || !Array.isArray(allowedFiles) || allowedFiles.length)) throw error('INVALID_REVIEW_SCOPE');
     if (!text(prompt) || !Array.isArray(allowedFiles) || (!this.reviewOnly && !allowedFiles.length) || allowedFiles.some(file =>
       !text(file) || path.isAbsolute(file) || file.includes('\\') || file.split('/').some(part => !part || ['..', '.', '.git', '.codex', 'TASK.md'].includes(part)))) throw error('INVALID_TASK_SCOPE');
@@ -218,6 +220,7 @@ export class LocalCodexBackend {
       if (!text(started?.thread?.id) || (threadId && started.thread.id !== threadId) || started.modelProvider !== 'openai' ||
           started.cwd !== this.cwd || started.approvalPolicy !== 'on-request' || started.approvalsReviewer !== 'user' ||
           started.sandbox?.type !== (this.reviewOnly ? 'readOnly' : 'workspaceWrite') || started.sandbox.networkAccess !== false) throw error('THREAD_POLICY_MISMATCH');
+      if (this.requireFreshThread && (!Array.isArray(started.thread.turns) || started.thread.turns.length)) throw error('FRESH_THREAD_REQUIRED');
       if (started.thread.turns?.some(turn => turn.status === 'inProgress')) throw error('THREAD_HAS_ACTIVE_TURN');
       if (this.reviewOnly && (!Array.isArray(started.thread.turns) || started.thread.turns.length)) throw error('REVIEW_THREAD_NOT_FRESH');
       result.threadId = started.thread.id;

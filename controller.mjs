@@ -272,7 +272,7 @@ export class Controller {
       }
       if (t.execution_backend === 'local_codex') {
         if (t.correction && t.correction_state !== 'awaiting_review') {
-          t.correction_state = 'needs_attention'; t.correction_reason = 'CORRECTION_RESTART_NO_REPLAY'; this.save(t);
+          t.correction_state = 'needs_attention'; t.correction_reason ||= 'CORRECTION_RESTART_NO_REPLAY'; this.save(t);
         }
         if (t.local_validation && !['completed', 'unavailable', 'interrupted', 'uncertain'].includes(t.local_validation.status)) {
           t.local_validation.status = 'uncertain'; t.local_validation.diagnostic = 'VALIDATION_RESTART_NO_REPLAY';
@@ -343,14 +343,29 @@ export class Controller {
   save(task, { packetText, operation, relatedTask } = {}) {
     // SAVEPOINT composes with the existing human-response transaction. No await
     // may separate these writes: acceptance, evidence and task state commit together.
+    const writes = relatedTask ? [relatedTask, task] : [task];
+    const protectedWrite = writes.some(t => t.correction || t.automatic?.correction);
+    const intended = new Map(), operationStates = new Map();
+    const verify = () => {
+      if (!protectedWrite) return;
+      for (const t of writes) {
+        if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id)?.value !== intended.get(t.id)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+        if (t.correction) this.verifyCorrectionEvidence(t, operationStates.get(t.id));
+      }
+      if (operation && this.db.prepare('SELECT status FROM operations WHERE id=?').get(operation.id)?.status !== operation.status) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    };
     try {
+      for (const t of writes) intended.set(t.id, JSON.stringify(t));
       this.transaction(() => {
-        for (const t of relatedTask ? [relatedTask, task] : [task]) {
+        for (const t of writes) {
+          if (t.correction) operationStates.set(t.id, operation?.id === t.request_id ? operation.status :
+            this.db.prepare('SELECT status FROM operations WHERE id=?').get(t.request_id)?.status);
           const prior = this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id);
           if (prior) {
             const old = JSON.parse(prior.value);
             if ((old.correction && (digest(old.correction) !== digest(t.correction) || old.deadline !== t.deadline || old.baseline !== t.baseline || t.execution_backend !== 'local_codex')) ||
                 (old.automatic?.correction && digest(old.automatic.correction) !== digest(t.automatic?.correction))) throw new BridgeError('CORRECTION_BINDING_CHANGED');
+            if (old.correction && old.implementer.local.turn_submission_attempted && !t.implementer.local.turn_submission_attempted) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
             if (old.automatic && (digest(old.automatic.authorization) !== digest(t.automatic?.authorization ?? null) ||
                 digest(old.automatic.review_authorization ?? null) !== digest(t.automatic?.review_authorization ?? null) ||
                 (old.reviewer?.review_protocol && old.reviewer.review_protocol !== t.reviewer?.review_protocol))) throw new BridgeError('AUTOMATIC_REVIEW_AUTHORIZATION_CHANGED');
@@ -368,7 +383,7 @@ export class Controller {
             this.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?) ON CONFLICT(task_id,attempt_id,observation_sha256) DO NOTHING')
               .run(t.id, t.request_id, digest(observation), JSON.stringify(observation));
           }
-          this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?)').run(t.id, JSON.stringify(t));
+          this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?)').run(t.id, intended.get(t.id));
           for (const row of this.db.prepare('SELECT id,value FROM audit').all()) {
             const a = JSON.parse(row.value); if (a.task_id !== t.id) continue;
             const ref = t[a.role];
@@ -386,10 +401,15 @@ export class Controller {
           }
         }
         if (operation) this.opDone(operation.id, operation.status);
+        verify();
       });
+      // Verify the intended snapshot again after commit. A valid older snapshot
+      // is not proof that this transition or its submission intent was retained.
+      verify();
     } catch (error) {
       if (!task.automatic && !task.correction) throw error;
       this.persistenceFailures.add(task.id);
+      for (const t of writes) if (t.correction) this.persistenceFailures.add(t.id);
       throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
     }
   }
@@ -714,10 +734,37 @@ export class Controller {
       baseline_commit: task.baseline, deadline: task.deadline, repository: task.repository, implementer: task.implementer,
       state: task.correction_state, reason: task.correction_reason || null };
   }
-  verifyCorrectionEvidence(task) {
+  verifyCorrectionEvidence(task, operationStatus) {
+    if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id)?.value !== JSON.stringify(task)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
     const observation = this.correctiveObservation(task), sha = digest(observation);
     const row = this.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=? AND attempt_id=? AND observation_sha256=?').get(task.id, task.request_id, sha);
     if (!row || digest(JSON.parse(row.value)) !== sha) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    const operation = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.request_id);
+    if (operation?.task_id !== task.id || operation.fingerprint !== digest({ kind: 'correction', payload: task.correction }) ||
+        (operationStatus !== undefined && operation.status !== operationStatus)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    if (operationStatus !== undefined) return;
+    const local = task.implementer.local;
+    for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
+      const prior = JSON.parse(row.value);
+      if (digest(prior) !== row.observation_sha256 || (prior.implementer?.local.turn_submission_attempted && !local.turn_submission_attempted)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    }
+    const expected = task.correction_state === 'awaiting_review' ? 'accepted' : task.implementer.error || (!local.turn_submission_attempted && local.result_received) ? 'failed' :
+      local.result_received ? 'result_received' : local.turn_submission_acknowledged ? 'submitted' : local.turn_submission_attempted ? 'submitting' : 'reserved';
+    if ((operation.status === 'accepted' && (task.correction_state !== 'awaiting_review' || !localExecutionQualified(local))) ||
+        (task.correction_state !== 'needs_attention' && operation.status !== expected) ||
+        (['submitting', 'submitted', 'result_received', 'accepted'].includes(operation.status) && !local.turn_submission_attempted)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+  }
+  correctiveSubmission(task) {
+    let attempted = task.implementer.local.turn_submission_attempted === true;
+    try {
+      const operation = this.db.prepare('SELECT status FROM operations WHERE id=?').get(task.request_id);
+      attempted ||= ['submitting', 'submitted', 'result_received', 'accepted'].includes(operation?.status);
+      for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
+        const prior = JSON.parse(row.value);
+        if (digest(prior) === row.observation_sha256 && prior.implementer?.local.turn_submission_attempted) attempted = true;
+      }
+    } catch { return attempted ? 1 : null; }
+    return Number(attempted);
   }
   async correctionEvidence(id, reservation) {
     const task = this.task(id); this.automaticGuard(task);
@@ -805,8 +852,13 @@ export class Controller {
       task.correction_state = qualified ? 'awaiting_review' : 'needs_attention';
       task.correction_reason ||= qualified ? 'CORRECTION_REQUIRES_INDEPENDENT_REVIEW' : 'CORRECTION_EXECUTION_UNQUALIFIED';
       this.save(task, { operation: { id: requestId, status: qualified ? 'accepted' : 'uncertain' } });
-      this.verifyCorrectionEvidence(this.task(childId));
+      this.verifyCorrectionEvidence(task);
       this.finishAutomatic(id, qualified ? 'stopped' : 'uncertain', task.correction_reason);
+    } catch (error) {
+      if (this.persistenceFailures.has(childId)) {
+        this.persistenceAttention(childId); this.persistenceFailures.add(id);
+      }
+      throw error;
     } finally {
       if (this.localRuns.has(childId)) await this.stopLocalWithoutStorage(id);
     }
@@ -1242,7 +1294,8 @@ export class Controller {
     }
     task.local_protected_before = protectedState; task.local_execution_evidence = createLocalEvidence(id); this.save(task);
     const abort = new AbortController();
-    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.executionTimeout(task), deferHumanRequests: true, onLifecycle: event => {
+    const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.executionTimeout(task), deferHumanRequests: true,
+      ...(task.correction ? { requireFreshThread: true } : {}), onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
       const current = this.task(id), ref = current.implementer, local = ref.local;
       this.correctiveIdentity(current, event);
@@ -1277,7 +1330,7 @@ export class Controller {
       }
       this.save(current, current.correction && ['turn_submitting', 'turn_acknowledged'].includes(event.phase) ?
         { operation: { id: current.request_id, status: event.phase === 'turn_submitting' ? 'submitting' : 'submitted' } } : {});
-      if (current.correction) this.verifyCorrectionEvidence(this.task(id));
+      if (current.correction) this.verifyCorrectionEvidence(current);
       if (unsupported && current.automatic) this.finishAutomatic(id, 'stopped', 'AUTOMATIC_HUMAN_ATTENTION_REQUIRED');
       if (unsupported) abort.abort();
       if (ref.stopping && event.phase !== 'terminal_observed') throw new BridgeError('LOCAL_STOP_REQUESTED');
@@ -1317,7 +1370,7 @@ export class Controller {
       }
       this.invalidateLocalRequests(task, 'LOCAL_TURN_ENDED_WITHOUT_CALLBACK_RESOLUTION');
       this.localHumanState(task);
-      if (task.correction) this.save(task, { operation: { id: task.request_id, status: 'result_received' } });
+      if (task.correction) this.save(task, { operation: { id: task.request_id, status: local.turn_submission_attempted ? 'result_received' : 'failed' } });
       else { this.opDone(task.request_id); this.save(task); }
     } finally {
       const closed = await settledWithin(Promise.resolve().then(() => backend.close()));
@@ -1515,8 +1568,7 @@ export class Controller {
         human_attention_required: t.automatic.human_attention_required, limits: t.automatic.authorization,
         review_request_id: t.automatic.review_request_id, publish_request_id: t.automatic.publish_request_id,
         usage: { implementer_turn_submissions_attempted: Number(t.implementer.local.turn_submission_attempted),
-          reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns:
-            t.automatic.correction ? Number(this.task(t.automatic.correction.task_id).implementer.local.turn_submission_attempted) : 0,
+          reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns: t.automatic.correction ? null : 0,
           token_usage: null, subscription_billing_attribution: 'unverified' } };
       result.automatic.review = await this.automaticReviewSummary(t);
       if (versioned && this.persistenceFailures.has(id)) {
@@ -1546,15 +1598,25 @@ export class Controller {
       const child = this.task(lineage.task_id), local = child.implementer.local;
       let retained = true;
       try { this.verifyCorrectionEvidence(child); } catch { retained = false; }
+      const parent = t.automatic ? t : this.task(lineage.parent_task_id);
+      const uncertain = !retained || !!storageDiagnostic || this.persistenceFailures.has(child.id) || this.persistenceFailures.has(parent.id) ||
+        [child.correction_reason, parent.automatic.reason].includes('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED') ||
+        (child.correction_state === 'needs_attention' && local.instance_started && !local.result_received);
+      const observed = this.correctiveSubmission(child), attempted = observed === 1 ? 1 : uncertain ? null : observed;
       result.correction = { parent_task_id: lineage.parent_task_id, task_id: lineage.task_id, attempt_id: lineage.request_id,
         rejected_attempt_id: lineage.rejected_attempt_id, rejected_tree_sha: lineage.rejected_tree_sha, baseline_commit: lineage.baseline_commit,
-        deadline: new Date(lineage.deadline).toISOString(), state: child.correction_state,
-        reason: retained ? child.correction_reason || null : 'CORRECTIVE_EVIDENCE_UNVERIFIED', reserved_corrections: 1, attempted_corrections: Number(local.turn_submission_attempted),
+        deadline: new Date(lineage.deadline).toISOString(), state: uncertain ? 'needs_attention' : child.correction_state,
+        reason: retained ? child.correction_reason || null : 'CORRECTIVE_EVIDENCE_UNVERIFIED', reserved_corrections: 1, attempted_corrections: attempted,
         remaining_codex_turns: 0, remaining_corrections: 0, execution_authorized: false,
         execution: Object.fromEntries(['thread_id', 'turn_id', 'model', 'authentication', 'turn_submission_attempted',
           'turn_submission_acknowledged', 'terminal_observed', 'result_received', 'server_closed'].map(key => [key, local[key]])),
-        terminal_confirmed: retained && child.correction_state === 'awaiting_review' && localExecutionQualified(local) && !this.persistenceFailures.has(child.id),
-        retention_uncertain: !retained || this.persistenceFailures.has(child.id) || this.persistenceFailures.has(lineage.parent_task_id) };
+        terminal_confirmed: !uncertain && child.correction_state === 'awaiting_review' && localExecutionQualified(local),
+        retention_uncertain: uncertain };
+      result.correction.execution.turn_submission_attempted = attempted === null ? null : attempted === 1;
+      if (result.automatic) result.automatic.usage.correction_turns = attempted;
+      if (t.correction && uncertain) {
+        result.state = 'needs_attention'; result.implementer.local.turn_submission_attempted = result.correction.execution.turn_submission_attempted;
+      }
     }
     if (storageDiagnostic) result.storage_diagnostic = storageDiagnostic;
     if (versioned && result.cleanup) { result.cleanup = { ...result.cleanup }; delete result.cleanup.workspace_path; }

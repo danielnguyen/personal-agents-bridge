@@ -287,6 +287,84 @@ test('single correction requires committed history before native submission even
   assert(c.task(id).reviewer.review_result); c.db.exec('DROP TRIGGER ignore_history');
 });
 
+for (const boundary of ['submission', 'acknowledgment', 'acceptance', 'submission operation', 'acceptance operation'])
+test(`corrective SQLite IGNORE at ${boundary} verifies intended writes and remains uncertain across a separate Controller restart`, async t => {
+  let ignored = 0, original;
+  const value = await automaticAttempt(t, { versioned: true, correction: true, async beforeCorrection(c) {
+    const parent = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => task.automatic);
+    original = { reviewer: JSON.stringify(parent.reviewer), rows: attemptRows(c, parent.id),
+      packet: await fs.readFile(path.join(c.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8') };
+  }, configure(c) {
+    c.db.function('count_ignored_correction', () => { ignored++; return 1; });
+    const operation = boundary.endsWith('operation');
+    const predicate = operation ? `NEW.id LIKE 'correct_%' AND NEW.status='${boundary.startsWith('submission') ? 'submitting' : 'accepted'}'` :
+      "json_extract(NEW.value,'$.correction.parent_task_id') IS NOT NULL AND " + (boundary === 'acceptance' ?
+        "json_extract(NEW.value,'$.correction_state')='awaiting_review'" :
+        `json_extract(NEW.value,'$.implementer.local.${boundary === 'submission' ? 'turn_submission_attempted' : 'turn_submission_acknowledged'}')=1`);
+    c.db.exec(`CREATE TEMP TRIGGER ignore_correction BEFORE ${operation ? 'UPDATE ON operations' : 'INSERT ON tasks'}
+      WHEN (${predicate}) AND count_ignored_correction() BEGIN SELECT RAISE(IGNORE); END;`);
+  } });
+  const { c, id, submissions, calls, publisherCalls } = value, parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  c.db.exec('DROP TRIGGER ignore_correction');
+  assert(ignored > 0);
+  const beforeSubmission = boundary.startsWith('submission');
+  assert.equal(submissions.length, beforeSubmission ? 0 : 1);
+  assert.notEqual(child.correction_state, 'awaiting_review');
+  assert.notEqual(c.db.prepare('SELECT status FROM operations WHERE id=?').get(child.request_id).status, 'accepted');
+  assert.equal(parent.automatic.status, 'uncertain'); assert.deepEqual(publisherCalls, []);
+  const check = async controller => {
+    const { get } = await statusClient(t, controller), ledger = statusLedger(controller.db);
+    for (const taskId of [id, child.id, id]) {
+      const response = await get(taskId); assert.notEqual(response.isError, true);
+      const status = response.structuredContent;
+      assert.equal(status.correction.retention_uncertain, true);
+      assert.equal(status.correction.terminal_confirmed, false);
+      assert.equal(status.correction.attempted_corrections, beforeSubmission ? null : 1);
+      if (status.automatic) assert.equal(status.automatic.usage.correction_turns, status.correction.attempted_corrections);
+    }
+    assert.equal(statusLedger(controller.db), ledger);
+    const currentReview = controller.task(id).reviewer, originalReview = JSON.parse(original.reviewer);
+    delete currentReview.stopping; delete originalReview.stopping;
+    delete currentReview.local.human_attention_required; delete originalReview.local.human_attention_required;
+    assert.deepEqual(currentReview, originalReview);
+    assert.equal(await fs.readFile(path.join(controller.workspaceRoot, id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'), original.packet);
+    for (const row of original.rows) assert(attemptRows(controller, id).some(current => current.value === row.value && current.observation_sha256 === row.observation_sha256));
+  };
+  await check(c);
+  const restarted = await restartEvidenceController(t, value);
+  await check(restarted);
+  await restarted.start(value.input); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(calls.length, 3); assert.deepEqual(publisherCalls, []);
+});
+
+for (const stale of ['task', 'operation']) test(`corrective status detects a stale ${stale} snapshot without losing attempted evidence across restart`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true }), { c, id, calls } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  assert.equal(child.correction_state, 'awaiting_review'); assert.equal(value.submissions.length, 1);
+  if (stale === 'task') {
+    const prior = attemptRows(c, child.id).map(row => JSON.parse(row.value)).find(row => row.state === 'running' && row.implementer.local.thread_id && !row.implementer.local.turn_submission_attempted);
+    assert(prior);
+    child.implementer = prior.implementer; child.correction_state = prior.state; child.correction_reason = prior.reason;
+    c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(child), child.id);
+  } else c.db.prepare('UPDATE operations SET status=? WHERE id=?').run('result_received', child.request_id);
+  const check = async controller => {
+    const { get } = await statusClient(t, controller), ledger = statusLedger(controller.db), files = await statusFiles(value.normal, controller.workspaceRoot);
+    for (const taskId of [id, child.id, id]) {
+      const response = await get(taskId); assert.notEqual(response.isError, true);
+      const status = response.structuredContent;
+      assert.equal(status.correction.attempted_corrections, 1); assert.equal(status.correction.retention_uncertain, true);
+      assert.equal(status.correction.terminal_confirmed, false); assert.equal(status.correction.state, 'needs_attention');
+      assert.equal(status.correction.execution_authorized, false);
+    }
+    assert.equal(statusLedger(controller.db), ledger); assert.equal(await statusFiles(value.normal, controller.workspaceRoot), files);
+    assert.deepEqual(controller.task(id).reviewer.review_result, parent.reviewer.review_result);
+  };
+  await check(c);
+  const restarted = await restartEvidenceController(t, value); await check(restarted);
+  await restarted.start(value.input); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(calls.length, 3); assert.deepEqual(value.publisherCalls, []);
+});
+
 test('single correction restart does not resume or replace a reserved attempt', async t => {
   const value = await automaticAttempt(t, { versioned: true, correction: true, activeCorrection: true });
   const parent = value.c.task(value.id), child = value.c.task(parent.automatic.correction.task_id);

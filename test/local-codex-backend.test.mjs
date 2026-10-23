@@ -154,6 +154,32 @@ test('review-only adapter cannot grant native approval even with an accepting ca
   assert(!value.replies.some(reply => reply.result?.decision === 'accept'));
 });
 
+for (const [label, turns] of [['missing', undefined], ['null', null], ['object', {}], ['completed', [{ id: 'old', status: 'completed' }]], ['active', [{ id: 'old', status: 'inProgress' }]]])
+test(`fresh native execution rejects ${label} thread history before turn submission`, async context => {
+  const value = await fixture(context, { 'thread/start': ({ defaults }) => {
+    const started = defaults['thread/start']();
+    if (turns === undefined) delete started.thread.turns; else started.thread.turns = turns;
+    return started;
+  } }, { requireFreshThread: true });
+  const result = await value.run();
+  assert.equal(result.status, 'failed'); assert.equal(result.turnSubmissionAttempted, false);
+  assert.equal(value.requests.filter(request => request.method === 'thread/start').length, 1);
+  assert(!value.requests.some(request => ['turn/start', 'thread/resume'].includes(request.method)));
+});
+
+test('fresh native execution requires an empty thread/start acknowledgment and rejects resume before RPC', async context => {
+  const value = await fixture(context, {}, { requireFreshThread: true });
+  await assert.rejects(value.run({ threadId: 'existing-thread' }), { code: 'FRESH_THREAD_REQUIRED' });
+  assert.equal(value.requests.length, 0);
+  const result = await value.run();
+  assert.equal(result.status, 'completed'); assert.equal(result.authentication, 'chatgpt');
+  const before = value.requests.length;
+  await assert.rejects(value.run({ threadId: result.threadId }), { code: 'FRESH_THREAD_REQUIRED' });
+  assert.equal(value.requests.length, before);
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  assert(!value.requests.some(request => request.method === 'thread/resume'));
+});
+
 test('start and resume use the same thread, ordinary sandbox and structured command provenance', async context => {
   const progress = [];
   const value = await fixture(context, {}, { onProgress: message => progress.push(message.method) });
