@@ -345,12 +345,16 @@ export class Controller {
     // may separate these writes: acceptance, evidence and task state commit together.
     const writes = relatedTask ? [relatedTask, task] : [task];
     const protectedWrite = writes.some(t => t.correction || t.automatic?.correction);
-    const intended = new Map(), operationStates = new Map();
+    const intended = new Map(), operationStates = new Map(), reviewStates = new Map(), retained = [];
     const verify = () => {
       if (!protectedWrite) return;
       for (const t of writes) {
         if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id)?.value !== intended.get(t.id)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
-        if (t.correction) this.verifyCorrectionEvidence(t, operationStates.get(t.id));
+        if (t.correction) this.verifyCorrectionEvidence(t, operationStates.get(t.id), reviewStates.get(t.id));
+      }
+      for (const record of retained) {
+        if (this.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=? AND attempt_id=? AND observation_sha256=?')
+          .get(record.task_id, record.attempt_id, record.sha256)?.value !== record.value) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
       }
       if (operation && this.db.prepare('SELECT status FROM operations WHERE id=?').get(operation.id)?.status !== operation.status) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
     };
@@ -360,6 +364,8 @@ export class Controller {
         for (const t of writes) {
           if (t.correction) operationStates.set(t.id, operation?.id === t.request_id ? operation.status :
             this.db.prepare('SELECT status FROM operations WHERE id=?').get(t.request_id)?.status);
+          if (t.correction && t.automatic) reviewStates.set(t.id, operation?.id === t.automatic.review_request_id ? operation.status :
+            this.db.prepare('SELECT status FROM operations WHERE id=?').get(t.automatic.review_request_id)?.status);
           const prior = this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id);
           if (prior) {
             const old = JSON.parse(prior.value);
@@ -376,8 +382,12 @@ export class Controller {
             const received = old.reviewer?.received_output_sha256;
             if (received && (t.reviewer?.received_output_sha256 !== received || digest(t.reviewer.received_review_output) !== received)) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
           }
-          if (packetText !== undefined) this.retainAutomaticAttempt(t, packetText);
-          if (t.automatic && (t.reviewer?.review_result || t.reviewer?.received_review_output || t.automatic.status !== 'progressing')) this.retainAutomaticAttempt(t);
+          if (packetText !== undefined) {
+            const record = this.retainAutomaticAttempt(t, packetText); if (t.correction && t.automatic) retained.push(record);
+          }
+          if (t.automatic && (t.reviewer?.review_result || t.reviewer?.received_review_output || t.automatic.status !== 'progressing')) {
+            const record = this.retainAutomaticAttempt(t); if (t.correction) retained.push(record);
+          }
           if (t.correction) {
             const observation = this.correctiveObservation(t);
             this.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?) ON CONFLICT(task_id,attempt_id,observation_sha256) DO NOTHING')
@@ -594,7 +604,7 @@ export class Controller {
         Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol'].includes(key)) ||
         (Object.hasOwn(value, 'review_protocol') && value.review_protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION) ||
         !((value.max_codex_turns === 2 && value.max_corrections === 0) ||
-          (value.max_codex_turns === 3 && value.max_corrections === 1 && value.review_protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION)) || !Number.isInteger(value.max_duration_seconds) ||
+          ([3, 4].includes(value.max_codex_turns) && value.max_corrections === 1 && value.review_protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION)) || !Number.isInteger(value.max_duration_seconds) ||
         value.max_duration_seconds < 1 || value.max_duration_seconds > 900 || !plain(value.publish) ||
         Object.keys(value.publish).some(key => !['title', 'body', 'draft'].includes(key)) || value.publish.draft !== true ||
         typeof value.publish.title !== 'string' || !value.publish.title.trim() || value.publish.title.length > 200 || /[\x00-\x1f]/.test(value.publish.title) ||
@@ -621,14 +631,28 @@ export class Controller {
         original.owner_instance !== task.automatic.owner_instance || operation?.task_id !== task.id ||
         operation.fingerprint !== original.request_fingerprint ||
         (task.reviewer && task.reviewer.review_protocol !== selected)) throw new BridgeError('LOCAL_REVIEW_PROTOCOL_CHANGED');
+    if (task.correction) this.correctiveReviewAuthority(task);
     return selected;
+  }
+  correctiveReviewAuthority(task) {
+    const parent = this.task(task.correction.parent_task_id), authority = task.automatic?.review_authorization;
+    if (parent.correction || this.reviewProtocol(parent) !== LOCAL_ACTIONABILITY_REVIEW_VERSION ||
+        parent.automatic.authorization.max_codex_turns !== 4 || parent.automatic.authorization.max_corrections !== 1 ||
+        digest(task.automatic?.authorization) !== digest(parent.automatic.authorization) ||
+        digest(parent.automatic.correction) !== digest(task.correction) ||
+        authority?.parent_task_id !== parent.id || authority.lineage_sha256 !== digest(task.correction) ||
+        authority.parent_review_authorization_sha256 !== digest(parent.automatic.review_authorization) ||
+        task.automatic.contract_binding.sha256 !== parent.automatic.contract_binding.sha256 ||
+        task.baseline !== parent.baseline || task.deadline !== parent.deadline) throw new BridgeError('CORRECTIVE_REVIEW_NOT_AUTHORIZED');
+    return parent;
   }
   reviewBinding(task) {
     const identity = ref => ({ thread_id: ref.local.thread_id, turn_id: ref.local.turn_id, model: ref.local.model, authentication: ref.local.authentication });
     return { protocol: this.reviewProtocol(task), task_id: task.id, authorization: task.automatic.review_authorization,
       contract_sha256: task.automatic.contract_binding.sha256, baseline_commit: task.baseline, deadline: task.deadline,
       reviewed_git_state: task.reviewer.reviewed_git_state, packet_sha256: task.reviewer.packet_hash, packet_bytes: task.reviewer.packet_bytes,
-      validation_sha256: digest(task.local_validation), implementer: identity(task.implementer), reviewer: identity(task.reviewer) };
+      validation_sha256: digest(task.local_validation), implementer: identity(task.implementer), reviewer: identity(task.reviewer),
+      ...(task.correction ? { correction: task.correction } : {}) };
   }
   reviewContext(task, contract, packet) {
     const ref = task.reviewer, implementer = task.implementer, automatic = task.automatic;
@@ -637,7 +661,10 @@ export class Controller {
     const publishing = automatic?.phase === 'publication' && task.publication_frozen === true;
     const identitiesMatch = packet.execution?.task_id === task.id && ['thread_id', 'turn_id', 'model', 'authentication', 'adapter_contract']
       .every(key => packet.execution?.[key] === implementer.local[key]);
-    const reviewerIndependent = identitiesMatch && !!ref.local.thread_id && !!ref.local.turn_id && ref.local.thread_id !== implementer.local.thread_id &&
+    const parent = task.correction ? this.correctiveReviewAuthority(task) : null;
+    const independentLineage = !parent || [parent.implementer, parent.reviewer, implementer].every(role =>
+      role.local.thread_id !== ref.local.thread_id && role.local.turn_id !== ref.local.turn_id);
+    const reviewerIndependent = independentLineage && identitiesMatch && !!ref.local.thread_id && !!ref.local.turn_id && ref.local.thread_id !== implementer.local.thread_id &&
       ref.local.owner_instance === this.instanceId && implementer.local.owner_instance === this.instanceId && ref.request_id === automatic?.review_request_id &&
       reviewOperation?.task_id === task.id && reviewOperation.fingerprint === digest({ kind: 'review', payload: { id: task.id } });
     const executionQualified = reviewerIndependent && [implementer, ref].every(role => !role.error && !role.stale && (!role.stopping || publishing) &&
@@ -645,7 +672,9 @@ export class Controller {
       !this.localRuns.has(task.id) && !this.localRuns.has(`${task.id}:reviewer`) && !this.validationRuns.has(task.id);
     let storageConfirmed = false;
     try { this.storageAuthority(); storageConfirmed = !this.persistenceFailures.has(task.id); } catch { /* No authority from uncertain storage. */ }
-    const authorityValid = storageConfirmed && !this.closed && automatic?.owner_instance === this.instanceId && !this.expiryStops.has(task.id) && !task.cleaned &&
+    const parentValid = !parent || (parent.automatic.status === 'progressing' && parent.automatic.owner_instance === this.instanceId &&
+      !parent.cleaned && !parent.implementer.stopping && !this.expiryStops.has(parent.id) && !this.persistenceFailures.has(parent.id));
+    const authorityValid = parentValid && storageConfirmed && !this.closed && automatic?.owner_instance === this.instanceId && !this.expiryStops.has(task.id) && !task.cleaned &&
       startOperation?.status === 'accepted' && Date.now() < task.deadline && task.deadline === automatic.deadline && digest(contract) === automatic.contract_binding.sha256 &&
       this.reviewProtocol(task) === LOCAL_ACTIONABILITY_REVIEW_VERSION && packet.baseline_commit === task.baseline && packet.current_commit === task.baseline &&
       digest(packet.reviewed_git_state) === digest(ref.reviewed_git_state) && packet.local_scope?.contract_sha256 === automatic.contract_binding.sha256 &&
@@ -654,7 +683,8 @@ export class Controller {
       digest(task.local_validation) === digest(packet.independent_validation);
     const uncertainPublication = !!task.publication_error || this.db.prepare('SELECT status FROM operations WHERE id=?').get(automatic.publish_request_id)?.status === 'uncertain';
     return { reviewerIndependent, executionQualified, authorityValid,
-      uncertaintyFree: executionQualified && authorityValid && validationConfirmed && ['pending', 'accepted'].includes(reviewOperation?.status) &&
+      uncertaintyFree: executionQualified && authorityValid && validationConfirmed &&
+        ['pending', 'accepted', ...(parent ? ['submitted', 'result_received'] : [])].includes(reviewOperation?.status) &&
         !uncertainPublication && automatic.status !== 'uncertain' };
   }
   validateReviewOutput(task, output, contract, packet) {
@@ -716,9 +746,49 @@ export class Controller {
       if (task.automatic.correction) {
         summary.potentially_correctable = false; summary.blockers.unshift('CORRECTION_BUDGET_RESERVED');
       }
+      if (task.correction) { summary.potentially_correctable = false; summary.blockers.unshift('CORRECTION_BUDGET_EXHAUSTED'); }
     } catch {
       summary.state = 'malformed_or_uncertain'; summary.potentially_correctable = false;
       summary.blockers = ['REVIEW_EVIDENCE_UNVERIFIED', 'CORRECTION_EXECUTION_DISABLED'];
+    }
+    return summary;
+  }
+  async correctiveReviewSummary(task) {
+    const ref = task.reviewer, validation = task.local_validation;
+    const summary = { protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION, request_id: task.automatic.review_request_id,
+      state: task.automatic.status === 'progressing' ? validation?.status === 'running' || validation?.status === 'pending' ? 'validating' : ref?.state || 'reserved' : 'needs_attention',
+      corrected_tree_sha: ref?.reviewed_git_state?.tree_sha || null, overall: null, qualified: false,
+      evidence: 'pending', uncertain: task.automatic.status === 'uncertain', reason: task.automatic.reason,
+      received_output: ref?.received_review_output ? 'durable' : this.pendingReviewResults.get(task.id)?.received_output ? 'volatile_only' : 'unavailable',
+      attempted_turns: this.correctiveSubmission(task, 'reviewer'), reserved_turns: 1, execution_authorized: false, publication_authorized: false,
+      validation: { attempt_id: validation?.attempt_id || null, status: validation?.status || 'not_started',
+        qualified: false, termination_confirmed: validation?.termination_confirmed === true,
+        results: (validation?.results || []).slice(0, 10).map(record => ({ command_index: record.command_index, status: record.status,
+          exit_code: record.exit_code, start_observed: record.start_observed, completion_observed: record.completion_observed, termination_confirmed: record.termination_confirmed })) },
+      reviewer: ref ? Object.fromEntries(['thread_id', 'turn_id', 'model', 'authentication', 'turn_submission_attempted',
+        'turn_submission_acknowledged', 'terminal_observed', 'result_received', 'server_closed'].map(key => [key, ref.local[key]])) : null };
+    try {
+      this.storageAuthority();
+      const parent = this.correctiveReviewAuthority(task);
+      this.verifyCorrectionEvidence(task);
+      if (summary.uncertain || this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      if (!ref?.review_result) {
+        if (ref?.error || task.automatic.status !== 'progressing' || ref?.pending_review_output || ref?.pending_review_result) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+        return summary;
+      }
+      this.verifyAutomaticEvidence(task, { progressing: true });
+      const packet = await this.currentReviewPacket(task);
+      await this.currentReviewPacket(parent);
+      const review = this.revalidateVersionedReview(task, packet);
+      if (ref.state !== 'completed' || !localExecutionQualified(ref.local) || !Object.values(ref.review_result.controller_context || {}).every(value => value === true) ||
+          Object.keys(ref.review_result.controller_context || {}).length !== 4) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      summary.validation.qualified = independentValidationPassed(validation, task.automatic.contract_binding.contract.test_commands, ref.reviewed_git_state, task.id);
+      if (!summary.validation.qualified) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      Object.assign(summary, { state: 'reviewed', overall: review.overall, qualified: true, evidence: 'retained', uncertain: false });
+    } catch {
+      Object.assign(summary, { state: 'malformed_or_uncertain', overall: null, qualified: false, evidence: 'unavailable', uncertain: true, reason: 'REVIEW_EVIDENCE_UNVERIFIED' });
+      summary.validation.qualified = false;
+      if (summary.attempted_turns !== 1) summary.attempted_turns = null;
     }
     return summary;
   }
@@ -732,9 +802,12 @@ export class Controller {
   correctiveObservation(task) {
     return { task_id: task.id, attempt_id: task.request_id, kind: 'corrective_execution', correction: task.correction,
       baseline_commit: task.baseline, deadline: task.deadline, repository: task.repository, implementer: task.implementer,
-      state: task.correction_state, reason: task.correction_reason || null };
+      state: task.correction_state, reason: task.correction_reason || null,
+      ...(task.automatic ? { review: { authorization: task.automatic.review_authorization,
+        status: task.automatic.status, phase: task.automatic.phase, reason: task.automatic.reason,
+        reviewer: task.reviewer || null, validation: task.local_validation || null } } : {}) };
   }
-  verifyCorrectionEvidence(task, operationStatus) {
+  verifyCorrectionEvidence(task, operationStatus, reviewStatus) {
     if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id)?.value !== JSON.stringify(task)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
     const observation = this.correctiveObservation(task), sha = digest(observation);
     const row = this.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=? AND attempt_id=? AND observation_sha256=?').get(task.id, task.request_id, sha);
@@ -742,11 +815,21 @@ export class Controller {
     const operation = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.request_id);
     if (operation?.task_id !== task.id || operation.fingerprint !== digest({ kind: 'correction', payload: task.correction }) ||
         (operationStatus !== undefined && operation.status !== operationStatus)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    if (task.automatic) {
+      this.reviewProtocol(task);
+      const review = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.automatic.review_request_id);
+      if (review?.task_id !== task.id || review.fingerprint !== digest({ kind: 'review', payload: { id: task.id } }) ||
+          (reviewStatus !== undefined && review.status !== reviewStatus)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+      if (reviewStatus === undefined && ((review.status === 'accepted' && (task.reviewer?.state !== 'completed' || !task.reviewer.review_result ||
+          !localExecutionQualified(task.reviewer.local) || task.reviewer.evidence_retention?.review !== 'retained')) ||
+          (['submitting', 'submitted', 'result_received', 'accepted'].includes(review.status) && !task.reviewer?.local.turn_submission_attempted))) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+    }
     if (operationStatus !== undefined) return;
     const local = task.implementer.local;
     for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
       const prior = JSON.parse(row.value);
       if (digest(prior) !== row.observation_sha256 || (prior.implementer?.local.turn_submission_attempted && !local.turn_submission_attempted)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+      if (prior.review?.reviewer?.local.turn_submission_attempted && !task.reviewer?.local.turn_submission_attempted) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
     }
     const expected = task.correction_state === 'awaiting_review' ? 'accepted' : task.implementer.error || (!local.turn_submission_attempted && local.result_received) ? 'failed' :
       local.result_received ? 'result_received' : local.turn_submission_acknowledged ? 'submitted' : local.turn_submission_attempted ? 'submitting' : 'reserved';
@@ -754,21 +837,23 @@ export class Controller {
         (task.correction_state !== 'needs_attention' && operation.status !== expected) ||
         (['submitting', 'submitted', 'result_received', 'accepted'].includes(operation.status) && !local.turn_submission_attempted)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
   }
-  correctiveSubmission(task) {
-    let attempted = task.implementer.local.turn_submission_attempted === true;
+  correctiveSubmission(task, role = 'implementer') {
+    let attempted = task[role]?.local.turn_submission_attempted === true;
     try {
-      const operation = this.db.prepare('SELECT status FROM operations WHERE id=?').get(task.request_id);
+      const operation = this.db.prepare('SELECT status FROM operations WHERE id=?').get(role === 'reviewer' ? task.automatic?.review_request_id : task.request_id);
       attempted ||= ['submitting', 'submitted', 'result_received', 'accepted'].includes(operation?.status);
       for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
         const prior = JSON.parse(row.value);
-        if (digest(prior) === row.observation_sha256 && prior.implementer?.local.turn_submission_attempted) attempted = true;
+        if (digest(prior) === row.observation_sha256 && (role === 'reviewer' ? prior.review?.reviewer : prior.implementer)?.local.turn_submission_attempted) attempted = true;
       }
     } catch { return attempted ? 1 : null; }
     return Number(attempted);
   }
   async correctionEvidence(id, reservation) {
-    const task = this.task(id); this.automaticGuard(task);
-    if (task.automatic.authorization.max_codex_turns !== 3 || task.automatic.authorization.max_corrections !== 1 ||
+    const task = this.task(id);
+    if (task.correction) throw new BridgeError('CORRECTION_BUDGET_EXHAUSTED');
+    this.automaticGuard(task);
+    if (![3, 4].includes(task.automatic.authorization.max_codex_turns) || task.automatic.authorization.max_corrections !== 1 ||
         this.reviewProtocol(task) !== LOCAL_ACTIONABILITY_REVIEW_VERSION ||
         (task.automatic.correction && digest(task.automatic.correction) !== digest(reservation ?? null)) ||
         task.implementer.local.human_requests.length || task.reviewer?.local.human_requests.length ||
@@ -778,6 +863,7 @@ export class Controller {
     const review = this.revalidateVersionedReview(task, packet);
     const context = this.reviewContext(task, task.automatic.contract_binding.contract, packet);
     if (review.overall !== 'FAIL' || review.model_overall !== 'FAIL' || review.controller_overrides.length ||
+        (task.automatic.authorization.max_codex_turns === 4 && task.implementer.local.turn_id === task.reviewer.local.turn_id) ||
         !Object.values(context).every(value => value === true) || !review.actionability_qualification.potentially_correctable ||
         ['SCOPE', 'TEST_EVIDENCE'].some(id => review.findings.find(finding => finding.id === id)?.status !== 'PASS') ||
         review.findings.filter(finding => finding.status === 'FAIL').some(finding => finding.classification?.kind !== 'implementation_defect')) throw new BridgeError('CORRECTION_REVIEW_UNQUALIFIED');
@@ -829,12 +915,21 @@ export class Controller {
       await this.correctionEvidence(id, lineage);
       await fs.mkdir(root, { mode: 0o700 });
       const repository = await createCorrectiveWorktree(root, childId, path.join(this.workspaceRoot, id), parent.repository, lineage.rejected_tree_sha);
+      if (parent.automatic.authorization.max_codex_turns === 4) {
+        // Keep the materialized rejected files, with the original baseline in
+        // the new private index, before recording normal execution safeguards.
+        git(repo, 'read-tree', parent.baseline);
+      }
       await fs.writeFile(path.join(repo, 'TASK.md'), contractMarkdown(contract, 'local_codex'), { mode: 0o600, flag: 'wx' });
       await fs.writeFile(path.join(root, 'contract.json'), JSON.stringify(contract), { mode: 0o600, flag: 'wx' });
       await fs.writeFile(path.join(root, 'baseline-state.json'), JSON.stringify({ head: parent.baseline,
         staged_files: git(repo, 'diff', '--cached', '--name-only'), config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')) }), { mode: 0o600, flag: 'wx' });
       const task = this.task(childId); task.repository = repository; task.correction_state = 'running';
       this.save(task);
+      if (parent.automatic.authorization.max_codex_turns === 4) {
+        const before = await captureBefore(this.task(childId), this.stateRoot, this.workspaceRoot, this.bounded.bind(this));
+        const current = this.task(childId); current.review_evidence_before = JSON.parse(this.safe(JSON.stringify(before))); this.save(current);
+      }
       await this.localReferenceEvidence(repo, parent.baseline, contract, true, true);
       await this.correctionEvidence(id, lineage);
       const diagnostic = JSON.stringify(review.findings.filter(finding => finding.status === 'FAIL'));
@@ -853,7 +948,8 @@ export class Controller {
       task.correction_reason ||= qualified ? 'CORRECTION_REQUIRES_INDEPENDENT_REVIEW' : 'CORRECTION_EXECUTION_UNQUALIFIED';
       this.save(task, { operation: { id: requestId, status: qualified ? 'accepted' : 'uncertain' } });
       this.verifyCorrectionEvidence(task);
-      this.finishAutomatic(id, qualified ? 'stopped' : 'uncertain', task.correction_reason);
+      if (qualified && parent.automatic.authorization.max_codex_turns === 4) await this.runCorrectiveReview(id, childId);
+      else this.finishAutomatic(id, qualified ? 'stopped' : 'uncertain', task.correction_reason);
     } catch (error) {
       if (this.persistenceFailures.has(childId)) {
         this.persistenceAttention(childId); this.persistenceFailures.add(id);
@@ -863,20 +959,85 @@ export class Controller {
       if (this.localRuns.has(childId)) await this.stopLocalWithoutStorage(id);
     }
   }
+  async runCorrectiveReview(parentId, id) {
+    const task = this.task(id), { task: parent } = await this.correctionEvidence(parentId, task.correction);
+    this.verifyCorrectionEvidence(task);
+    if (parent.automatic.authorization.max_codex_turns !== 4 || task.automatic || task.reviewer ||
+        task.correction.parent_task_id !== parentId || task.correction_state !== 'awaiting_review' ||
+        !localExecutionQualified(task.implementer.local) || task.implementer.error || task.implementer.stopping ||
+        task.implementer.local.owner_instance !== this.instanceId || task.implementer.local.human_requests.length ||
+        this.localRuns.has(id) || this.jobs.has(`${id}:implementer`) || this.jobs.has(`${id}:reviewer`) || this.validationRuns.has(id)) throw new BridgeError('CORRECTIVE_REVIEW_NOT_AUTHORIZED');
+    const root = path.join(this.workspaceRoot, id);
+    await verifyTaskWorktree(root, task.repository);
+    const contract = parent.automatic.contract_binding.contract;
+    if (digest(JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'))) !== parent.automatic.contract_binding.sha256 ||
+        await fs.readFile(path.join(root, 'repo/TASK.md'), 'utf8') !== contractMarkdown(contract, 'local_codex')) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
+    this.automaticGuard(this.task(parentId));
+    const requestId = `corrective_review_${randomUUID()}`;
+    if (this.operation(requestId, 'review', { id }, id)) throw new BridgeError('CORRECTIVE_REVIEW_REPLAY_FORBIDDEN');
+    task.automatic = { authorization: structuredClone(parent.automatic.authorization),
+      contract_binding: structuredClone(parent.automatic.contract_binding), deadline: parent.deadline, owner_instance: this.instanceId,
+      review_request_id: requestId, publish_request_id: parent.automatic.publish_request_id,
+      phase: 'validation_and_review', status: 'progressing', reason: null, human_attention_required: false };
+    task.automatic.review_authorization = { task_id: id, authorization_sha256: digest(task.automatic.authorization),
+      contract_sha256: task.automatic.contract_binding.sha256, baseline_commit: task.baseline, deadline: task.deadline,
+      owner_instance: this.instanceId, review_request_id: requestId, publish_request_id: task.automatic.publish_request_id,
+      request_fingerprint: this.db.prepare('SELECT fingerprint FROM operations WHERE id=?').get(task.request_id).fingerprint,
+      parent_task_id: parentId, lineage_sha256: digest(task.correction),
+      parent_review_authorization_sha256: digest(parent.automatic.review_authorization) };
+    try {
+      this.save(task, { operation: { id: requestId, status: 'reserved' } });
+      await this.invoke('review_task', { task_id: id, request_id: requestId }, {}, input => this.review(input, automaticTransition));
+      await this.jobs.get(`${id}:reviewer`);
+      const completed = this.task(id), ref = completed.reviewer;
+      this.automaticGuard(completed);
+      this.verifyAutomaticEvidence(completed, { progressing: true });
+      if (!ref?.review_result || ref.state !== 'completed' || ref.error || !localExecutionQualified(ref.local) ||
+          !Object.values(ref.review_result.controller_context || {}).every(value => value === true) ||
+          Object.keys(ref.review_result.controller_context || {}).length !== 4) throw new BridgeError(ref?.error || 'CORRECTIVE_REVIEW_UNQUALIFIED');
+      this.revalidateVersionedReview(completed, await this.currentReviewPacket(completed));
+      await this.currentReviewPacket(this.task(parentId));
+      this.automaticGuard(this.task(id));
+      this.finishAutomatic(id, 'stopped', 'CORRECTIVE_REVIEW_RETAINED');
+      this.verifyAutomaticEvidence(this.task(id));
+      this.finishAutomatic(parentId, 'stopped', 'CORRECTIVE_REVIEW_RETAINED');
+    } catch (error) {
+      if (this.persistenceFailures.has(id)) this.persistenceAttention(id);
+      else if (!this.dbClosed) this.finishAutomatic(id, 'uncertain', error instanceof BridgeError ? error.code : 'CORRECTIVE_REVIEW_UNCONFIRMED');
+      throw error;
+    }
+  }
+  correctiveReviewerIdentity(task, event) {
+    if (!task.correction) return;
+    const parent = this.correctiveReviewAuthority(task);
+    for (const role of [parent.implementer, parent.reviewer, task.implementer]) {
+      if ((event.threadId && event.threadId === role.local.thread_id) || (event.turnId && event.turnId === role.local.turn_id)) throw new BridgeError('LOCAL_REVIEW_THREAD_NOT_INDEPENDENT');
+    }
+    if (event.model && event.model !== task.implementer.local.model) throw new BridgeError('LOCAL_REVIEW_MODEL_CHANGED');
+  }
   automaticGuard(task) {
     this.storageAuthority();
     if (task.correction) {
       const parent = this.task(task.correction.parent_task_id);
       this.automaticGuard(parent);
       this.verifyCorrectionEvidence(task);
+      const reviewing = !!task.automatic;
+      if (reviewing) {
+        this.correctiveReviewAuthority(task);
+        if (task.automatic.status !== 'progressing' || task.automatic.phase !== 'validation_and_review' || task.automatic.owner_instance !== this.instanceId ||
+            task.automatic.deadline !== task.deadline || this.expiryStops.has(task.id) ||
+            !localExecutionQualified(task.implementer.local) || task.implementer.local.owner_instance !== this.instanceId ||
+            task.implementer.error || task.implementer.local.human_requests.length ||
+            this.localRuns.has(task.id) || this.jobs.has(`${task.id}:implementer`)) throw new BridgeError('CORRECTIVE_REVIEW_AUTHORITY_UNAVAILABLE');
+      }
       const operation = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.request_id);
       if (digest(parent.automatic.correction) !== digest(task.correction) || parent.automatic.phase !== 'correction' ||
           digest(parent.automatic.authorization) !== task.correction.authorization_sha256 || parent.automatic.contract_binding.sha256 !== task.correction.contract_sha256 ||
           parent.reviewer.findings_sha256 !== task.correction.findings_sha256 || parent.reviewer.packet_hash !== task.correction.packet_sha256 ||
           operation?.task_id !== task.id || operation.fingerprint !== digest({ kind: 'correction', payload: task.correction }) ||
-          !['reserved', 'submitting', 'submitted', 'result_received'].includes(operation.status) ||
+          !(reviewing ? operation.status === 'accepted' : ['reserved', 'submitting', 'submitted', 'result_received'].includes(operation.status)) ||
           task.deadline !== parent.deadline || task.baseline !== parent.baseline || task.cleaned || task.implementer.stopping ||
-          task.correction_state !== 'running' || this.persistenceFailures.has(task.id)) throw new BridgeError('CORRECTION_AUTHORITY_UNAVAILABLE');
+          task.correction_state !== (reviewing ? 'awaiting_review' : 'running') || this.persistenceFailures.has(task.id)) throw new BridgeError('CORRECTION_AUTHORITY_UNAVAILABLE');
       return;
     }
     if (!task.automatic) return;
@@ -928,13 +1089,19 @@ export class Controller {
         localCorrectionEligibility(ref?.review_result, { validationQualified, executionQualified, authorityValid }) };
     // Append-only application history: never UPDATE/REPLACE/delete observations.
     // This is not physical immutability against privileged database tampering.
+    const record = { task_id: task.id, attempt_id: evidence.attempt_id, sha256: digest(evidence), value: JSON.stringify(evidence) };
     this.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?) ON CONFLICT(task_id,attempt_id,observation_sha256) DO NOTHING')
-      .run(task.id, evidence.attempt_id, digest(evidence), JSON.stringify(evidence));
+      .run(record.task_id, record.attempt_id, record.sha256, record.value);
+    return record;
   }
-  verifyAutomaticEvidence(task, { progressing = false } = {}) {
+  verifyAutomaticEvidence(task, { progressing = false, beforeSubmission = false } = {}) {
     if (this.db.isTransaction) throw new BridgeError('AUTOMATIC_EVIDENCE_TRANSACTION_UNRESOLVED');
     const ref = task.reviewer;
-    const records = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => {
+    if (beforeSubmission && (!task.correction || ref?.local.turn_submission_attempted ||
+        this.db.prepare('SELECT status FROM operations WHERE id=?').get(ref.request_id)?.status !== 'pending')) throw new BridgeError('CORRECTIVE_REVIEW_SUBMISSION_UNCONFIRMED');
+    const rows = task.correction ? this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.automatic.review_request_id) :
+      this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id);
+    const records = rows.map(row => {
       const value = JSON.parse(row.value);
       if (digest(value) !== row.observation_sha256 || value.task_id !== task.id || value.attempt_id !== task.automatic.review_request_id ||
           value.baseline_commit !== task.baseline ||
@@ -947,7 +1114,8 @@ export class Controller {
     if (ref?.received_review_output && digest(ref.received_review_output) !== ref.received_output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
     if (ref?.pending_review_output || this.pendingReviewResults.get(task.id)?.received_output) throw new BridgeError('AUTOMATIC_REVIEW_RETENTION_UNRESOLVED');
     if (ref?.received_output_sha256 && !records.some(record => record.received_output_sha256 === ref.received_output_sha256)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
-    if (ref?.pending_review_result || ['pending', 'awaiting_receipt'].includes(ref?.evidence_retention?.review)) throw new BridgeError(
+    if (ref?.pending_review_result || ref?.evidence_retention?.review === 'pending' ||
+        (!beforeSubmission && ref?.evidence_retention?.review === 'awaiting_receipt')) throw new BridgeError(
       ref.pending_review_result ? 'AUTOMATIC_REVIEW_RETENTION_UNRESOLVED' : 'AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED');
     if (ref?.findings_sha256 && !records.some(record => record.review_result && record.findings_sha256 === ref.findings_sha256 &&
         record.review_result.packet_hash === ref.packet_hash)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
@@ -1084,6 +1252,8 @@ export class Controller {
     if (task.automatic.correction) {
       const child = this.task(task.automatic.correction.task_id);
       if (child.correction_state !== 'awaiting_review' || this.persistenceFailures.has(child.id) || !localExecutionQualified(child.implementer.local)) return true;
+      if (child.automatic?.status === 'uncertain' || (child.reviewer?.local.instance_started && !child.reviewer.local.server_closed) ||
+          child.local_validation?.termination_confirmed === false) return true;
     }
     return task.automatic.owner_instance !== this.instanceId || task.automatic.phase === 'publication' || task.local_validation?.termination_confirmed === false ||
       [task.implementer, task.reviewer].some(ref => ref?.local && (ref.local.execution_state === 'uncertain' ||
@@ -1106,6 +1276,7 @@ export class Controller {
   }
   async runAutomatic(id) {
     let task = this.task(id); this.automaticGuard(task);
+    if (task.correction) throw new BridgeError('CORRECTIVE_REVIEW_OWNS_TRANSITIONS');
     if (task.automatic.phase !== 'implementation') throw new BridgeError('AUTOMATIC_REPLAY_FORBIDDEN');
     if (task.implementer.error || task.implementer.stopping || !localExecutionQualified(task.implementer.local) ||
         task.implementer.local.human_requests.length || this.localRuns.has(id) || this.jobs.has(`${id}:implementer`)) throw new BridgeError('AUTOMATIC_IMPLEMENTATION_UNQUALIFIED');
@@ -1598,7 +1769,7 @@ export class Controller {
       const child = this.task(lineage.task_id), local = child.implementer.local;
       let retained = true;
       try { this.verifyCorrectionEvidence(child); } catch { retained = false; }
-      const parent = t.automatic ? t : this.task(lineage.parent_task_id);
+      const parent = t.correction ? this.task(lineage.parent_task_id) : t;
       const uncertain = !retained || !!storageDiagnostic || this.persistenceFailures.has(child.id) || this.persistenceFailures.has(parent.id) ||
         [child.correction_reason, parent.automatic.reason].includes('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED') ||
         (child.correction_state === 'needs_attention' && local.instance_started && !local.result_received);
@@ -1617,6 +1788,27 @@ export class Controller {
       if (t.correction && uncertain) {
         result.state = 'needs_attention'; result.implementer.local.turn_submission_attempted = result.correction.execution.turn_submission_attempted;
       }
+      if (child.automatic) {
+        const review = await this.correctiveReviewSummary(child);
+        result.correction.review = review;
+        result.correction.state = review.qualified ? 'reviewed' : review.uncertain ? 'needs_attention' : 'validation_and_review';
+        result.correction.terminal_confirmed = !uncertain && review.qualified;
+        result.correction.retention_uncertain ||= review.uncertain;
+        result.correction.remaining_codex_turns = 0;
+        const original = [parent.implementer, parent.reviewer].map(role => Number(role.local.turn_submission_attempted));
+        result.correction.codex_turns_attempted = attempted === null || review.attempted_turns === null ? null : original[0] + original[1] + attempted + review.attempted_turns;
+        if (result.automatic) {
+          result.automatic.usage.corrective_reviewer_turn_submissions_attempted = review.attempted_turns;
+          result.automatic.usage.total_codex_turn_submissions_attempted = result.correction.codex_turns_attempted;
+        }
+        if (t.correction) {
+          result.automatic.usage.implementer_turn_submissions_attempted = original[0];
+          result.automatic.usage.reviewer_turn_submissions_attempted = original[1];
+          if (result.reviewer) result.reviewer.overall = review.overall;
+          result.automatic.review = { ...result.automatic.review, state: review.qualified ? review.overall === 'PASS' ? 'pass' : 'non_correctable_fail' : 'malformed_or_uncertain',
+            potentially_correctable: false, execution_authorized: false };
+        }
+      } else if (parent.automatic.authorization.max_codex_turns === 4) result.correction.remaining_codex_turns = 1;
     }
     if (storageDiagnostic) result.storage_diagnostic = storageDiagnostic;
     if (versioned && result.cleanup) { result.cleanup = { ...result.cleanup }; delete result.cleanup.workspace_path; }
@@ -1832,6 +2024,7 @@ export class Controller {
         staged_files: git(repo, 'diff', '--cached', '--name-only'), changed_files: changed, unauthorized_files: changed.filter(name => !contract.allowed_files.includes(name)),
         baseline, current, diff: await this.repositoryDiff(repo, t.baseline),
         ...(contract.reference_files?.length ? { source_context: await this.localReferenceEvidence(repo, t.baseline, contract) } : {}) };
+      if (t.correction) data.controller_evidence.task_worktree.mapping_method = 'Controller copied verified rejected-candidate Git objects into independent private administration; files were seeded from the rejected tree and the original baseline remains comparison authority.';
       if (JSON.stringify(await publicationState(repo)) !== JSON.stringify(reviewedState.state)) throw new BridgeError('WORKTREE_CHANGED_DURING_REVIEW');
       const sanitized = JSON.parse(this.safe(JSON.stringify(data)));
       if (sanitized.contract !== markdown || digest(sanitized.contract_binding) !== digest(data.contract_binding)) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
@@ -1892,7 +2085,7 @@ export class Controller {
   async review({ task_id: id, request_id }, owner) {
     return this.locked(id, async () => {
       const t = this.task(id);
-      if (t.correction) throw new BridgeError('CORRECTION_REQUIRES_SEPARATE_REVIEW_AUTHORIZATION');
+      if (t.correction && owner !== automaticTransition) throw new BridgeError('CORRECTION_REQUIRES_SEPARATE_REVIEW_AUTHORIZATION');
       if (t.automatic && owner !== automaticTransition) throw new BridgeError('AUTOMATIC_TASK_OWNS_TRANSITIONS');
       this.automaticGuard(t);
       if (t.execution_backend === 'local_codex' && t.publication_frozen) throw new BridgeError('TASK_FROZEN_FOR_PUBLICATION');
@@ -2052,6 +2245,7 @@ export class Controller {
   async reviewLocal(task, requestId) {
     if (task.cleaned || this.closed) throw new BridgeError('TASK_CLEANED');
     if (Date.now() > task.deadline) throw new BridgeError('TASK_EXPIRED');
+    if (task.correction && (requestId !== task.automatic?.review_request_id || task.reviewer)) throw new BridgeError('CORRECTIVE_REVIEW_REPLAY_FORBIDDEN');
     let retry = false;
     if (task.reviewer) {
       const ref = task.reviewer;
@@ -2071,7 +2265,7 @@ export class Controller {
         !task.implementer.local.result_received || !task.implementer.local.terminal_observed) throw new BridgeError('LOCAL_REVIEW_REQUIRES_COMPLETED_IMPLEMENTATION');
     if (this.jobs.has(`${task.id}:implementer`) || this.localRuns.has(task.id) || task.implementer.local.server_closed !== true) throw new BridgeError('LOCAL_EVIDENCE_EXECUTION_NOT_CLOSED');
     const old = this.operation(requestId, 'review', { id: task.id }, task.id);
-    if (old) return this.get(task.id);
+    if (old && !(task.correction && task.automatic && old.status === 'reserved' && !task.reviewer)) return this.get(task.id);
     const local = { phase: 'independent_validation', execution_state: 'starting', thread_id: null, turn_id: null, model: null,
       turn_submission_attempted: false, turn_submission_acknowledged: false, terminal_observed: false, result_received: false,
       instance_started: false, server_closed: false, human_attention_required: false, human_requests: [], diagnostics: [] };
@@ -2095,9 +2289,9 @@ export class Controller {
     task.local_validation = { version: VALIDATION_VERSION, provenance: 'controller_process_observation', attempt_id: randomUUID(),
       request_id: requestId, task_id: task.id, reviewed_git_state: reviewedState, status: 'pending', results: [],
       original_unchanged: false, termination_confirmed: true, diagnostic: null };
-    this.automaticGuard(task);
+    this.automaticGuard(this.task(task.id));
     if (!task.automatic) task.deadline = Date.now() + this.timeoutMs;
-    this.save(task);
+    this.save(task, task.correction ? { operation: { id: requestId, status: 'pending' } } : {});
     this.launch(task.id, 'reviewer', () => this.runLocalReview(task.id));
     return this.get(task.id, false);
   }
@@ -2113,6 +2307,7 @@ export class Controller {
     if (this.closed || this.task(id).reviewer.stopping) return;
     const runner = this.localValidationFactory({ root, timeoutMs: this.executionTimeout(this.task(id)), bound: this.bounded.bind(this) });
     this.validationRuns.set(id, runner);
+    if (task.correction) this.validationRuns.set(task.correction.parent_task_id, runner);
     task = this.task(id); task.local_validation.status = 'running'; this.save(task);
     try {
       this.automaticGuard(this.task(id));
@@ -2131,7 +2326,10 @@ export class Controller {
       task = this.task(id); task.local_validation.status = runner.terminationConfirmed ? 'unavailable' : 'uncertain';
       task.local_validation.diagnostic = 'VALIDATION_EXECUTION_UNAVAILABLE';
     } finally {
-      if (runner.terminationConfirmed) this.validationRuns.delete(id);
+      if (runner.terminationConfirmed) {
+        this.validationRuns.delete(id);
+        if (task.correction && this.validationRuns.get(task.correction.parent_task_id) === runner) this.validationRuns.delete(task.correction.parent_task_id);
+      }
     }
     if (this.dbClosed) return;
     task.local_validation.termination_confirmed = runner.terminationConfirmed === true;
@@ -2158,6 +2356,10 @@ export class Controller {
     if (!['completed', 'unavailable'].includes(task.local_validation.status) || !task.local_validation.termination_confirmed ||
         !task.local_validation.original_unchanged) throw new BridgeError('LOCAL_VALIDATION_UNRESOLVED');
     this.automaticGuard(task);
+    if (task.correction) {
+      await this.currentReviewPacket(this.task(task.correction.parent_task_id));
+      this.automaticGuard(this.task(id));
+    }
     if (task.automatic) {
       const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
       if (!independentValidationPassed(task.local_validation, contract.test_commands, task.reviewer.reviewed_git_state, id)) throw new BridgeError('AUTOMATIC_VALIDATION_FAILED');
@@ -2185,6 +2387,25 @@ export class Controller {
       onLifecycle: event => {
         if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
         const current = this.task(id), ref = current.reviewer, local = ref.local;
+        if (current.correction) {
+          this.automaticGuard(current);
+          this.correctiveReviewerIdentity(current, event);
+          const operation = this.db.prepare('SELECT status FROM operations WHERE id=?').get(ref.request_id);
+          if (event.phase === 'turn_submitting') {
+            if (local.turn_submission_attempted || operation?.status !== 'pending') throw new BridgeError('CORRECTIVE_REVIEW_REPLAY_FORBIDDEN');
+            const packetText = readFileSync(path.join(this.workspaceRoot, id, ref.packet_directory, 'evidence.json'), 'utf8');
+            if (digest(packetText) !== ref.packet_hash || Buffer.byteLength(packetText) !== ref.packet_bytes) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+            const packet = JSON.parse(packetText), parent = this.task(current.correction.parent_task_id);
+            const contract = current.automatic.contract_binding.contract;
+            this.verifyAutomaticEvidence(current, { progressing: true, beforeSubmission: true });
+            if (digest(JSON.parse(readFileSync(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'))) !== current.correction.contract_sha256 ||
+                digest(JSON.parse(readFileSync(path.join(this.workspaceRoot, parent.id, 'contract.json'), 'utf8'))) !== current.correction.contract_sha256 ||
+                digest(readFileSync(path.join(this.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8')) !== current.correction.packet_sha256 ||
+                digest(JSON.stringify(packet.independent_validation)) !== digest(JSON.stringify(current.local_validation)) ||
+                !independentValidationPassed(current.local_validation, contract.test_commands, ref.reviewed_git_state, id)) throw new BridgeError('AUTOMATIC_VALIDATION_FAILED');
+          }
+          if (event.phase === 'turn_acknowledged' && operation?.status !== 'submitting') throw new BridgeError('CORRECTIVE_REVIEW_SUBMISSION_UNCONFIRMED');
+        }
         this.localIdentity(local, event); local.phase = this.bounded(event.phase, 64);
         if (local.thread_id && local.thread_id === current.implementer.local.thread_id) {
           ref.error = 'LOCAL_REVIEW_THREAD_NOT_INDEPENDENT'; this.save(current); throw new BridgeError(ref.error);
@@ -2196,7 +2417,8 @@ export class Controller {
         if (event.phase === 'turn_acknowledged') { local.execution_state = 'running'; ref.state = 'running'; }
         if (event.phase === 'terminal_observed') { local.execution_state = event.status; ref.state = 'finishing'; }
         receivedTask = structuredClone(current);
-        this.save(current);
+        this.save(current, current.correction && ['turn_submitting', 'turn_acknowledged'].includes(event.phase) ?
+          { operation: { id: ref.request_id, status: event.phase === 'turn_submitting' ? 'submitting' : 'submitted' } } : {});
         if (ref.stopping || this.closed) throw new BridgeError('LOCAL_STOP_REQUESTED');
       }, onProgress: event => {
         if (event.params?.item?.type === 'fileChange') {
@@ -2204,7 +2426,7 @@ export class Controller {
           abort.abort(); throw new BridgeError('LOCAL_REVIEW_WRITE_OBSERVED');
         }
       } });
-    this.localRuns.set(key, { backend, abort });
+    this.localRuns.set(key, { backend, abort, parent_id: task.correction?.parent_task_id });
     task = this.task(id); Object.assign(task.reviewer.local, { instance_started: true, owner_instance: this.instanceId });
     if (task.automatic) task.reviewer.evidence_retention.review = 'awaiting_receipt';
     this.save(task);
@@ -2212,6 +2434,10 @@ export class Controller {
     let result;
     try {
       this.automaticGuard(this.task(id));
+      if (task.correction) {
+        await this.currentReviewPacket(this.task(id));
+        this.automaticGuard(this.task(id));
+      }
       const protocol = this.reviewProtocol(this.task(id));
       result = await backend.run({ prompt: protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION ? localActionabilityReviewerInstructions : localReviewerInstructions, allowedFiles: [], signal: abort.signal });
       // Capture before any database read/write or asynchronous resource closure.
@@ -2224,7 +2450,7 @@ export class Controller {
       task = this.task(id); const ref = task.reviewer;
       ref.received_review_output = received; ref.received_output_sha256 = receipt.sha256; ref.pending_review_output = true;
       ref.evidence_retention ||= { review: 'received' };
-      this.save(task); // Receipt and history commit before completion metadata.
+      this.save(task, task.correction ? { operation: { id: ref.request_id, status: received.observed_local.turn_submission_attempted ? 'result_received' : 'failed' } } : {}); // Receipt and history commit before completion metadata.
       this.applyReceivedReview(ref.local, received);
       ref.state = 'finishing'; this.save(task);
     } finally {
@@ -2238,6 +2464,7 @@ export class Controller {
     task = this.task(id);
     try {
       const ref = task.reviewer, local = ref.local;
+      this.correctiveReviewerIdentity(task, { threadId: local.thread_id, turnId: local.turn_id, model: local.model });
       if (ref.stopping || ref.error || !localExecutionQualified(local) || local.execution_state !== 'completed' || !local.server_closed || !local.terminal_observed ||
           !local.turn_submission_acknowledged || !local.thread_id || !local.turn_id || local.thread_id === task.implementer.local.thread_id ||
           result.authentication !== 'chatgpt') throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
@@ -2514,7 +2741,20 @@ export class Controller {
     }
   }
   async stopLocal(id, role = 'implementer') {
-    try { return await this.stopLocalState(id, role); }
+    try {
+      const task = this.task(id);
+      let linked;
+      if (role === 'implementer' && task.automatic?.correction) {
+        const child = this.task(task.automatic.correction.task_id);
+        if (child.automatic && child.reviewer) linked = await this.stopLocal(child.id, 'reviewer');
+      }
+      const stopped = await this.stopLocalState(id, role);
+      if (linked) {
+        for (const field of ['server_closed', 'job_settled', 'cancellation_confirmed']) stopped[field] &&= linked[field];
+        stopped.diagnostics = [...new Set([...stopped.diagnostics, ...linked.diagnostics])];
+      }
+      return stopped;
+    }
     catch (error) {
       if (!this.transactionUnresolved && !this.persistenceFailures.has(id) && !sqliteFailure(error)) throw error;
       this.persistenceFailures.add(id);

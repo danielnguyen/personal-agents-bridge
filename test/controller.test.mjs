@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { repoGit, repositoryIdentity } from '../repositories.mjs';
 import { LOCAL_ACTIONABILITY_REVIEW_VERSION, localReviewerInstructions, localActionabilityReviewerInstructions } from '../local-reviewer-instructions.mjs';
+import { GitHubPublisher } from '../publication.mjs';
 
 async function setup(t) {
   const root = await fs.mkdtemp('/var/tmp/personal-agents-bridge/unit-');
@@ -46,17 +47,28 @@ async function automaticAttempt(t, mode = {}) {
   const reviewerActive = new Promise(resolve => active = resolve), stops = [], prompts = [], publisherCalls = [], submissions = [];
   await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
+  if (mode.referenceFile) { await fs.writeFile(path.join(normal, 'policy.txt'), 'Original reference\n'); repoGit(normal, 'add', 'policy.txt'); }
   repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
   c.publisher = { async target() { publisherCalls.push('target'); throw Error('Publication forbidden for failed review'); } };
-  let implementations = 0;
+  let implementations = 0, reviews = 0;
   c.localBackendFactory = options => {
     const corrective = !options.reviewOnly && implementations++ > 0;
+    const correctiveReview = options.reviewOnly && reviews++ > 0;
     let stopped;
     const wait = new Promise(resolve => stopped = resolve);
     return {
     async run(input) {
-      calls.push(options.reviewOnly ? 'reviewer' : corrective ? 'corrector' : 'implementer');
+      calls.push(correctiveReview ? 'corrective-reviewer' : options.reviewOnly ? 'reviewer' : corrective ? 'corrector' : 'implementer');
+      if (correctiveReview) {
+        await mode.beforeCorrectiveReview?.(c, options, input);
+        options.onLifecycle({ phase: 'model_selected', model: 'fixture-model' });
+        options.onLifecycle({ phase: 'thread_acknowledged', model: 'fixture-model', threadId: mode.correctiveReviewThread || 'corrective-review-thread' });
+        options.onLifecycle({ phase: 'turn_submitting', model: 'fixture-model', threadId: 'corrective-review-thread', turnSubmissionAttempted: true });
+        submissions.push('corrective-reviewer');
+        if (mode.correctiveReviewAckUnknown) return { status: 'uncertain', authentication: 'chatgpt', threadId: 'corrective-review-thread', turnSubmissionAttempted: true, uncertainties: ['UNKNOWN_ACK'], messages: [] };
+        if (mode.activeCorrectiveReviewer) { active(); await wait; return { status: 'interrupted', authentication: 'chatgpt', messages: [], uncertainties: ['INTERRUPTED'] }; }
+      }
       if (corrective) {
         await mode.beforeCorrection?.(c, options, input);
         assert.equal(await fs.readFile(path.join(options.cwd, 'greeting.txt'), 'utf8'), 'candidate\n');
@@ -70,7 +82,7 @@ async function automaticAttempt(t, mode = {}) {
         if (mode.activeCorrection) { active(); await wait; return { status: 'interrupted', authentication: 'chatgpt', messages: [], uncertainties: ['INTERRUPTED'] }; }
       }
       if (options.reviewOnly) prompts.push(input.prompt);
-      const identity = { model: corrective && mode.wrongModel ? 'other-model' : 'fixture-model', threadId: options.reviewOnly ? 'review-thread' : corrective ? 'correct-thread' : 'implement-thread', turnId: corrective && !mode.reuseTurn ? 'correct-turn' : 'fixture-turn',
+      const identity = { model: corrective && mode.wrongModel ? 'other-model' : 'fixture-model', threadId: correctiveReview ? 'corrective-review-thread' : options.reviewOnly ? 'review-thread' : corrective ? 'correct-thread' : 'implement-thread', turnId: correctiveReview ? mode.correctiveReviewTurn || 'corrective-review-turn' : corrective && !mode.reuseTurn ? 'correct-turn' : mode.postReview ? options.reviewOnly ? mode.originalReviewTurn || 'review-turn' : 'implement-turn' : 'fixture-turn',
         turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
       options.onLifecycle({ ...identity, terminalObserved: false, phase: 'turn_acknowledged' });
       if (corrective && mode.correctiveHuman) {
@@ -90,28 +102,49 @@ async function automaticAttempt(t, mode = {}) {
         classification: finding.status === 'PASS' ? null : mode.cause && mode.cause !== 'implementation_defect' ? { kind: mode.cause } :
           { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: mode.remedy || 'Replace the incorrect greeting.', requires_human_approval: !!mode.humanApproval } } })) } : { overall: 'FAIL', findings };
       if (options.reviewOnly) { mode.output?.(output); await mode.beforeResult?.(c, options); }
-      const text = mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output);
+      if ((correctiveReview && !mode.correctiveReviewFail) || (!correctiveReview && mode.originalPass)) { output.overall = 'PASS'; for (const finding of output.findings) { finding.status = 'PASS'; finding.classification = null; } }
+      if (correctiveReview) mode.correctiveOutput?.(output);
+      const text = (mode.incomplete || (correctiveReview && mode.correctiveReviewMalformed)) ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output);
       if (options.reviewOnly) mode.returnedOutput?.(text);
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
         ...(options.reviewOnly ? mode.result : {}),
-        messages: options.reviewOnly ? [{ provenance: 'reasoning', text: 'Private reasoning must not be retained.' }, { provenance: 'model', text }] : [] };
-    }, async close() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection)) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return corrective && mode.correctiveCloseUncertain ? false : true; },
-    async cancel() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection)) { stops.push('cancel'); stopped(); return mode.cancelResult ?? true; } },
+        messages: options.reviewOnly && !(correctiveReview && mode.correctiveReviewMissing) ? [{ provenance: 'reasoning', text: 'Private reasoning must not be retained.' }, { provenance: 'model', text }] : [] };
+    }, async close() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection) || (correctiveReview && mode.activeCorrectiveReviewer)) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return (corrective && mode.correctiveCloseUncertain) || (correctiveReview && mode.correctiveReviewerCloseUncertain) ? false : true; },
+    async cancel() { if ((options.reviewOnly && mode.activeReviewer) || (corrective && mode.activeCorrection) || (correctiveReview && mode.activeCorrectiveReviewer)) { stops.push('cancel'); stopped(); return mode.cancelResult ?? true; } },
   }; };
   if (mode.validationFailure) c.localValidationFactory = () => ({ terminationConfirmed: true, async run() { throw Error('Synthetic validator failure'); }, cancel() {} });
+  if (mode.activeCorrectiveValidation) {
+    const factory = c.localValidationFactory; let release;
+    const waiting = new Promise(resolve => { release = resolve; });
+    c.localValidationFactory = options => c.task(path.basename(options.root)).correction ? {
+      terminationConfirmed: false, async run() { active(); await waiting; },
+      cancel() { stops.push('validation.cancel'); this.terminationConfirmed = !mode.validationTerminationUncertain; release(); },
+    } : factory(options);
+  }
   if (mode.beforeDispatch) {
     const run = c.runCorrection.bind(c);
     c.runCorrection = async id => { await mode.beforeDispatch(c, id); return run(id); };
+  }
+  if (mode.beforeReviewAdmission) {
+    const run = c.runCorrectiveReview.bind(c);
+    c.runCorrectiveReview = async (parentId, id) => { await mode.beforeReviewAdmission(c, parentId, id); return run(parentId, id); };
+  }
+  if (mode.afterCorrectiveValidation) {
+    const run = c.runLocalValidation.bind(c);
+    c.runLocalValidation = async id => { await run(id); if (c.task(id).correction) await mode.afterCorrectiveValidation(c, id); };
   }
   const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
     automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
   if (mode.versioned) input.automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
   if (mode.correction) Object.assign(input.automatic, { max_codex_turns: 3, max_corrections: 1 });
+  if (mode.postReview) Object.assign(input.automatic, { max_codex_turns: 4, max_corrections: 1 });
+  if (mode.requiredValidation) input.contract.test_commands = ['cat greeting.txt'];
+  if (mode.referenceFile) input.contract.reference_files = ['policy.txt'];
   if (mode.manual) delete input.automatic;
   if (mode.validationFailure) input.contract.test_commands = ['true'];
   await mode.configure?.(c, input);
   const result = await c.start(input);
-  if (mode.activeReviewer || mode.activeCorrection) await reviewerActive;
+  if (mode.activeReviewer || mode.activeCorrection || mode.activeCorrectiveReviewer || mode.activeCorrectiveValidation) await reviewerActive;
   else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
     if (mode.manual) { await c.review({ task_id: result.task_id, request_id: 'manual_review' }); await Promise.all([...c.jobs.values()]); } }
   return { ...value, id: result.task_id, calls, stops, input, normal, prompts, publisherCalls, submissions };
@@ -137,13 +170,313 @@ test('single correction authorization accepts only explicit local versioned 3/1 
   const input = { execution_backend: 'local_codex', repository_id: 'fixture', automatic: { publish: { title: 'Fixture', draft: true },
     max_duration_seconds: 120, max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
   assert.equal(c.automaticAuthorization(input).max_corrections, 1);
-  for (const changes of [{ max_codex_turns: 2 }, { max_codex_turns: 4 }, { max_corrections: 0 }, { max_corrections: 2 },
+  for (const changes of [{ max_codex_turns: 2 }, { max_codex_turns: 5 }, { max_corrections: 0 }, { max_corrections: 2 },
     { review_protocol: undefined }, { review_protocol: 'legacy' }, { max_duration_seconds: 901 }])
     assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...changes } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
   for (const changes of [{ execution_backend: 'agents_api' }, { repository_id: undefined }])
     assert.throws(() => c.automaticAuthorization({ ...input, ...changes }), /INVALID_AUTOMATIC_AUTHORIZATION/);
   assert.equal(c.automaticAuthorization({ ...input, automatic: { ...input.automatic, max_codex_turns: 2, max_corrections: 0 } }).max_codex_turns, 2);
   assert.equal(api.created.length, 0);
+});
+
+test('explicit four-turn authority validates and reviews the corrected tree once, retains PASS, and stops without publication', async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true, postReview: true, requiredValidation: true });
+  const { c, id, calls, publisherCalls } = value, parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector', 'corrective-reviewer'], JSON.stringify({ parent: parent.automatic, child: child.automatic, reviewer: child.reviewer }));
+  assert.equal(child.reviewer?.review_result?.overall, 'PASS', JSON.stringify(child));
+  assert.equal(parent.automatic.reason, 'CORRECTIVE_REVIEW_RETAINED');
+  assert.equal(child.automatic.reason, 'CORRECTIVE_REVIEW_RETAINED');
+  assert.deepEqual(publisherCalls, []); assert.equal(value.api.created.length, 0);
+  assert.notEqual(child.reviewer.reviewed_git_state.tree_sha, parent.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(child.local_validation.reviewed_git_state.tree_sha, child.reviewer.reviewed_git_state.tree_sha);
+  assert.notEqual(child.local_validation.attempt_id, parent.local_validation.attempt_id);
+  assert.equal(child.deadline, parent.deadline); assert.equal(child.baseline, parent.baseline);
+  assert.equal(new Set([parent.implementer, parent.reviewer, child.implementer, child.reviewer].map(role => role.local.thread_id)).size, 4);
+  assert.equal(new Set([parent.implementer, parent.reviewer, child.implementer, child.reviewer].map(role => role.local.turn_id)).size, 4);
+  assert.equal(child.local_validation.results[0].stdout.text, 'corrected\n');
+  assert.equal(parent.local_validation.results[0].stdout.text, 'candidate\n');
+  assert.equal(child.local_validation.results[0].exit_code, 0); assert.equal(child.local_validation.results[0].termination_confirmed, true);
+  assert.notEqual(child.local_validation.results[0].cwd, parent.local_validation.results[0].cwd);
+  const { get } = await statusClient(t, c), ledger = statusLedger(c.db), files = await statusFiles(value.normal, c.workspaceRoot);
+  for (const taskId of [id, child.id, id]) {
+    const status = (await get(taskId)).structuredContent;
+    assert.equal(status.correction.review.overall, 'PASS', JSON.stringify(status));
+    assert.equal(status.correction.review.qualified, true); assert.equal(status.correction.review.validation.qualified, true);
+    assert.equal(status.correction.codex_turns_attempted, 4); assert.equal(status.correction.remaining_codex_turns, 0);
+  }
+  assert.equal(statusLedger(c.db), ledger); assert.equal(await statusFiles(value.normal, c.workspaceRoot), files);
+  c.verifyAutomaticEvidence(child); c.verifyCorrectionEvidence(child);
+  await assert.rejects(c.review({ task_id: child.id, request_id: 'public_fourth_review' }), /CORRECTION_REQUIRES_SEPARATE_REVIEW_AUTHORIZATION/);
+  await assert.rejects(c.publish({ task_id: child.id, title: 'Forbidden' }), /CORRECTIVE_PUBLICATION_NOT_AUTHORIZED/);
+});
+
+test('four-turn authorization accepts only explicit versioned local repository 4/1', async t => {
+  const { c } = await setup(t), input = { repository_id: 'fixture', execution_backend: 'local_codex', automatic: {
+    publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 4, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
+  assert.equal(c.automaticAuthorization(input).max_codex_turns, 4);
+  for (const change of [{ max_codex_turns: 5 }, { max_corrections: 0 }, { max_corrections: 2 }, { review_protocol: undefined },
+    { review_protocol: 'v1' }, { authorize_review: true }, { max_duration_seconds: 901 }])
+    assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...change } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  for (const change of [{ execution_backend: undefined }, { execution_backend: 'agents_api' }, { repository_id: undefined }])
+    assert.throws(() => c.automaticAuthorization({ ...input, ...change }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+});
+
+test('four-turn authority rejects reused original reviewer turn identity before correction', async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, originalReviewTurn: 'implement-turn' });
+  assert.deepEqual(value.calls, ['implementer', 'reviewer']); assert.deepEqual(value.publisherCalls, []);
+  assert.equal(value.c.task(value.id).automatic.correction, undefined);
+});
+
+test('corrective review four-turn initial PASS still publishes one exact-tree draft without correction', async t => {
+  let publisher, remote;
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, originalPass: true, async configure(c) {
+    const root = path.dirname(c.stateRoot), normal = path.join(root, 'normal'); remote = path.join(root, 'remote.git');
+    await fs.mkdir(remote); repoGit(remote, 'init', '--bare', '--initial-branch=main');
+    repoGit(normal, 'remote', 'add', 'origin', remote); repoGit(normal, 'push', 'origin', 'HEAD:refs/heads/main');
+    publisher = new class extends GitHubPublisher {
+      constructor() { super(); this.creates = 0; this.pushes = 0; }
+      api() { assert.fail('External GitHub API forbidden'); }
+      async target() { return { repository: 'fixture/publication', base: 'main', remote }; }
+      async push(...args) { this.pushes++; return super.push(...args); }
+      async findPR() { return this.pr || null; }
+      async createPR(target, branch, input) {
+        this.creates++; assert.equal(input.draft, true);
+        return this.pr = { number: 1, html_url: 'https://github.com/fixture/publication/pull/1', draft: true, state: 'open', merged_at: null,
+          head: { ref: branch, sha: repoGit(remote, 'rev-parse', `refs/heads/${branch}`).trim(), repo: { full_name: target.repository } },
+          base: { ref: target.base, repo: { full_name: target.repository } } };
+      }
+    }(); c.publisher = publisher;
+  } });
+  const task = value.c.task(value.id);
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.deepEqual(value.calls, ['implementer', 'reviewer']); assert.equal(task.automatic.correction, undefined);
+  assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1);
+  assert.equal(repoGit(remote, 'rev-parse', `${task.publication.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
+});
+
+for (const mode of [{ label: 'FAIL', correctiveReviewFail: true }, { label: 'malformed', correctiveReviewMalformed: true },
+  { label: 'missing output', correctiveReviewMissing: true }, { label: 'wrong version', correctiveOutput: output => { output.format = 'legacy'; } },
+  { label: 'unknown acknowledgment', correctiveReviewAckUnknown: true }, { label: 'unconfirmed closure', correctiveReviewerCloseUncertain: true },
+  { label: 'original implementation thread', correctiveReviewThread: 'implement-thread' }, { label: 'original reviewer thread', correctiveReviewThread: 'review-thread' },
+  { label: 'corrective implementation thread', correctiveReviewThread: 'correct-thread' }, { label: 'reused turn', correctiveReviewTurn: 'correct-turn' }])
+test(`corrective review ${mode.label} stops without publication, another correction or replay`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, ...mode }), { c, id } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  assert.deepEqual(value.publisherCalls, []); assert.equal(value.calls.filter(call => call === 'corrector').length, 1);
+  assert.equal(value.calls.filter(call => call === 'corrective-reviewer').length, 1);
+  const view = await c.get(id);
+  assert.equal(view.correction.review.qualified, mode.label === 'FAIL');
+  assert.equal(view.correction.review.overall, mode.label === 'FAIL' ? 'FAIL' : null);
+  if (mode.correctiveReviewThread) assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 0);
+  c.scheduleAutomatic(id); await c.start(value.input); await Promise.all([...c.automaticJobs.values()]);
+  assert.equal(value.calls.length, 4); assert.equal(c.task(child.id).deadline, parent.deadline);
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+});
+
+for (const change of ['exit', 'identity', 'tree', 'termination', 'workspace', 'reference'])
+test(`corrective review rechecks fresh validation and ${change} before fourth-turn submission`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, requiredValidation: true, referenceFile: true,
+    async afterCorrectiveValidation(c, id) {
+      const task = c.task(id);
+      if (change === 'workspace' || change === 'reference') await fs.writeFile(path.join(c.workspaceRoot, id, 'repo', change === 'workspace' ? 'greeting.txt' : 'policy.txt'), 'changed\n');
+      else {
+        if (change === 'exit') task.local_validation.results[0].exit_code = 2;
+        if (change === 'identity') task.local_validation.attempt_id = 'changed';
+        if (change === 'tree') task.local_validation.reviewed_git_state.tree_sha = '0'.repeat(40);
+        if (change === 'termination') task.local_validation.termination_confirmed = false;
+        c.save(task);
+      }
+    } });
+  assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 0);
+  assert.equal(value.calls.filter(call => call === 'corrective-reviewer').length, 0);
+  assert.deepEqual(value.publisherCalls, []);
+});
+
+for (const boundary of ['admission', 'validation', 'submission']) test(`corrective review expiry at ${boundary} preserves the original deadline and cannot submit`, async t => {
+  const now = Date.now; let deadline;
+  const expire = (c, id) => { deadline = c.task(id).deadline; Date.now = () => deadline + 1; };
+  try {
+    const value = await automaticAttempt(t, { versioned: true, postReview: true,
+      ...(boundary === 'admission' ? { beforeReviewAdmission: (c, parentId) => expire(c, parentId) } :
+        boundary === 'validation' ? { afterCorrectiveValidation: expire } : { beforeCorrectiveReview: c => {
+          const child = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => task.correction); expire(c, child.id);
+        } }) });
+    assert.equal(value.c.task(value.id).deadline, deadline);
+    assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 0);
+    assert.deepEqual(value.publisherCalls, []);
+  } finally { Date.now = now; }
+});
+
+for (const change of ['packet', 'parent contract', 'validation']) test(`corrective review pre-submission ${change} tampering cannot grant the fourth turn`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, beforeCorrectiveReview: async (c, options) => {
+    const tasks = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value));
+    const child = tasks.find(task => task.correction), parent = tasks.find(task => !task.correction);
+    if (change === 'packet') {
+      const file = path.join(options.cwd, 'evidence.json'); await fs.chmod(file, 0o600);
+      const packet = JSON.parse(await fs.readFile(file, 'utf8')); packet.contract += '\nchanged';
+      await fs.writeFile(file, JSON.stringify(packet)); await fs.chmod(file, 0o400);
+    } else if (change === 'parent contract') await fs.writeFile(path.join(c.workspaceRoot, parent.id, 'contract.json'), '{}');
+    else { child.local_validation.status = 'unavailable'; c.save(child); }
+  } });
+  assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 0); assert.deepEqual(value.publisherCalls, []);
+});
+
+for (const effect of ['ABORT', 'IGNORE']) for (const boundary of ['reservation', 'validation intent', 'validation result', 'packet', 'submission', 'acknowledgment', 'receipt', 'closure', 'history', 'acceptance'])
+test(`corrective review SQLite ${effect} at ${boundary} cannot accept or replay a fourth review`, async t => {
+  let hits = 0;
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, requiredValidation: true, configure(c) {
+    c.db.function('review_fault', () => { hits++; return 1; });
+    let table = 'tasks', event = 'INSERT', predicate = "json_extract(NEW.value,'$.correction.parent_task_id') IS NOT NULL AND json_extract(NEW.value,'$.automatic.review_authorization.parent_task_id') IS NOT NULL";
+    const conditions = { reservation: "json_extract(NEW.value,'$.reviewer') IS NULL", 'validation intent': "json_extract(NEW.value,'$.local_validation.status')='pending'",
+      'validation result': "json_extract(NEW.value,'$.local_validation.results[0].completion_observed')=1",
+      submission: "json_extract(NEW.value,'$.reviewer.local.turn_submission_attempted')=1 AND json_extract(NEW.value,'$.reviewer.local.turn_submission_acknowledged')=0",
+      acknowledgment: "json_extract(NEW.value,'$.reviewer.local.turn_submission_acknowledged')=1",
+      receipt: "json_extract(NEW.value,'$.reviewer.received_output_sha256') IS NOT NULL AND json_extract(NEW.value,'$.reviewer.pending_review_output')=1",
+      closure: "json_extract(NEW.value,'$.reviewer.received_output_sha256') IS NOT NULL AND json_extract(NEW.value,'$.reviewer.local.server_closed')=1" };
+    if (boundary === 'packet' || boundary === 'history') {
+      table = 'automatic_attempts'; predicate = `json_extract(NEW.value,'$.review_authorization.parent_task_id') IS NOT NULL AND json_extract(NEW.value,'$.kind')='${boundary === 'packet' ? 'review_packet' : 'review_result'}'`;
+    } else if (boundary === 'acceptance') { table = 'operations'; event = 'UPDATE'; predicate = "NEW.id GLOB 'corrective_review_*' AND NEW.status='accepted'"; }
+    else predicate += ` AND (${conditions[boundary]})`;
+    c.db.exec(`CREATE TEMP TRIGGER fourth_fault BEFORE ${event} ON ${table} WHEN (${predicate}) AND review_fault() BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'injected corrective review fault'" : ''}); END;`);
+  } });
+  const { c, id } = value, child = c.task(c.task(id).automatic.correction.task_id);
+  c.db.exec('DROP TRIGGER fourth_fault'); assert(hits > 0);
+  assert.deepEqual(value.publisherCalls, []);
+  assert(value.submissions.filter(call => call === 'corrective-reviewer').length <= (['acknowledgment', 'receipt', 'closure', 'history', 'acceptance'].includes(boundary) ? 1 : 0));
+  const view = await c.get(id); assert.notEqual(view.correction.review?.qualified, true);
+  if (boundary === 'receipt') assert.equal(view.correction.review.received_output, 'volatile_only');
+  if (boundary === 'closure') assert.equal(view.correction.review.received_output, 'durable');
+  if (child.automatic) assert.notEqual(c.db.prepare('SELECT status FROM operations WHERE id=?').get(child.automatic.review_request_id).status, 'accepted');
+  assert(c.task(id).reviewer.review_result); assert(attemptRows(c, id).some(row => JSON.parse(row.value).packet_utf8));
+  const count = value.calls.length, restarted = await restartEvidenceController(t, value);
+  await restarted.start(value.input); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(value.calls.length, count);
+  const restored = await restarted.get(id); assert.notEqual(restored.correction.review?.qualified, true);
+  if (boundary === 'receipt') assert.equal(restored.correction.review.received_output, 'unavailable');
+});
+
+test('corrective review lost Controller ownership prevents native fourth-turn submission', async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, beforeCorrectiveReview(c) {
+    c.instanceId = 'another-controller';
+  } });
+  assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 0); assert.deepEqual(value.publisherCalls, []);
+  assert.notEqual((await value.c.get(value.id)).correction.review.qualified, true);
+});
+
+test('corrective review cannot upgrade a three-turn request through child state or changed authority', async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: true }), { c, id } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  parent.automatic.status = 'progressing'; c.save(parent);
+  await assert.rejects(c.runCorrectiveReview(id, child.id), /CORRECTIVE_REVIEW_NOT_AUTHORIZED/);
+  parent.automatic.authorization.max_codex_turns = 4;
+  assert.throws(() => c.save(parent), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(c.task(id).automatic.authorization.max_codex_turns, 3);
+  assert.equal(c.task(child.id).automatic, undefined); assert.equal(value.calls.length, 3); assert.deepEqual(value.publisherCalls, []);
+});
+
+test('corrective review duplicate dispatch and repeated start cannot create another fourth reviewer', async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, activeCorrectiveReviewer: true }), { c, id } = value;
+  const child = c.task(c.task(id).automatic.correction.task_id), count = c.db.prepare('SELECT count(*) AS n FROM operations').get().n;
+  await assert.rejects(c.runCorrectiveReview(id, child.id), /CORRECTIVE_REVIEW_NOT_AUTHORIZED/);
+  await assert.rejects(c.reviewLocal(child, child.automatic.review_request_id), /CORRECTIVE_REVIEW_REPLAY_FORBIDDEN/);
+  await assert.rejects(c.runCorrection(child.id), /CORRECTION_BUDGET_EXHAUSTED/);
+  await c.start(value.input);
+  assert.equal(c.db.prepare('SELECT count(*) AS n FROM operations').get().n, count);
+  assert.equal(value.calls.length, 4); assert.equal(value.submissions.filter(call => call === 'corrective-reviewer').length, 1);
+  await c.cleanup({ task_id: id });
+  assert(value.stops.includes('cancel')); assert(value.stops.includes('close')); assert.deepEqual(value.publisherCalls, []);
+});
+
+test('corrective review restart never replays an attempted native reviewer', async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, activeCorrectiveReviewer: true });
+  const child = value.c.task(value.c.task(value.id).automatic.correction.task_id), requestId = child.automatic.review_request_id;
+  const restarted = await restartEvidenceController(t, value);
+  await restarted.start(value.input); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(value.calls.length, 4); assert.equal(restarted.task(child.id).automatic.review_request_id, requestId);
+  assert.notEqual((await restarted.get(value.id)).correction.review.qualified, true); assert.deepEqual(value.publisherCalls, []);
+});
+
+test('corrective review restart never replays a durable reservation without a submitted reviewer', async t => {
+  let reserved, parentSnapshot;
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, configure(c) {
+    const save = c.save.bind(c);
+    c.save = (task, options) => {
+      save(task, options);
+      if (!reserved && task.correction && task.automatic && !task.reviewer) {
+        reserved = structuredClone(task); parentSnapshot = c.task(task.correction.parent_task_id);
+        throw Error('Simulated process loss after committed reservation');
+      }
+    };
+  } });
+  assert(reserved); assert.equal(value.calls.length, 3);
+  await value.c.close();
+  const db = new DatabaseSync(path.join(value.c.stateRoot, 'controller.sqlite'));
+  db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(reserved), reserved.id);
+  db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(parentSnapshot), parentSnapshot.id); db.close();
+  const restarted = await new Controller({ stateRoot: value.c.stateRoot, workspaceRoot: value.c.workspaceRoot, api: value.api,
+    executor: value.executor, localBackendFactory: () => assert.fail('Reserved reviewer replay forbidden') }).init();
+  t.after(() => restarted.close());
+  await restarted.start(value.input); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal(restarted.task(reserved.id).automatic.review_request_id, reserved.automatic.review_request_id);
+  assert.equal(restarted.task(reserved.id).automatic.status, 'uncertain'); assert.equal(value.calls.length, 3);
+});
+
+for (const unavailable of ['packet', 'tree']) test(`corrective review MCP status remains observational with missing corrected ${unavailable} evidence`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true }), { c, id } = value;
+  const parent = c.task(id), child = c.task(parent.automatic.correction.task_id), root = path.join(c.workspaceRoot, child.id);
+  if (unavailable === 'packet') await fs.rm(path.join(root, child.reviewer.packet_directory, 'evidence.json'));
+  else {
+    const tree = child.reviewer.reviewed_git_state.tree_sha;
+    await fs.rm(path.join(root, 'git-store/objects', tree.slice(0, 2), tree.slice(2)));
+  }
+  const ledger = statusLedger(c.db), files = await statusFiles(value.normal, c.workspaceRoot), { get } = await statusClient(t, c);
+  let writes = 0;
+  const denied = new Set([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE]);
+  c.db.setAuthorizer(action => { if (denied.has(action)) { writes++; return sqlite.SQLITE_DENY; } return sqlite.SQLITE_OK; });
+  try {
+    for (const taskId of [id, child.id, id, child.id]) {
+      const response = await get(taskId); assert.notEqual(response.isError, true);
+      assert.equal(response.structuredContent.correction.review.qualified, false);
+      assert.equal(response.structuredContent.correction.review.overall, null);
+      if (taskId === child.id) assert.equal(response.structuredContent.reviewer.overall, null);
+    }
+    assert.equal(writes, 0); assert.equal(statusLedger(c.db), ledger);
+    assert.equal(await statusFiles(value.normal, c.workspaceRoot), files); assert.equal(value.calls.length, 4); assert.deepEqual(value.publisherCalls, []);
+  } finally { c.db.setAuthorizer(null); }
+});
+
+for (const uncertain of [false, true]) test(`corrective review expiry cancels the owned fourth backend without SQLite; uncertain=${uncertain}`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, activeCorrectiveReviewer: true,
+    cancelResult: !uncertain, closeResult: !uncertain }), { c, id } = value;
+  const deadline = c.task(id).deadline;
+  c.db.setAuthorizer((action, table) => action === sqlite.SQLITE_READ && table === 'tasks' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+  try { await assert.doesNotReject(c.expireAutomatic(id)); }
+  finally { c.db.setAuthorizer(null); }
+  assert(value.stops.includes('cancel')); assert(value.stops.includes('close'));
+  assert.equal(c.task(id).deadline, deadline); assert.equal(value.calls.length, 4); assert.deepEqual(value.publisherCalls, []);
+  assert.equal(c.expiryStops.get(id).confirmed, !uncertain);
+});
+
+for (const action of ['cleanup', 'expiry']) test(`corrective review ${action} stops its new validation runner without reviewer submission`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, activeCorrectiveValidation: true }), { c, id } = value;
+  const deadline = c.task(id).deadline;
+  const child = c.task(c.task(id).automatic.correction.task_id), { get } = await statusClient(t, c);
+  const ledger = statusLedger(c.db);
+  for (const taskId of [id, child.id]) {
+    const status = (await get(taskId)).structuredContent;
+    assert.equal(status.correction.codex_turns_attempted, 3);
+    assert.equal(status.automatic.usage.implementer_turn_submissions_attempted, 1);
+    assert.equal(status.automatic.usage.reviewer_turn_submissions_attempted, 1);
+    assert.equal(status.correction.review.attempted_turns, 0);
+  }
+  assert.equal(statusLedger(c.db), ledger);
+  if (action === 'cleanup') await c.cleanup({ task_id: id });
+  else {
+    c.db.setAuthorizer((kind, table) => kind === sqlite.SQLITE_READ && table === 'tasks' ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+    try { await assert.doesNotReject(c.expireAutomatic(id)); } finally { c.db.setAuthorizer(null); }
+  }
+  assert(value.stops.includes('validation.cancel'));
+  assert.equal(value.calls.length, 3); assert.equal(c.task(id).deadline, deadline); assert.deepEqual(value.publisherCalls, []);
 });
 
 test('single correction preserves the rejected tree and evidence, runs once in a fresh workspace, and stops for review', async t => {
