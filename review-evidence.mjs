@@ -41,11 +41,11 @@ async function treeState(root, skip = []) {
 function observedText(text, bound, limit = 8192) {
   return { text: bound(text, limit), sha256: sha(text), truncated: text.length > limit };
 }
-export async function gitState(repo, bound) {
+export async function gitState(repo, bound, git = repoGit) {
   try {
-    const common = await fs.realpath(repoGit(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim());
-    const gitDir = await fs.realpath(repoGit(repo, 'rev-parse', '--absolute-git-dir').trim());
-    const refs = repoGit(repo, 'for-each-ref', '--format=%(refname) %(objectname)');
+    const common = await fs.realpath((await git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')).trim());
+    const gitDir = await fs.realpath((await git(repo, 'rev-parse', '--absolute-git-dir')).trim());
+    const refs = await git(repo, 'for-each-ref', '--format=%(refname) %(objectname)');
     const config = await fs.readFile(path.join(common, 'config'));
     const indexFile = path.join(gitDir, 'index');
     const index = await fs.readFile(indexFile).then(sha, e => { if (e.code === 'ENOENT') return null; throw e; });
@@ -53,23 +53,23 @@ export async function gitState(repo, bound) {
     for (const name of ['MERGE_HEAD', 'REBASE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-apply', 'rebase-merge']) {
       markers[name] = await fs.lstat(path.join(gitDir, name)).then(() => true, e => { if (e.code === 'ENOENT') return false; throw e; });
     }
-    return { status: 'captured', remotes: observedText(repoGit(repo, 'remote'), bound), operation_markers: markers, head: repoGit(repo, 'rev-parse', 'HEAD').trim(),
+    return { status: 'captured', remotes: observedText(await git(repo, 'remote'), bound), operation_markers: markers, head: (await git(repo, 'rev-parse', 'HEAD')).trim(),
       refs: observedText(refs, bound), config_sha256: sha(config), index_sha256: index,
       metadata: await treeState(common, ['objects']),
       metadata_coverage: 'Git common directory except objects, including refs, reflogs, config, index and worktree administration' };
   } catch { return unavailable('Git state unreadable, changed during capture, or exceeded snapshot limits'); }
 }
-export async function checkoutSnapshot(repo, bound) {
+export async function checkoutSnapshot(repo, bound, git = repoGit) {
   const capturedAt = new Date().toISOString();
   try {
     const canonical = await fs.realpath(repo);
     if (canonical !== repo) throw Error();
-    const before = await gitState(repo, bound);
-    const status = repoGit(repo, 'status', '--porcelain=v1', '--untracked-files=all');
+    const before = await gitState(repo, bound, git);
+    const status = await git(repo, 'status', '--porcelain=v1', '--untracked-files=all');
     const contents = await treeState(repo, ['.git']);
-    const after = await gitState(repo, bound);
+    const after = await gitState(repo, bound, git);
     if (before.status !== 'captured' || JSON.stringify(before) !== JSON.stringify(after) ||
-        status !== repoGit(repo, 'status', '--porcelain=v1', '--untracked-files=all')) throw Error();
+        status !== await git(repo, 'status', '--porcelain=v1', '--untracked-files=all')) throw Error();
     return { status: 'captured', captured_at: capturedAt, git: before,
       index_worktree_status: observedText(status, bound), contents };
   } catch { return { ...unavailable('Checkout unreadable, changed during capture, or exceeded snapshot limits'), captured_at: capturedAt }; }

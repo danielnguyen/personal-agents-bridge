@@ -9,6 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Controller, BridgeError } from './controller.mjs';
 import { githubNamePattern } from './github-registration.mjs';
+import { LOCAL_ACTIONABILITY_REVIEW_VERSION } from './local-reviewer-instructions.mjs';
 
 const requestId = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/);
 const taskId = z.string().regex(/^task_[a-f0-9-]{36}$/);
@@ -20,6 +21,7 @@ const requirement = z.object({ id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,39
 const automaticAuthorization = z.object({
   publish: z.object({ title: z.string().min(1).max(200).regex(/^[^\x00-\x1f]+$/), body: z.string().max(16000).optional(), draft: z.literal(true) }).strict(),
   max_duration_seconds: z.number().int().min(1).max(900), max_codex_turns: z.literal(2), max_corrections: z.literal(0),
+  review_protocol: z.literal(LOCAL_ACTIONABILITY_REVIEW_VERSION).optional().describe('Explicit local automatic review format; correction execution remains disabled. Omit for the original protocol.'),
 }).strict().describe('Explicit authority for one local implementation, independent validation, one reviewer and exact-tree draft publication. Failures or human requests stop; no corrections or restart replay.').optional();
 export const contractSchema = z.object({
   goal: z.string().min(1).max(8000),
