@@ -351,6 +351,7 @@ export class Controller {
       for (const t of writes) {
         if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id)?.value !== intended.get(t.id)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
         if (t.correction) this.verifyCorrectionEvidence(t, operationStates.get(t.id), reviewStates.get(t.id));
+        if (t.correction && t.automatic?.corrective_publication) this.verifyCorrectivePublicationEvidence(t);
       }
       for (const record of retained) {
         if (this.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=? AND attempt_id=? AND observation_sha256=?')
@@ -375,6 +376,7 @@ export class Controller {
             if (old.automatic && (digest(old.automatic.authorization) !== digest(t.automatic?.authorization ?? null) ||
                 digest(old.automatic.review_authorization ?? null) !== digest(t.automatic?.review_authorization ?? null) ||
                 (old.reviewer?.review_protocol && old.reviewer.review_protocol !== t.reviewer?.review_protocol))) throw new BridgeError('AUTOMATIC_REVIEW_AUTHORIZATION_CHANGED');
+            if (old.automatic?.corrective_publication && digest(old.automatic.corrective_publication) !== digest(t.automatic?.corrective_publication ?? null)) throw new BridgeError('CORRECTIVE_PUBLICATION_BINDING_CHANGED');
             const authenticated = old.reviewer?.authenticated_review_sha256;
             if (authenticated && (t.reviewer?.authenticated_review_sha256 !== authenticated || t.reviewer.findings_sha256 !== authenticated ||
                 (t.reviewer.review_result && digest(t.reviewer.review_result) !== authenticated) ||
@@ -386,7 +388,7 @@ export class Controller {
             const record = this.retainAutomaticAttempt(t, packetText); if (t.correction && t.automatic) retained.push(record);
           }
           if (t.automatic && (t.reviewer?.review_result || t.reviewer?.received_review_output || t.automatic.status !== 'progressing')) {
-            const record = this.retainAutomaticAttempt(t); if (t.correction) retained.push(record);
+            const record = this.retainAutomaticAttempt(t); if (t.correction || t.automatic.corrective_publication) retained.push(record);
           }
           if (t.correction) {
             const observation = this.correctiveObservation(t);
@@ -601,7 +603,9 @@ export class Controller {
     if (input.automatic === undefined) return undefined;
     const value = input.automatic, plain = object => object && typeof object === 'object' && !Array.isArray(object);
     if (input.execution_backend !== 'local_codex' || !input.repository_id || !plain(value) ||
-        Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol'].includes(key)) ||
+        Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol', 'publish_after_correction'].includes(key)) ||
+        (Object.hasOwn(value, 'publish_after_correction') && (value.publish_after_correction !== true || value.max_codex_turns !== 4 ||
+          value.max_corrections !== 1 || value.review_protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION)) ||
         (Object.hasOwn(value, 'review_protocol') && value.review_protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION) ||
         !((value.max_codex_turns === 2 && value.max_corrections === 0) ||
           ([3, 4].includes(value.max_codex_turns) && value.max_corrections === 1 && value.review_protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION)) || !Number.isInteger(value.max_duration_seconds) ||
@@ -612,7 +616,8 @@ export class Controller {
     this.rejectSecret(value);
     return { publish: { title: value.publish.title, body: value.publish.body || '', draft: true },
       max_duration_seconds: value.max_duration_seconds, max_codex_turns: value.max_codex_turns, max_corrections: value.max_corrections,
-      ...(value.review_protocol ? { review_protocol: value.review_protocol } : {}) };
+      ...(value.review_protocol ? { review_protocol: value.review_protocol } : {}),
+      ...(value.publish_after_correction === true ? { publish_after_correction: true } : {}) };
   }
   reviewProtocol(task) {
     const selected = task.automatic?.authorization.review_protocol;
@@ -771,7 +776,7 @@ export class Controller {
       this.storageAuthority();
       const parent = this.correctiveReviewAuthority(task);
       this.verifyCorrectionEvidence(task);
-      if (summary.uncertain || this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      if ((summary.uncertain && !task.automatic.corrective_publication) || this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
       if (!ref?.review_result) {
         if (ref?.error || task.automatic.status !== 'progressing' || ref?.pending_review_output || ref?.pending_review_result) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
         return summary;
@@ -792,6 +797,41 @@ export class Controller {
     }
     return summary;
   }
+  correctivePublicationSummary(task) {
+    const binding = task.automatic.corrective_publication, p = task.publication;
+    const result = { operation_id: binding.operation_id, task_id: task.id, state: p?.phase || 'reserved', observed_phase: p?.phase || 'reserved', confirmed: false,
+      uncertain: true, execution_authorized: false, reviewed_tree_sha: binding.reviewed_tree_sha,
+      commit_sha: p?.commit_sha || null, pushed_branch: binding.branch, push_attempted: p?.push_attempted === true,
+      pr_attempted: p?.pr_attempted === true, pr_number: p?.pr_number || null, pr_url: p?.pr_url || null,
+      diagnostic: task.publication_error || 'CORRECTIVE_PUBLICATION_UNCONFIRMED' };
+    try {
+      this.storageAuthority();
+      const parent = this.correctiveReviewAuthority(task);
+      this.verifyCorrectionEvidence(task);
+      const operation = this.verifyCorrectivePublicationEvidence(task);
+      this.verifyAutomaticEvidence(task, { progressing: true }); this.verifyAutomaticEvidence(parent, { progressing: true });
+      if (this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+      if (operation.status !== 'accepted') {
+        if (operation.status === 'uncertain' || task.automatic.status !== 'progressing' || parent.automatic.status !== 'progressing' ||
+            task.automatic.owner_instance !== this.instanceId || parent.automatic.owner_instance !== this.instanceId || Date.now() >= task.deadline) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+        return { ...result, state: p?.phase === 'complete' ? 'confirmation_pending' : result.state, uncertain: false, diagnostic: null };
+      }
+      return { ...result, ...publicationResult(p), state: 'complete', confirmed: true, uncertain: false, diagnostic: null };
+    } catch {
+      try {
+        for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
+          const prior = JSON.parse(row.value);
+          if (digest(prior) !== row.observation_sha256) continue;
+          result.push_attempted ||= prior.publication?.state?.push_attempted === true;
+          result.pr_attempted ||= prior.publication?.state?.pr_attempted === true;
+        }
+      } catch { /* Unavailable history cannot prove nonexecution. */ }
+      if (!result.push_attempted) result.push_attempted = null;
+      if (!result.pr_attempted) result.pr_attempted = null;
+      result.state = 'uncertain';
+      return result;
+    }
+  }
   async currentReviewPacket(task) {
     const current = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), task.repository.repository_id,
       task.repository.base_ref, this.workspaceRoot, this.stateRoot, asynchronousRepoGit(AbortSignal.timeout(10000)));
@@ -805,7 +845,9 @@ export class Controller {
       state: task.correction_state, reason: task.correction_reason || null,
       ...(task.automatic ? { review: { authorization: task.automatic.review_authorization,
         status: task.automatic.status, phase: task.automatic.phase, reason: task.automatic.reason,
-        reviewer: task.reviewer || null, validation: task.local_validation || null } } : {}) };
+        reviewer: task.reviewer || null, validation: task.local_validation || null } } : {}),
+      ...(task.automatic?.corrective_publication ? { publication: { authorization: task.automatic.corrective_publication,
+        state: task.publication || null, error: task.publication_error || null } } : {}) };
   }
   verifyCorrectionEvidence(task, operationStatus, reviewStatus) {
     if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id)?.value !== JSON.stringify(task)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
@@ -998,12 +1040,113 @@ export class Controller {
       this.revalidateVersionedReview(completed, await this.currentReviewPacket(completed));
       await this.currentReviewPacket(this.task(parentId));
       this.automaticGuard(this.task(id));
+      if (completed.automatic.authorization.publish_after_correction === true && ref.review_result.overall === 'PASS') {
+        await this.runCorrectivePublication(parentId, id); return;
+      }
       this.finishAutomatic(id, 'stopped', 'CORRECTIVE_REVIEW_RETAINED');
       this.verifyAutomaticEvidence(this.task(id));
       this.finishAutomatic(parentId, 'stopped', 'CORRECTIVE_REVIEW_RETAINED');
     } catch (error) {
       if (this.persistenceFailures.has(id)) this.persistenceAttention(id);
       else if (!this.dbClosed) this.finishAutomatic(id, 'uncertain', error instanceof BridgeError ? error.code : 'CORRECTIVE_REVIEW_UNCONFIRMED');
+      throw error;
+    }
+  }
+  correctivePublicationBinding(task) {
+    const parent = this.correctiveReviewAuthority(task), ref = task.reviewer;
+    if (parent.automatic.authorization.publish_after_correction !== true) throw new BridgeError('CORRECTIVE_PUBLICATION_NOT_AUTHORIZED');
+    return { parent_task_id: parent.id, task_id: task.id, operation_id: parent.automatic.publish_request_id,
+      original_request_id: parent.request_id, original_request_fingerprint: parent.automatic.review_authorization.request_fingerprint,
+      authorization_sha256: digest(parent.automatic.authorization), contract_sha256: task.correction.contract_sha256,
+      baseline_commit: parent.baseline, deadline: parent.deadline, lineage: task.correction,
+      rejected_tree_sha: task.correction.rejected_tree_sha, rejected_packet_sha256: task.correction.packet_sha256,
+      rejected_findings_sha256: task.correction.findings_sha256, reviewed_tree_sha: ref.reviewed_git_state.tree_sha,
+      packet_sha256: ref.packet_hash, findings_sha256: ref.findings_sha256,
+      reviewer_thread_id: ref.local.thread_id, reviewer_turn_id: ref.local.turn_id,
+      validation_attempt_id: task.local_validation.attempt_id, validation_sha256: digest(task.local_validation),
+      branch: task.repository.branch, input: { task_id: task.id, ...parent.automatic.authorization.publish } };
+  }
+  correctivePublicationState(task) {
+    const p = task.publication;
+    return p?.phase === 'complete' ? 'result_received' : p?.pr_attempted ? 'pr_attempted' :
+      p?.phase === 'pushed' ? 'pushed' : p?.push_attempted ? 'push_attempted' : 'reserved';
+  }
+  verifyCorrectivePublicationEvidence(task) {
+    const binding = this.correctivePublicationBinding(task), parent = this.task(binding.parent_task_id);
+    const operation = this.db.prepare('SELECT * FROM operations WHERE id=?').get(binding.operation_id);
+    if (digest(task.automatic.corrective_publication) !== digest(binding) || digest(parent.automatic.corrective_publication) !== digest(binding) ||
+        this.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id)?.value !== JSON.stringify(task) ||
+        operation?.task_id !== task.id || operation.fingerprint !== digest({ kind: 'automatic_publish', payload: binding.input })) throw new BridgeError('CORRECTIVE_PUBLICATION_BINDING_CHANGED');
+    const p = task.publication, expected = this.correctivePublicationState(task);
+    if (operation.status === 'accepted') {
+      if (p?.phase !== 'complete' || task.automatic.status !== 'succeeded' || parent.automatic.status !== 'succeeded' ||
+          digest(parent.automatic.corrective_publication_result) !== digest(publicationResult(p))) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+    } else if (operation.status === 'uncertain') {
+      if (task.automatic.status !== 'uncertain') throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+    } else if (operation.status !== expected || parent.automatic.corrective_publication_result) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+    if (p && (p.task_id !== task.id || p.input_sha256 !== digest({ title: binding.input.title, body: binding.input.body, draft: true }) ||
+        p.reviewed_tree_sha !== binding.reviewed_tree_sha || p.review_packet_sha256 !== binding.packet_sha256 ||
+        p.pushed_branch !== binding.branch || p.reviewer_thread_id !== binding.reviewer_thread_id || p.reviewer_turn_id !== binding.reviewer_turn_id ||
+        p.review_overall !== 'PASS' || !['prepared', 'pushed', 'complete'].includes(p.phase))) throw new BridgeError('CORRECTIVE_PUBLICATION_BINDING_CHANGED');
+    let retained = false;
+    for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND attempt_id=?').all(task.id, task.request_id)) {
+      const observation = JSON.parse(row.value), prior = observation.publication;
+      if (digest(observation) !== row.observation_sha256) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+      if (!prior) continue;
+      if (digest(prior.authorization) !== digest(binding) || (prior.state?.push_attempted && !p?.push_attempted) ||
+          (prior.state?.pr_attempted && !p?.pr_attempted) || (prior.state && (!p || prior.state.commit_sha !== p.commit_sha ||
+            digest(prior.state.target) !== digest(p.target)))) throw new BridgeError('CORRECTIVE_PUBLICATION_BINDING_CHANGED');
+      retained ||= digest(observation) === digest(this.correctiveObservation(task));
+    }
+    if (!retained) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+    return operation;
+  }
+  async qualifyCorrectivePublication(task) {
+    this.automaticGuard(task);
+    const parent = this.correctiveReviewAuthority(task);
+    await this.correctionEvidence(parent.id, task.correction);
+    this.verifyCorrectionEvidence(task); this.verifyAutomaticEvidence(task, { progressing: true });
+    this.correctiveReviewerIdentity(task, { threadId: task.reviewer.local.thread_id, turnId: task.reviewer.local.turn_id, model: task.reviewer.local.model });
+    if (parent.automatic.authorization.publish_after_correction !== true || task.reviewer.review_result?.model_overall !== 'PASS' ||
+        task.reviewer.review_result.controller_overrides.length || !Object.values(task.reviewer.review_result.controller_context).every(value => value === true)) throw new BridgeError('CORRECTIVE_PUBLICATION_NOT_AUTHORIZED');
+    await this.currentReviewPacket(task);
+    await this.qualifyLocalPublication(task);
+    if (task.automatic.corrective_publication) this.verifyCorrectivePublicationEvidence(task);
+    if (task.publication) {
+      const git = asynchronousRepoGit(AbortSignal.timeout(10000)), repo = path.join(this.workspaceRoot, task.id, 'repo');
+      if ((await git(repo, 'rev-parse', `${task.publication.commit_sha}^{tree}`)).trim() !== task.reviewer.reviewed_git_state.tree_sha ||
+          (await git(repo, 'rev-list', '--parents', '-n', '1', task.publication.commit_sha)).trim() !== `${task.publication.commit_sha} ${task.baseline}`) throw new BridgeError('PUBLICATION_TREE_MISMATCH');
+    }
+    this.automaticGuard(this.task(task.id));
+  }
+  async runCorrectivePublication(parentId, id) {
+    let task = this.task(id), parent = this.task(parentId);
+    await this.qualifyCorrectivePublication(task);
+    if (task.automatic.corrective_publication || parent.automatic.corrective_publication || task.publication || parent.publication ||
+        task.correction.parent_task_id !== parentId) throw new BridgeError('AUTOMATIC_PUBLICATION_REPLAY_FORBIDDEN');
+    const binding = this.correctivePublicationBinding(task);
+    if (this.operation(binding.operation_id, 'automatic_publish', binding.input, id)) throw new BridgeError('AUTOMATIC_PUBLICATION_REPLAY_FORBIDDEN');
+    task.automatic.corrective_publication = binding; parent.automatic.corrective_publication = binding;
+    task.automatic.phase = 'publication';
+    try {
+      this.save(task, { relatedTask: parent, operation: { id: binding.operation_id, status: 'reserved' } });
+      const result = await this.invoke('publish_task', binding.input, {}, input => this.publish(input, automaticTransition));
+      task = this.task(id); parent = this.task(parentId);
+      await this.qualifyCorrectivePublication(task);
+      if (task.publication?.phase !== 'complete' || digest(result) !== digest(publicationResult(task.publication))) throw new BridgeError('CORRECTIVE_PUBLICATION_UNCONFIRMED');
+      Object.assign(task.automatic, { status: 'succeeded', reason: null, human_attention_required: false });
+      Object.assign(parent.automatic, { status: 'succeeded', reason: null, human_attention_required: false, corrective_publication_result: result });
+      this.save(task, { relatedTask: parent, operation: { id: binding.operation_id, status: 'accepted' } });
+      this.verifyCorrectivePublicationEvidence(this.task(id));
+      for (const taskId of [id, parentId]) { clearTimeout(this.automaticTimers.get(taskId)); this.automaticTimers.delete(taskId); }
+    } catch (error) {
+      if (this.persistenceFailures.has(id) || this.persistenceFailures.has(parentId)) {
+        this.persistenceFailures.add(id); this.persistenceFailures.add(parentId); this.persistenceAttention(id); this.persistenceAttention(parentId);
+      } else if (!this.dbClosed) {
+        task = this.task(id); parent = this.task(parentId);
+        for (const value of [task, parent]) Object.assign(value.automatic, { status: 'uncertain', reason: this.bounded(error.code || 'PUBLICATION_FAILED', 256), human_attention_required: true });
+        this.save(task, { relatedTask: parent, operation: { id: binding.operation_id, status: 'uncertain' } });
+      }
       throw error;
     }
   }
@@ -1024,7 +1167,9 @@ export class Controller {
       const reviewing = !!task.automatic;
       if (reviewing) {
         this.correctiveReviewAuthority(task);
-        if (task.automatic.status !== 'progressing' || task.automatic.phase !== 'validation_and_review' || task.automatic.owner_instance !== this.instanceId ||
+        const publishing = task.automatic.phase === 'publication' && !!task.automatic.corrective_publication;
+        if (publishing) this.verifyCorrectivePublicationEvidence(task);
+        if (task.automatic.status !== 'progressing' || (!publishing && task.automatic.phase !== 'validation_and_review') || task.automatic.owner_instance !== this.instanceId ||
             task.automatic.deadline !== task.deadline || this.expiryStops.has(task.id) ||
             !localExecutionQualified(task.implementer.local) || task.implementer.local.owner_instance !== this.instanceId ||
             task.implementer.error || task.implementer.local.human_requests.length ||
@@ -1036,7 +1181,7 @@ export class Controller {
           parent.reviewer.findings_sha256 !== task.correction.findings_sha256 || parent.reviewer.packet_hash !== task.correction.packet_sha256 ||
           operation?.task_id !== task.id || operation.fingerprint !== digest({ kind: 'correction', payload: task.correction }) ||
           !(reviewing ? operation.status === 'accepted' : ['reserved', 'submitting', 'submitted', 'result_received'].includes(operation.status)) ||
-          task.deadline !== parent.deadline || task.baseline !== parent.baseline || task.cleaned || task.implementer.stopping ||
+          task.deadline !== parent.deadline || task.baseline !== parent.baseline || task.cleaned || (task.implementer.stopping && task.automatic?.phase !== 'publication') ||
           task.correction_state !== (reviewing ? 'awaiting_review' : 'running') || this.persistenceFailures.has(task.id)) throw new BridgeError('CORRECTION_AUTHORITY_UNAVAILABLE');
       return;
     }
@@ -1081,6 +1226,8 @@ export class Controller {
         actionability_qualification: ref?.review_result?.actionability_qualification || null } : {}),
       implementer: identity(task.implementer), reviewer: identity(ref),
       ...(task.automatic.correction ? { correction: task.automatic.correction } : {}),
+      ...(task.automatic.corrective_publication ? { corrective_publication: task.automatic.corrective_publication,
+        publication: task.publication || task.automatic.corrective_publication_result || null } : {}),
       outcome: task.automatic.status, stop_reason: task.automatic.reason,
       correction_eligibility: task.automatic.authorization.review_protocol ? {
         eligible: false, execution_authorized: false,
@@ -1254,6 +1401,7 @@ export class Controller {
       if (child.correction_state !== 'awaiting_review' || this.persistenceFailures.has(child.id) || !localExecutionQualified(child.implementer.local)) return true;
       if (child.automatic?.status === 'uncertain' || (child.reviewer?.local.instance_started && !child.reviewer.local.server_closed) ||
           child.local_validation?.termination_confirmed === false) return true;
+      if (child.automatic?.corrective_publication && child.automatic.status !== 'succeeded') return true;
     }
     return task.automatic.owner_instance !== this.instanceId || task.automatic.phase === 'publication' || task.local_validation?.termination_confirmed === false ||
       [task.implementer, task.reviewer].some(ref => ref?.local && (ref.local.execution_state === 'uncertain' ||
@@ -1807,6 +1955,14 @@ export class Controller {
           if (result.reviewer) result.reviewer.overall = review.overall;
           result.automatic.review = { ...result.automatic.review, state: review.qualified ? review.overall === 'PASS' ? 'pass' : 'non_correctable_fail' : 'malformed_or_uncertain',
             potentially_correctable: false, execution_authorized: false };
+        }
+        if (child.automatic.corrective_publication) {
+          const publication = this.correctivePublicationSummary(child);
+          result.correction.publication = publication;
+          result.publication = publication.confirmed ? publicationResult(child.publication) : publication;
+          if (publication.uncertain) {
+            result.state = 'uncertain'; result.automatic.status = 'uncertain'; result.automatic.human_attention_required = true;
+          }
         }
       } else if (parent.automatic.authorization.max_codex_turns === 4) result.correction.remaining_codex_turns = 1;
     }
@@ -2551,10 +2707,14 @@ export class Controller {
     this.rejectSecret(input);
     return this.locked(input.task_id, async () => {
       let t = this.task(input.task_id);
-      if (t.correction) throw new BridgeError('CORRECTIVE_PUBLICATION_NOT_AUTHORIZED');
+      if (t.correction && (owner !== automaticTransition || !t.automatic?.corrective_publication)) throw new BridgeError('CORRECTIVE_PUBLICATION_NOT_AUTHORIZED');
       if (t.automatic && owner !== automaticTransition) throw new BridgeError('AUTOMATIC_TASK_OWNS_TRANSITIONS');
       try {
         this.automaticGuard(t);
+        if (t.correction) {
+          if (digest(input) !== digest(t.automatic.corrective_publication.input)) throw new BridgeError('PUBLICATION_INPUT_CHANGED');
+          await this.qualifyCorrectivePublication(t);
+        }
         if (!t.repository) throw new BridgeError('PUBLICATION_REQUIRES_REPOSITORY');
         if (['implementer', 'reviewer'].some(role => this.jobs.has(`${t.id}:${role}`))) throw new BridgeError('TASK_EXECUTION_PENDING');
         for (const role of ['implementer', 'reviewer']) if (t.execution_backend !== 'local_codex' && t[role]?.session_id && !t[role].deleted) await this.viewRole(t, role);
@@ -2574,13 +2734,18 @@ export class Controller {
         const publicationController = Object.create(this);
         publicationController.publisher = Object.fromEntries(['target', 'remoteHead', 'push', 'findPR', 'createPR'].map(method => [method, async (...args) => {
           this.automaticGuard(this.task(t.id));
-          if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
+          if (t.correction) await this.qualifyCorrectivePublication(this.task(t.id));
+          else if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
           const result = await this.publisher[method](...args);
           this.automaticGuard(this.task(t.id));
-          if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
+          if (t.correction) await this.qualifyCorrectivePublication(this.task(t.id));
+          else if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
           return result;
         }]));
-        publicationController.save = value => { this.automaticGuard(this.task(t.id)); this.save(value); };
+        publicationController.save = value => {
+          this.automaticGuard(this.task(t.id));
+          this.save(value, t.correction ? { operation: { id: value.automatic.corrective_publication.operation_id, status: this.correctivePublicationState(value) } } : {});
+        };
         const result = await publishReviewedTask(publicationController, t, { title: input.title, body: input.body || '', draft: true });
         t = this.task(t.id); t.publication_error = null; this.save(t);
         const auditId = this.context.getStore();
