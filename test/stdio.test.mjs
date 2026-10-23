@@ -11,6 +11,14 @@ test('actual stdio MCP process initializes and returns stable task IDs', async t
   const client = new Client({ name: 'stdio-verifier', version: '1' });
   t.after(async () => { await client.close(); await fs.rm(root, { recursive: true, force: true }); });
   await client.connect(transport); assert.equal((await client.listTools()).tools.length, 8);
+  const automatic = { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 3,
+    max_corrections: 1, review_protocol: 'pab.local-review.actionability.v1' };
+  const missing = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'stdio_corrective',
+    execution_backend: 'local_codex', repository_id: 'missing_fixture', automatic } });
+  assert.equal(missing.isError, true); assert.match(missing.content[0].text, /UNKNOWN_REPOSITORY_ID/);
+  const invalid = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'stdio_invalid_correction',
+    execution_backend: 'local_codex', repository_id: 'missing_fixture', automatic: { ...automatic, review_protocol: undefined } } });
+  assert.equal(invalid.isError, true);
   const started = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'stdio_start' } });
   assert(started.structuredContent.task_id);
   const got = await client.callTool({ name: 'get_task', arguments: { task_id: started.structuredContent.task_id } });

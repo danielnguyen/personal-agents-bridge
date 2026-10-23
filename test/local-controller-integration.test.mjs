@@ -77,6 +77,71 @@ async function setup(context, mode = {}, options = {}) {
 
 const automaticAuthority = () => ({ publish: { title: 'Explicit fixture draft', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 });
 
+for (const reused of [false, true]) test(`corrective native adapter starts a fresh subscription thread and never resumes; reused=${reused}`, async context => {
+  const calls = []; let index = 0, fixtureFailure;
+  const value = await setup(context, {}, { noApi: true, localBackendFactory: options => {
+    const execution = index++, thread = reused && execution === 2 ? 'native-0' : `native-${execution}`, turn = `turn-${execution}`;
+    return new LocalCodexBackend({ ...options, spawnProcess(binary, args, config) {
+      const child = new EventEmitter(); child.stdout = new PassThrough();
+      const send = message => child.stdout.write(JSON.stringify(message) + '\n');
+      child.kill = () => { if (!child.dead) { child.dead = true; queueMicrotask(() => child.emit('close', 0)); } };
+      child.stdin = new Writable({ write(chunk, encoding, callback) {
+        const message = JSON.parse(String(chunk));
+        if (message.id !== undefined && message.method) {
+          calls.push({ execution, method: message.method, params: message.params });
+          queueMicrotask(() => { void (async () => {
+            let result;
+            if (message.method === 'initialize') result = { codexHome: config.env.CODEX_HOME };
+            else if (message.method === 'config/read') result = { config: { model_provider: 'openai', chatgpt_base_url: 'https://chatgpt.com/backend-api/',
+              sandbox_mode: options.reviewOnly ? 'read-only' : 'workspace-write', sandbox_workspace_write: { network_access: false },
+              approval_policy: 'on-request', approvals_reviewer: 'user', web_search: 'disabled',
+              shell_environment_policy: { inherit: 'none', set: { PATH: '/usr/local/bin:/usr/bin:/bin' } },
+              features: { apps: false, plugins: false, hooks: false, multi_agent: false, remote_control: false, api_key_model_discovery: false } } };
+            else if (message.method === 'account/read') result = { account: { type: 'chatgpt', email: 'fixture@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true };
+            else if (message.method === 'model/list') result = { data: [{ id: 'model', model: 'gpt-6-astra', isDefault: true, hidden: false }], nextCursor: null };
+            else if (message.method === 'thread/start') result = { thread: { id: thread, turns: [] }, model: 'gpt-6-astra', cwd: options.cwd,
+              modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: options.reviewOnly ? 'readOnly' : 'workspaceWrite', networkAccess: false } };
+            else if (message.method === 'turn/start') {
+              if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), execution === 0 ? 'candidate\n' : 'corrected\n');
+              result = { turn: { id: turn, status: 'inProgress' } };
+              setImmediate(() => {
+                const output = { format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall: 'FAIL', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({
+                  id, status: id === 'R1' ? 'FAIL' : 'PASS', evidence: 'greeting.txt has the wrong greeting; the original required greeting must be restored.',
+                  classification: id === 'R1' ? { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: 'Use the originally required greeting.', requires_human_approval: false } } : null })) };
+                if (options.reviewOnly) send({ method: 'item/completed', params: { threadId: thread, turnId: turn,
+                  item: { id: 'review-output', type: 'agentMessage', text: JSON.stringify(output) } } });
+                send({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed' } } });
+              });
+            } else throw Error(`Unexpected native method ${message.method}`);
+            send({ id: message.id, result });
+          })().catch(error => { fixtureFailure = error; send({ id: message.id, error: { code: -32000, message: 'Fixture failure' } }); }); });
+        }
+        callback();
+      } });
+      return child;
+    } });
+  } });
+  value.input.automatic = { ...automaticAuthority(), max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION };
+  let publishes = 0; value.controller.publisher = { target() { publishes++; throw Error('Publication forbidden'); } };
+  const result = await value.start(); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  assert.equal(fixtureFailure, undefined);
+  const parent = value.controller.task(result.task_id);
+  assert(parent.automatic.correction, JSON.stringify(parent.automatic));
+  const child = value.controller.task(parent.automatic.correction.task_id);
+  assert.equal(child.correction_state, reused ? 'needs_attention' : 'awaiting_review', JSON.stringify(child.implementer));
+  assert.equal(calls.filter(call => call.method === 'thread/start').length, 3);
+  assert.equal(calls.filter(call => call.method === 'turn/start').length, reused ? 2 : 3);
+  assert.equal(calls.filter(call => call.method === 'thread/resume').length, 0);
+  assert.equal(publishes, 0); assert.equal(value.controller._api, undefined); assert.equal(value.executor.started.length, 0);
+  if (!reused) {
+    assert.equal(child.implementer.local.authentication, 'chatgpt'); assert.equal(child.implementer.local.thread_id, 'native-2');
+    assert.equal(child.implementer.local.turn_id, 'turn-2'); assert.equal(child.deadline, parent.deadline);
+    const submitted = calls.find(call => call.execution === 2 && call.method === 'turn/start').params;
+    assert.equal(submitted.sandboxPolicy.networkAccess, false); assert.deepEqual(submitted.sandboxPolicy.writableRoots, [path.join(value.controller.workspaceRoot, child.id, 'repo')]);
+    assert.equal(await fs.readFile(path.join(value.controller.workspaceRoot, parent.id, 'repo/greeting.txt'), 'utf8'), 'candidate\n');
+  }
+});
+
 for (const [label, change] of [
   ['implicit backend', input => { delete input.execution_backend; }],
   ['Agents API backend', input => { input.execution_backend = 'agents_api'; }],

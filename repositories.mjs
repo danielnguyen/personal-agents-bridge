@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, constants } from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -225,6 +225,47 @@ export async function verifyTaskWorktree(root, repository) {
   if (!pointer.isFile() || pointer.isSymbolicLink()) fail('TASK_WORKTREE_CHANGED');
   if ((await fs.readFile(path.join(worktree, '.git'), 'utf8')).trim() !== `gitdir: ${store}/worktrees/repo`) fail('TASK_WORKTREE_CHANGED');
   if (repoGit(worktree, 'symbolic-ref', 'HEAD').trim() !== `refs/heads/${repository.branch}`) fail('TASK_BRANCH_CHANGED');
+}
+export async function createCorrectiveWorktree(root, id, sourceRoot, repository, tree) {
+  if (!/^[a-f0-9]{40,64}$/.test(tree)) fail('INVALID_REVIEW_TREE');
+  await verifyTaskWorktree(sourceRoot, repository);
+  const git = asynchronousRepoGit(AbortSignal.timeout(10000)), source = path.join(sourceRoot, 'repo');
+  await git(source, 'cat-file', '-e', `${repository.baseline_commit}^{commit}`);
+  await validateManagedTree(source, tree, git);
+  const store = path.join(root, 'git-store'), worktree = path.join(root, 'repo');
+  await fs.mkdir(store, { mode: 0o700 });
+  await git(store, 'init', '--bare', '--initial-branch=main');
+  let files = 0, bytes = 0;
+  const deadline = Date.now() + 10000;
+  // Copy object bytes, never alternates, configuration, refs or mutable Git
+  // administration. No fetch, shared object directory or hardlinks are used.
+  async function copyObjects(relative = '') {
+    const from = path.join(sourceRoot, 'git-store/objects', relative), to = path.join(store, 'objects', relative);
+    const before = await fs.lstat(from, { bigint: true });
+    if (Date.now() >= deadline || before.uid !== BigInt(process.getuid()) || before.isSymbolicLink()) fail('CORRECTION_OBJECTS_UNAVAILABLE');
+    if (before.isDirectory()) {
+      if (relative && !/^(?:info|pack|[a-f0-9]{2})$/.test(relative)) fail('CORRECTION_OBJECTS_UNAVAILABLE');
+      if (relative) await fs.mkdir(to, { recursive: true, mode: 0o700 });
+      for (const name of (await fs.readdir(from)).sort()) await copyObjects(relative ? `${relative}/${name}` : name);
+    } else {
+      if (!before.isFile() || before.nlink !== 1n || !/^(?:[a-f0-9]{2}\/(?:[a-f0-9]{38}|[a-f0-9]{62})|pack\/pack-[a-f0-9]{40,64}\.(?:pack|idx|rev))$/.test(relative) ||
+          ++files > 100000 || (bytes += Number(before.size)) > 512 * 1024 * 1024) fail('CORRECTION_OBJECTS_UNAVAILABLE');
+      await fs.copyFile(from, to, constants.COPYFILE_EXCL);
+    }
+    const after = await fs.lstat(from, { bigint: true });
+    if (['dev', 'ino', 'mode', 'size', 'mtimeNs', 'ctimeNs'].some(key => before[key] !== after[key])) fail('CORRECTION_OBJECTS_CHANGED');
+  }
+  await copyObjects();
+  await git(store, 'fsck', '--full', '--strict', '--no-reflogs');
+  await git(store, 'cat-file', '-e', `${repository.baseline_commit}^{commit}`);
+  await validateManagedTree(store, tree, git);
+  const branch = `bridge/${id}`;
+  await git(store, 'worktree', 'add', '-b', branch, worktree, repository.baseline_commit);
+  await git(worktree, 'read-tree', '--reset', '-u', tree);
+  if ((await git(worktree, 'write-tree')).trim() !== tree) fail('CORRECTION_TREE_CHANGED');
+  await git(worktree, 'diff-files', '--quiet');
+  await fs.appendFile(path.join(store, 'info/exclude'), '\n/TASK.md\n');
+  return { ...repository, branch, worktree_id: id };
 }
 export async function removeTaskWorktree(root, repository) {
   const worktree = path.join(root, 'repo'), store = path.join(root, 'git-store');

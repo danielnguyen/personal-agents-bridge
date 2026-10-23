@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createRepositorySandbox } from '../repository-sandbox.mjs';
 import { Controller } from '../controller.mjs';
-import { repositoryIdentity, repoGit } from '../repositories.mjs';
+import { repositoryIdentity, repoGit, createCorrectiveWorktree } from '../repositories.mjs';
 import { createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -72,6 +72,39 @@ test('unknown IDs, arbitrary paths and missing base refs fail before API calls',
   await assert.rejects(c.start({ ...input, base_ref: '--all' }), /INVALID_BASE_REF/);
   assert.equal(api.created.length, 0);
   assert.equal(c.db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 0);
+});
+
+test('corrective worktree copies exact Git objects into independent administration at the original baseline', async t => {
+  const { c, root, normal, baseline, start } = await setup(t), view = await start();
+  const original = path.join(c.workspaceRoot, view.task_id), repo = path.join(original, 'repo');
+  await fs.writeFile(path.join(repo, 'greeting.txt'), 'rejected candidate\n'); repoGit(repo, 'add', 'greeting.txt');
+  const tree = repoGit(repo, 'write-tree').trim(), task = c.task(view.task_id);
+  const before = { refs: repoGit(repo, 'show-ref'), index: await fs.readFile(path.join(original, 'git-store/worktrees/repo/index')),
+    config: await fs.readFile(path.join(original, 'git-store/config')), owner: await fs.readFile(path.join(normal, 'greeting.txt')) };
+  const childRoot = path.join(root, 'corrective'); await fs.mkdir(childRoot);
+  const identity = await createCorrectiveWorktree(childRoot, 'corrective_fixture', original, task.repository, tree);
+  const candidate = path.join(childRoot, 'repo');
+  assert.equal(identity.baseline_commit, baseline); assert.equal(repoGit(candidate, 'rev-parse', 'HEAD').trim(), baseline);
+  assert.equal(repoGit(candidate, 'write-tree').trim(), tree); assert.equal(repoGit(candidate, 'remote'), '');
+  assert.equal(await fs.readFile(path.join(candidate, 'greeting.txt'), 'utf8'), 'rejected candidate\n');
+  const object = path.join('objects', tree.slice(0, 2), tree.slice(2));
+  const a = await fs.stat(path.join(original, 'git-store', object)), b = await fs.stat(path.join(childRoot, 'git-store', object));
+  assert.notEqual(a.ino, b.ino); assert.equal(b.nlink, 1);
+  await fs.writeFile(path.join(candidate, 'greeting.txt'), 'corrected\n');
+  assert.equal(await fs.readFile(path.join(repo, 'greeting.txt'), 'utf8'), 'rejected candidate\n');
+  assert.equal(repoGit(repo, 'show-ref'), before.refs);
+  assert.deepEqual(await fs.readFile(path.join(original, 'git-store/worktrees/repo/index')), before.index);
+  assert.deepEqual(await fs.readFile(path.join(original, 'git-store/config')), before.config);
+  assert.deepEqual(await fs.readFile(path.join(normal, 'greeting.txt')), before.owner);
+});
+
+test('corrective worktree refuses missing tree objects without fetching or changing the rejected source', async t => {
+  const { c, root, start } = await setup(t), view = await start(), original = path.join(c.workspaceRoot, view.task_id);
+  const childRoot = path.join(root, 'corrective'); await fs.mkdir(childRoot);
+  const packs = await fs.readdir(path.join(original, 'git-store/objects/pack'));
+  await assert.rejects(createCorrectiveWorktree(childRoot, 'corrective_fixture', original, c.task(view.task_id).repository, 'f'.repeat(40)));
+  assert.deepEqual(await fs.readdir(path.join(original, 'git-store/objects/pack')), packs);
+  await assert.rejects(fs.access(path.join(childRoot, 'git-store')), { code: 'ENOENT' });
 });
 
 test('MCP rejects arbitrary path arguments instead of silently dropping them', async t => {

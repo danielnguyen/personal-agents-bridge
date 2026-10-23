@@ -144,6 +144,18 @@ test('versioned automatic FAIL never invokes the publisher despite potential act
   assert.equal((await value.c.get(value.id)).automatic.usage.correction_turns, 0);
 });
 
+test('explicit 3/1 authority preserves exact-tree initial PASS draft publication without correction', async context => {
+  const value = await setup(context, ['one.txt'], true, [], { versioned: true, configure(c, input) {
+    Object.assign(input.automatic, { max_codex_turns: 3, max_corrections: 1 });
+  } });
+  const task = await automaticSettled(value);
+  assert.equal(task.automatic.status, 'succeeded'); assert.equal(task.automatic.correction, undefined);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']);
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1); assert.equal(value.publisher.pr.draft, true);
+  assert.equal(repoGit(value.remote, 'rev-parse', `${task.publication.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(task.deadline, task.automatic.review_authorization.deadline);
+});
+
 for (const field of ['thread', 'turn', 'packet', 'tree', 'version', 'context']) test(`versioned publication rejects stale ${field} binding before push`, async context => {
   let controlled, original, injected = false;
   const value = await setup(context, ['one.txt'], true, [], { versioned: true, configure(c) { controlled = c; }, publisher(publisher) {
