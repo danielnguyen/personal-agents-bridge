@@ -14,6 +14,7 @@ import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { PassThrough, Writable } from 'node:stream';
 import { LocalCodexBackend } from '../local-codex-backend.mjs';
+import { compareSnapshots } from '../review-evidence.mjs';
 
 class FakeLocal {
   constructor(options, mode = {}) { this.options = options; this.mode = mode; this.calls = []; }
@@ -77,12 +78,16 @@ async function setup(context, mode = {}, options = {}) {
 
 const automaticAuthority = () => ({ publish: { title: 'Explicit fixture draft', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 });
 
-for (const mode of [false, true, 'completed history', 'missing history', 'non-array history', 'null history', 'ignored submission', 'ignored acceptance'])
+for (const mode of [false, true, 'completed history', 'missing history', 'non-array history', 'null history', 'ignored submission', 'ignored acceptance',
+  'four-turn PASS', 'four-turn FAIL', 'four-turn implementation thread', 'four-turn original reviewer thread', 'four-turn corrective thread',
+  'four-turn reused turn', 'four-turn completed history', 'four-turn missing output', 'four-turn malformed', 'four-turn unknown acknowledgment'])
 test(`corrective native adapter starts a fresh subscription thread and never resumes; reused=${mode}`, async context => {
-  const reused = mode === true, qualified = mode === false;
+  const reused = mode === true, qualified = mode === false, four = typeof mode === 'string' && mode.startsWith('four-turn');
   const calls = []; let index = 0, fixtureFailure, original, ignored = 0;
   const value = await setup(context, {}, { noApi: true, localBackendFactory: options => {
-    const execution = index++, thread = reused && execution === 2 ? 'native-0' : `native-${execution}`, turn = `turn-${execution}`;
+    const execution = index++, prior = { 'four-turn implementation thread': 'native-0', 'four-turn original reviewer thread': 'native-1', 'four-turn corrective thread': 'native-2' }[mode];
+    const thread = reused && execution === 2 ? 'native-0' : execution === 3 && prior ? prior : `native-${execution}`;
+    const turn = execution === 3 && mode === 'four-turn reused turn' ? 'turn-0' : `turn-${execution}`;
     return new LocalCodexBackend({ ...options, spawnProcess(binary, args, config) {
       const child = new EventEmitter(); child.stdout = new PassThrough();
       const send = message => child.stdout.write(JSON.stringify(message) + '\n');
@@ -104,14 +109,17 @@ test(`corrective native adapter starts a fresh subscription thread and never res
             else if (message.method === 'thread/start') result = { thread: { id: thread, turns: [] }, model: 'gpt-6-astra', cwd: options.cwd,
               modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: options.reviewOnly ? 'readOnly' : 'workspaceWrite', networkAccess: false } };
             else if (message.method === 'turn/start') {
+              if (execution === 3 && mode === 'four-turn unknown acknowledgment') { send({ id: message.id, error: { code: -32000, message: 'Unknown acknowledgment' } }); return; }
               if (!options.reviewOnly) await fs.writeFile(path.join(options.cwd, 'greeting.txt'), execution === 0 ? 'candidate\n' : 'corrected\n');
               result = { turn: { id: turn, status: 'inProgress' } };
               setImmediate(() => {
+                if (child.dead) return;
                 const output = { format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall: 'FAIL', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({
                   id, status: id === 'R1' ? 'FAIL' : 'PASS', evidence: 'greeting.txt has the wrong greeting; the original required greeting must be restored.',
                   classification: id === 'R1' ? { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: 'Use the originally required greeting.', requires_human_approval: false } } : null })) };
-                if (options.reviewOnly) send({ method: 'item/completed', params: { threadId: thread, turnId: turn,
-                  item: { id: 'review-output', type: 'agentMessage', text: JSON.stringify(output) } } });
+                if (execution === 3 && mode !== 'four-turn FAIL') { output.overall = 'PASS'; for (const finding of output.findings) { finding.status = 'PASS'; finding.classification = null; } }
+                if (options.reviewOnly && !(execution === 3 && mode === 'four-turn missing output')) send({ method: 'item/completed', params: { threadId: thread, turnId: turn,
+                  item: { id: 'review-output', type: 'agentMessage', text: execution === 3 && mode === 'four-turn malformed' ? '{}' : JSON.stringify(output) } } });
                 send({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed' } } });
               });
             } else throw Error(`Unexpected native method ${message.method}`);
@@ -125,6 +133,7 @@ test(`corrective native adapter starts a fresh subscription thread and never res
               if (mode === 'non-array history') result.thread.turns = {};
               if (mode === 'null history') result.thread.turns = null;
             }
+            if (execution === 3 && message.method === 'thread/start' && mode === 'four-turn completed history') result.thread.turns = [{ id: 'prior-fourth-turn', status: 'completed' }];
             send({ id: message.id, result });
           })().catch(error => { fixtureFailure = error; send({ id: message.id, error: { code: -32000, message: 'Fixture failure' } }); }); });
         }
@@ -133,7 +142,8 @@ test(`corrective native adapter starts a fresh subscription thread and never res
       return child;
     } });
   } });
-  value.input.automatic = { ...automaticAuthority(), max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION };
+  value.input.automatic = { ...automaticAuthority(), max_codex_turns: four ? 4 : 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION };
+  if (four) value.input.contract.test_commands = ['cat greeting.txt'];
   if (typeof mode === 'string' && mode.startsWith('ignored')) {
     value.controller.db.function('count_native_ignored_write', () => { ignored++; return 1; });
     value.controller.db.exec(`CREATE TEMP TRIGGER native_ignored_write BEFORE INSERT ON tasks
@@ -142,14 +152,24 @@ test(`corrective native adapter starts a fresh subscription thread and never res
       AND count_native_ignored_write() BEGIN SELECT RAISE(IGNORE); END;`);
   }
   let publishes = 0; value.controller.publisher = { target() { publishes++; throw Error('Publication forbidden'); } };
-  const result = await value.start(); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  let result, fourClient;
+  if (four) {
+    const server = createServer(value.controller, async () => {}), client = new Client({ name: 'four-turn-native', version: '1' });
+    fourClient = client;
+    const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+    context.after(async () => { await client.close(); await server.close(); });
+    const response = await client.callTool({ name: 'start_task', arguments: value.input }); assert.notEqual(response.isError, true);
+    result = response.structuredContent;
+  } else result = await value.start();
+  await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
   assert.equal(fixtureFailure, undefined);
   const parent = value.controller.task(result.task_id);
   assert(parent.automatic.correction, JSON.stringify(parent.automatic));
   const child = value.controller.task(parent.automatic.correction.task_id);
-  assert.equal(child.correction_state, qualified ? 'awaiting_review' : 'needs_attention', JSON.stringify(child.implementer));
-  assert.equal(calls.filter(call => call.method === 'thread/start').length, 3);
-  assert.equal(calls.filter(call => call.method === 'turn/start').length, qualified || mode === 'ignored acceptance' ? 3 : 2);
+  assert.equal(child.correction_state, qualified || four ? 'awaiting_review' : 'needs_attention', JSON.stringify(child.implementer));
+  assert.equal(calls.filter(call => call.method === 'thread/start').length, four ? 4 : 3);
+  const refusedFourth = four && (priorThreadMode(mode) || mode === 'four-turn completed history');
+  assert.equal(calls.filter(call => call.method === 'turn/start').length, four ? refusedFourth ? 3 : 4 : qualified || mode === 'ignored acceptance' ? 3 : 2);
   assert.equal(calls.filter(call => call.method === 'thread/resume').length, 0);
   assert.equal(publishes, 0); assert.equal(value.controller._api, undefined); assert.equal(value.executor.started.length, 0);
   const originalReview = JSON.parse(original.reviewer), currentReview = structuredClone(parent.reviewer);
@@ -184,7 +204,30 @@ test(`corrective native adapter starts a fresh subscription thread and never res
     assert.equal(submitted.sandboxPolicy.networkAccess, false); assert.deepEqual(submitted.sandboxPolicy.writableRoots, [path.join(value.controller.workspaceRoot, child.id, 'repo')]);
     assert.equal(await fs.readFile(path.join(value.controller.workspaceRoot, parent.id, 'repo/greeting.txt'), 'utf8'), 'candidate\n');
   }
+  if (four) {
+    const accepted = ['four-turn PASS', 'four-turn FAIL'].includes(mode), status = await value.controller.get(parent.id);
+    assert.equal(await fs.readFile(path.join(value.normal, 'greeting.txt'), 'utf8'), 'uncommitted owner work\n');
+    assert.equal(repoGit(value.normal, 'rev-parse', 'HEAD').trim(), value.baseline);
+    const originalPacket = JSON.parse(original.packet), correctedPacket = JSON.parse(await fs.readFile(path.join(value.controller.workspaceRoot, child.id, child.reviewer.packet_directory, 'evidence.json'), 'utf8'));
+    assert.equal(compareSnapshots(originalPacket.controller_evidence.normal_checkout.at_review, correctedPacket.controller_evidence.normal_checkout.at_review).status, 'unchanged');
+    assert.equal(status.correction.review.qualified, accepted, JSON.stringify({ mode, child: child.automatic, reviewer: child.reviewer }));
+    assert.equal(status.correction.review.overall, accepted ? mode === 'four-turn PASS' ? 'PASS' : 'FAIL' : null);
+    assert.equal(child.reviewer.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
+    if (accepted) {
+      assert.equal(new Set([parent.implementer, parent.reviewer, child.implementer, child.reviewer].map(role => role.local.thread_id)).size, 4);
+      assert.equal(new Set([parent.implementer, parent.reviewer, child.implementer, child.reviewer].map(role => role.local.turn_id)).size, 4);
+      assert.equal(child.local_validation.results[0].stdout.text, 'corrected\n');
+      assert.notEqual(child.reviewer.reviewed_git_state.tree_sha, parent.reviewer.reviewed_git_state.tree_sha);
+    }
+    const request = calls.find(call => call.execution === 3 && call.method === 'turn/start');
+    if (request) { assert.equal(request.params.sandboxPolicy.type, 'readOnly'); assert.equal(request.params.sandboxPolicy.networkAccess, false); assert.equal(request.params.sandboxPolicy.writableRoots, undefined); }
+    assert.notEqual((await fourClient.callTool({ name: 'start_task', arguments: value.input })).isError, true);
+    value.controller.scheduleAutomatic(parent.id); await Promise.all([...value.controller.automaticJobs.values()]);
+    assert.equal(index, 4);
+  }
 });
+
+function priorThreadMode(mode) { return ['four-turn implementation thread', 'four-turn original reviewer thread', 'four-turn corrective thread'].includes(mode); }
 
 for (const [label, change] of [
   ['implicit backend', input => { delete input.execution_backend; }],
@@ -268,6 +311,31 @@ test('MCP admits only the explicit versioned automatic protocol and binds its or
   assert.equal(task.automatic.review_authorization.authorization_sha256, digest(task.automatic.authorization));
   assert.equal(task.automatic.authorization.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
   assert.equal(task.automatic.authorization.max_corrections, 0); assert.equal(value.api.created.length, 0);
+});
+
+test('MCP four-turn authority is explicit, fingerprinted, immutable and admits no additional authority fields', async context => {
+  const value = await setup(context, { status: 'completed' }, { noApi: true }), server = createServer(value.controller, async () => {});
+  const client = new Client({ name: 'four-turn-admission', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(a); await client.connect(b); context.after(async () => { await client.close(); await server.close(); });
+  const input = { ...value.input, automatic: { ...automaticAuthority(), max_codex_turns: 4, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
+  for (const automatic of [{ ...input.automatic, max_corrections: 0 }, { ...input.automatic, max_corrections: 2 },
+    { ...input.automatic, max_codex_turns: 5 }, { ...input.automatic, review_protocol: undefined },
+    { ...input.automatic, review_protocol: 'v1' }, { ...input.automatic, reviewerIndependent: true }, { ...input.automatic, fourth_turn_authorized: true }]) {
+    const response = await client.callTool({ name: 'start_task', arguments: { ...input, automatic } }); assert.equal(response.isError, true);
+  }
+  for (const change of [{ execution_backend: 'agents_api' }, { execution_backend: undefined }, { repository_id: undefined }]) {
+    const response = await client.callTool({ name: 'start_task', arguments: { ...input, ...change } }); assert.equal(response.isError, true);
+  }
+  assert.equal(value.instances.length, 0); assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  const response = await client.callTool({ name: 'start_task', arguments: input }); assert.notEqual(response.isError, true);
+  await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const task = value.controller.task(response.structuredContent.task_id);
+  assert.equal(task.automatic.authorization.max_codex_turns, 4);
+  assert.equal(task.automatic.review_authorization.request_fingerprint, value.controller.db.prepare('SELECT fingerprint FROM operations WHERE id=?').get(input.request_id).fingerprint);
+  const count = value.instances.length;
+  assert.notEqual((await client.callTool({ name: 'start_task', arguments: input })).isError, true);
+  assert.equal((await client.callTool({ name: 'start_task', arguments: { ...input, automatic: { ...input.automatic, max_codex_turns: 3 } } })).isError, true);
+  assert.equal(value.instances.length, count); assert.equal(value.controller._api, undefined);
 });
 
 test('local opt-in reuses owned worktree, baseline, contract and audit without Agents API sessions', async context => {
