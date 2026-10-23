@@ -264,7 +264,7 @@ for (const mutation of ['content', 'forged_hashes', 'missing_context', 'candidat
     else delete packet.source_context;
     const text = JSON.stringify(packet);
     await fs.chmod(file, 0o600); await fs.writeFile(file, text); await fs.chmod(file, 0o400);
-    task.reviewer.packet_hash = digest(text); value.controller.save(task);
+    task.reviewer.packet_hash = digest(text); task.reviewer.packet_bytes = Buffer.byteLength(text); value.controller.save(task);
   }
   await assert.rejects(value.controller.verifyLocalReviewPacket(task), error => /LOCAL_(REFERENCE_CHANGED|REVIEW_REFERENCE_CHANGED)/.test(error.code));
   value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
@@ -338,7 +338,7 @@ for (const tamper of ['markdown_and_digest', 'structured_and_digest', 'missing_b
   } else delete packet.contract_binding;
   const text = JSON.stringify(packet);
   await fs.chmod(file, 0o600); await fs.writeFile(file, text); await fs.chmod(file, 0o400);
-  task.reviewer.packet_hash = digest(text); value.controller.save(task);
+  task.reviewer.packet_hash = digest(text); task.reviewer.packet_bytes = Buffer.byteLength(text); value.controller.save(task);
   await assert.rejects(value.controller.verifyLocalReviewPacket(task), { code: 'LOCAL_REVIEW_CONTRACT_BINDING_CHANGED' });
   value.reviewer.finish('completed', true, reviewOutput()); await value.drain();
   const saved = value.controller.task(task.id);

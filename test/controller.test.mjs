@@ -52,9 +52,11 @@ async function automaticAttempt(t, mode = {}) {
         classification: finding.status === 'PASS' ? null : mode.cause && mode.cause !== 'implementation_defect' ? { kind: mode.cause } :
           { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: mode.remedy || 'Replace the incorrect greeting.', requires_human_approval: !!mode.humanApproval } } })) } : { overall: 'FAIL', findings };
       if (options.reviewOnly) { mode.output?.(output); await mode.beforeResult?.(c, options); }
+      const text = mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output);
+      if (options.reviewOnly) mode.returnedOutput?.(text);
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: options.reviewOnly && mode.uncertain ? ['Unknown execution'] : [],
         ...(options.reviewOnly ? mode.result : {}),
-        messages: options.reviewOnly ? [{ provenance: 'model', text: mode.incomplete ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output) }] : [] };
+        messages: options.reviewOnly ? [{ provenance: 'reasoning', text: 'Private reasoning must not be retained.' }, { provenance: 'model', text }] : [] };
     }, async close() { if (options.reviewOnly && mode.activeReviewer) { stops.push('close'); stopped(); return mode.closeResult ?? true; } return true; },
     async cancel() { if (options.reviewOnly && mode.activeReviewer) { stops.push('cancel'); return mode.cancelResult ?? true; } },
   }; };
@@ -62,11 +64,13 @@ async function automaticAttempt(t, mode = {}) {
   const input = { repository_id: 'fixture', execution_backend: 'local_codex', request_id: 'automatic_evidence', contract: contract(),
     automatic: { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 } };
   if (mode.versioned) input.automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
+  if (mode.manual) delete input.automatic;
   if (mode.validationFailure) input.contract.test_commands = ['true'];
   mode.configure?.(c, input);
   const result = await c.start(input);
   if (mode.activeReviewer) await reviewerActive;
-  else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]); }
+  else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
+    if (mode.manual) { await c.review({ task_id: result.task_id, request_id: 'manual_review' }); await Promise.all([...c.jobs.values()]); } }
   return { ...value, id: result.task_id, calls, stops, input, normal, prompts, publisherCalls };
 }
 
@@ -145,7 +149,8 @@ for (const conflict of ['validation', 'publication']) test(`versioned Controller
     controller.save(task);
   } });
   const result = c.task(id).reviewer.review_result;
-  assert.equal(result.controller_context.uncertaintyFree, false); assert.equal(result.actionability_qualification.potentially_correctable, false);
+  if (conflict === 'validation') assert.equal(result, null); // Original receipt's validation binding changed.
+  else { assert.equal(result.controller_context.uncertaintyFree, false); assert.equal(result.actionability_qualification.potentially_correctable, false); }
   assert.equal((await c.get(id)).automatic.review.execution_authorized, false);
   assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
 });
@@ -216,6 +221,250 @@ test('versioned protocol is frozen after admission and restart never grants repl
   assert.equal(recovered.task(id).reviewer.review_protocol, LOCAL_ACTIONABILITY_REVIEW_VERSION);
   const view = await recovered.get(id); assert.equal(view.automatic.review.potentially_correctable, false); assert.equal(view.automatic.review.execution_authorized, false);
   await recovered.start(value.input); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.equal(view.automatic.usage.correction_turns, 0);
+});
+
+const receivedOutputFault = (c, boundary) => sqliteAbort(c, 'tasks', boundary === 'receipt' ?
+  "json_extract(NEW.value,'$.reviewer.received_output_sha256') IS NOT NULL AND json_extract(NEW.value,'$.reviewer.local.result_received')=0" :
+  `json_extract(NEW.value,'$.reviewer.pending_review_output')=1 AND json_extract(NEW.value,'$.reviewer.local.result_received')=1 AND
+   json_extract(NEW.value,'$.reviewer.local.phase')='validating' AND json_extract(NEW.value,'$.reviewer.local.server_closed')=${boundary === 'completion' ? 0 : 1}`);
+
+for (const versioned of [false, true]) for (const boundary of ['completion', 'closure', 'receipt']) test(`SQLite ${boundary} ABORT preserves unverified ${versioned ? 'versioned' : 'legacy'} returned output before acceptance`, async t => {
+  let fault, output;
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned, returnedOutput: text => output = text,
+    configure(c) { fault = receivedOutputFault(c, boundary); } });
+  assert.equal(fault.hits, 1);
+  const before = c.task(id), durable = before.reviewer.received_review_output, memory = c.pendingReviewResults.get(id);
+  assert.equal(before.reviewer.review_result, null); assert.equal(before.reviewer.pending_review_result, undefined);
+  assert.equal(before.automatic.status, 'uncertain');
+  assert.equal(memory.received_output.output, output); assert.equal(memory.received_output.output_sha256, digest(output));
+  assert.equal(memory.sha256, digest(memory.received_output)); assert.equal(memory.server_closed, true);
+  assert(!JSON.stringify(memory).includes('Private reasoning'));
+  assert.equal(!!durable, boundary !== 'receipt');
+  if (durable) assert.equal(durable.output, output);
+  const status = await c.get(id);
+  assert.equal(status.automatic.evidence_retention.received_output, durable ? 'durable' : 'volatile_only');
+  assert.equal(status.automatic.evidence_retention.received_output_complete, true);
+  assert.equal(status.automatic.evidence_retention.reconciliation_required, true);
+  assert.notEqual(c.db.prepare('SELECT status FROM operations WHERE id=?').get(before.reviewer.request_id).status, 'accepted');
+  assert(!attemptRows(c, id).some(row => JSON.parse(row.value).review_result));
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  const reconciled = await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(reconciled.automatic.evidence_retention.reconciliation_required, false);
+  const task = c.task(id), records = attemptRows(c, id).map(row => JSON.parse(row.value));
+  assert.equal(task.reviewer.received_review_output.output, output); assert.equal(task.reviewer.review_result.overall, 'FAIL');
+  assert.deepEqual(task.reviewer.review_result.findings.map(item => item.id), JSON.parse(output).findings.map(item => item.id));
+  assert(records.some(record => record.received_review_output?.output === output && record.received_output_sha256 === digest(record.received_review_output)));
+  assert(records.some(record => record.findings_sha256 === digest(task.reviewer.review_result)));
+  assert(!JSON.stringify(records).includes('Private reasoning'));
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  assert.equal(task.deadline, before.deadline); assert.equal(reconciled.automatic.usage.correction_turns, 0);
+});
+
+for (const boundary of ['completion', 'closure']) test(`restart reconciles durable returned output after ${boundary} failure without restoring authority`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, configure(c) { receivedOutputFault(c, boundary); } });
+  const { id, calls, publisherCalls } = value, original = value.c.task(id).reviewer.received_review_output;
+  if (boundary === 'closure') {
+    // Interrupt explicit reconciliation after it commits the observed close,
+    // before the qualified receipt commits. Restart must use only those facts.
+    value.c.db.exec('DROP TRIGGER evidence_fault');
+    const second = sqliteAbort(value.c, 'tasks', "json_extract(NEW.value,'$.reviewer.pending_review_result.sha256') IS NOT NULL");
+    await value.c.cleanup({ task_id: id, delete_workspace: false });
+    assert.equal(second.hits, 1); assert.equal(value.c.task(id).reviewer.local.server_closed, true);
+    assert.equal(value.c.task(id).reviewer.review_result, null);
+  }
+  const c = await restartEvidenceController(t, value);
+  assert.equal(c.task(id).reviewer.received_review_output.output, original.output);
+  await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+  const view = await c.get(id);
+  assert.equal(view.automatic.review.potentially_correctable, false);
+  assert.equal(view.automatic.evidence_retention.received_output_complete, true);
+  assert.equal(c.task(id).reviewer.received_output_sha256, digest(original));
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []); assert.equal(c.automaticJobs.size, 0);
+});
+
+test('restart without a durable returned-output receipt reports unrecoverable findings instead of inventing them', async t => {
+  const value = await automaticAttempt(t, { configure(c) { receivedOutputFault(c, 'receipt'); } }), { id } = value;
+  assert(value.c.pendingReviewResults.get(id).received_output);
+  assert.equal(value.c.task(id).reviewer.received_review_output, undefined);
+  const c = await restartEvidenceController(t, value);
+  assert.equal(c.pendingReviewResults.has(id), false);
+  const view = await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.match(view.cleanup.cleanup_diagnostic, /AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED/);
+  assert.equal(view.automatic.evidence_retention.received_output, 'unavailable');
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  assert(!attemptRows(c, id).some(row => JSON.parse(row.value).review_result));
+});
+
+for (const change of ['output', 'digest', 'thread', 'packet', 'authority']) test(`returned-output receipt rejects ${change} tampering during reconciliation`, async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, configure(c) { receivedOutputFault(c, 'receipt'); } });
+  const memory = c.pendingReviewResults.get(id), original = structuredClone(memory);
+  if (change === 'output') memory.received_output.output += 'changed';
+  if (change === 'digest') memory.sha256 = 'f'.repeat(64);
+  if (change === 'thread') memory.received_output.binding.reviewer_thread = 'other-thread';
+  if (change === 'packet') memory.received_output.binding.packet_hash = 'f'.repeat(64);
+  if (change === 'authority') memory.received_output.binding.deadline++;
+  if (!['output', 'digest'].includes(change)) memory.sha256 = digest(memory.received_output);
+  await assert.rejects(c.reconcileAutomaticEvidence(id), /AUTOMATIC_REVIEW_RECEIPT_INVALID/);
+  assert.equal(c.task(id).reviewer.review_result, null);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  // Restore test corruption to the exact original receipt for teardown only.
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify({ ...c.task(id), reviewer: {
+    ...c.task(id).reviewer, received_review_output: original.received_output, received_output_sha256: original.sha256 } }), id);
+  c.pendingReviewResults.set(id, original);
+});
+
+test('second actual SQLite ABORT during receipt reconciliation preserves raw output and blocks deletion', async t => {
+  const { c, id, calls } = await automaticAttempt(t, { versioned: true, configure(c) { receivedOutputFault(c, 'completion'); } });
+  const original = c.task(id).reviewer.received_review_output;
+  c.db.exec('DROP TRIGGER evidence_fault');
+  const fault = sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.reviewer.pending_review_result.sha256') IS NOT NULL");
+  const unresolved = await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(fault.hits, 1); assert.equal(unresolved.automatic.evidence_retention.reconciliation_required, true);
+  assert.deepEqual(c.task(id).reviewer.received_review_output, original);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL'); assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
+test('missing durable reviewer termination after restart cannot qualify received output', async t => {
+  const value = await automaticAttempt(t, { versioned: true, configure(c) { receivedOutputFault(c, 'closure'); } }), { id } = value;
+  assert.equal(value.c.task(id).reviewer.local.server_closed, false);
+  const c = await restartEvidenceController(t, value);
+  const view = await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.match(view.cleanup.cleanup_diagnostic, /LOCAL_REVIEW_EXECUTION_UNVERIFIED/);
+  assert(c.task(id).reviewer.received_review_output); assert.equal(c.task(id).reviewer.review_result, null);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+});
+
+test('manual local review uses the same recoverable receipt lifecycle after completion write failure', async t => {
+  const { c, id, calls } = await automaticAttempt(t, { manual: true, configure(c) { receivedOutputFault(c, 'completion'); } });
+  const output = c.task(id).reviewer.received_review_output.output;
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL'); assert.equal(c.task(id).reviewer.received_review_output.output, output);
+  assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
+test('received but unverified PASS cannot authorize publication, including after explicit recovery', async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, configure(c) { receivedOutputFault(c, 'completion'); },
+    output(raw) { raw.overall = 'PASS'; for (const finding of raw.findings) { finding.status = 'PASS'; finding.classification = null; } } });
+  assert.equal(JSON.parse(c.task(id).reviewer.received_review_output.output).overall, 'PASS');
+  assert.equal(c.task(id).reviewer.review_result, null); assert.equal(c.task(id).reviewer.pending_review_result, undefined);
+  assert.equal((await c.get(id)).automatic.review.execution_authorized, false);
+  await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.equal(c.task(id).reviewer.review_result.overall, 'PASS');
+  assert.equal(c.task(id).reviewer.review_result.controller_context.authorityValid, false);
+  assert.equal(c.task(id).automatic.status, 'uncertain');
+  assert.equal((await c.get(id)).automatic.usage.correction_turns, 0);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const mode of [{ incomplete: true }, { uncertain: true }, { result: { status: 'failed' } }, { result: { status: 'interrupted' } }])
+  test(`explicit recovery retains incomplete/uncertain output without inventing a qualified result: ${JSON.stringify(mode)}`, async t => {
+    const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, ...mode, configure(c) { receivedOutputFault(c, 'completion'); } });
+    const received = c.task(id).reviewer.received_review_output;
+    const view = await c.cleanup({ task_id: id, delete_workspace: false });
+    assert(view.cleanup.cleanup_diagnostic); assert.equal(c.task(id).reviewer.review_result, null);
+    assert.deepEqual(c.task(id).reviewer.received_review_output, received);
+    assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+    assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  });
+
+test('returned-output receipts redact secrets and bound oversized data without claiming complete retention', async t => {
+  const { c, id, calls } = await automaticAttempt(t, { versioned: true,
+    output(raw) { raw.findings[0].evidence = 'test-sensitive-value' + 'x'.repeat(20000); } });
+  const received = c.task(id).reviewer.received_review_output;
+  assert(received.output.length <= 16000); assert.equal(received.complete, false);
+  assert(!JSON.stringify(received).includes('test-sensitive-value')); assert.equal(c.task(id).reviewer.review_result, null);
+  const view = await c.get(id);
+  assert.equal(view.automatic.review.potentially_correctable, false);
+  assert.equal(view.automatic.evidence_retention.received_output_complete, false);
+  assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
+test('receipt recovery cannot turn a sanitized or malformed native identity into authenticated execution', async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, result: { threadId: 123, model: 'test-sensitive-value' },
+    configure(c) { receivedOutputFault(c, 'receipt'); } });
+  const receipt = c.pendingReviewResults.get(id);
+  assert.equal(receipt.received_output.identity_valid, false);
+  assert(!JSON.stringify(receipt).includes('test-sensitive-value'));
+  const view = await c.cleanup({ task_id: id, delete_workspace: false });
+  assert.match(view.cleanup.cleanup_diagnostic, /LOCAL_IDENTITY_MISMATCH/);
+  assert.equal(c.task(id).reviewer.review_result, null);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const changed of ['contract', 'normal checkout', 'packet', 'missing evidence', 'candidate', 'expiry', 'storage']) test(`read-only status removes current correction qualification after ${changed} changes and never mutates evidence`, async t => {
+  const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id), workspace = path.join(c.workspaceRoot, id), contractFile = path.join(workspace, 'contract.json');
+  const contractText = await fs.readFile(contractFile, 'utf8'), normalText = await fs.readFile(path.join(normal, 'greeting.txt'), 'utf8');
+  const packetFile = path.join(workspace, task.reviewer.packet_directory, 'evidence.json'), packet = await fs.readFile(packetFile, 'utf8');
+  const candidateFile = path.join(workspace, 'repo/greeting.txt'), candidate = await fs.readFile(candidateFile, 'utf8');
+  assert.equal((await c.get(id)).automatic.review.potentially_correctable, true);
+  let clock;
+  if (changed === 'contract') await fs.writeFile(contractFile, JSON.stringify({ ...JSON.parse(contractText), goal: 'Changed contract' }));
+  if (changed === 'normal checkout') await fs.writeFile(path.join(normal, 'greeting.txt'), 'Changed without moving HEAD\n');
+  if (changed === 'packet') { await fs.chmod(packetFile, 0o600); await fs.writeFile(packetFile, packet + 'changed'); await fs.chmod(packetFile, 0o400); }
+  if (changed === 'missing evidence') await fs.unlink(contractFile);
+  if (changed === 'candidate') await fs.writeFile(candidateFile, 'Changed candidate\n');
+  if (changed === 'expiry') clock = t.mock.method(Date, 'now', () => task.deadline + 1);
+  if (changed === 'storage') c.persistenceFailures.add(id);
+  const rows = attemptRows(c, id), tasks = c.db.prepare('SELECT * FROM tasks').all();
+  const write = t.mock.method(c, 'save', () => assert.fail('get_task must never write'));
+  const validation = t.mock.method(c, 'runLocalValidation', () => assert.fail('get_task must not validate'));
+  const model = t.mock.method(c, 'localBackendFactory', () => assert.fail('get_task must not execute a model'));
+  const scratch = t.mock.method(fs, 'mkdtemp', () => assert.fail('get_task must not create a temporary index or worktree'));
+  try {
+    for (let count = 0; count < 3; count++) {
+      const summary = (await c.get(id)).automatic.review;
+      assert.equal(summary.potentially_correctable, false); assert.equal(summary.execution_authorized, false);
+      if (!['expiry', 'storage'].includes(changed)) assert(summary.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+    }
+    assert.deepEqual(c.db.prepare('SELECT * FROM tasks').all(), tasks); assert.deepEqual(attemptRows(c, id), rows);
+  } finally { write.mock.restore(); validation.mock.restore(); model.mock.restore(); scratch.mock.restore(); clock?.mock.restore(); }
+  if (['contract', 'missing evidence'].includes(changed)) await fs.writeFile(contractFile, contractText);
+  if (changed === 'normal checkout') await fs.writeFile(path.join(normal, 'greeting.txt'), normalText);
+  if (changed === 'packet') { await fs.chmod(packetFile, 0o600); await fs.writeFile(packetFile, packet); await fs.chmod(packetFile, 0o400); }
+  if (changed === 'candidate') await fs.writeFile(candidateFile, candidate);
+  c.persistenceFailures.delete(id);
+  // Restoring bytes cannot restore the inode/timestamp fingerprint of a file
+  // already changed. No status read silently requalifies that altered snapshot.
+  assert.equal((await c.get(id)).automatic.review.potentially_correctable, !['normal checkout', 'candidate'].includes(changed));
+  assert.equal(repoGit(normal, 'rev-parse', 'HEAD').trim(), task.baseline);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  assert.equal(c.task(id).deadline, task.deadline);
+});
+
+test('permitted workspace cleanup preserves historical correctability and removes current qualification', async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  const original = c.task(id).reviewer.review_result;
+  assert.equal((await c.get(id)).automatic.review.potentially_correctable, true);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  const rows = attemptRows(c, id), tasks = c.db.prepare('SELECT * FROM tasks').all();
+  for (let count = 0; count < 3; count++) assert.equal((await c.get(id)).automatic.review.potentially_correctable, false);
+  assert.deepEqual(c.task(id).reviewer.review_result, original);
+  assert(rows.some(row => JSON.parse(row.value).actionability_qualification?.potentially_correctable));
+  assert.deepEqual(attemptRows(c, id), rows); assert.deepEqual(c.db.prepare('SELECT * FROM tasks').all(), tasks);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('read-only status rejects a missing reviewed tree object without recreating it', async t => {
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id), tree = task.reviewer.reviewed_git_state.tree_sha;
+  const object = path.join(c.workspaceRoot, id, 'git-store/objects', tree.slice(0, 2), tree.slice(2));
+  const bytes = await fs.readFile(object), rows = attemptRows(c, id), tasks = c.db.prepare('SELECT * FROM tasks').all();
+  await fs.unlink(object);
+  for (let count = 0; count < 3; count++) {
+    assert.equal((await c.get(id)).automatic.review.potentially_correctable, false);
+    await assert.rejects(fs.stat(object), { code: 'ENOENT' });
+  }
+  assert.deepEqual(attemptRows(c, id), rows); assert.deepEqual(c.db.prepare('SELECT * FROM tasks').all(), tasks);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  await fs.writeFile(object, bytes, { mode: 0o444 }); // Restore exact fixture object for teardown.
 });
 
 for (const boundary of ['rollback', 'release']) for (const failure of ['deny', 'throw']) test(`SQLite ${boundary} ${failure} blocks authority across the entire connection`, async t => {
@@ -458,19 +707,22 @@ for (const boundary of ['packet', 'review']) test(`restart retains ${boundary} f
   assert.equal(c.automaticJobs.size, 0);
 });
 
-test('restart cannot fabricate a completed review whose receipt never became durable', async t => {
+test('restart recovers durable unverified output when the qualified receipt write failed', async t => {
   const value = await automaticAttempt(t, { configure: c => sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.reviewer.pending_review_result.sha256') IS NOT NULL") });
   const { id } = value;
   assert(value.c.pendingReviewResults.has(id)); assert.equal(value.c.task(id).reviewer.pending_review_result, undefined);
+  const original = value.c.task(id).reviewer.received_review_output;
+  assert(original); assert.equal(value.c.task(id).reviewer.review_result, null);
   const c = await restartEvidenceController(t, value);
   const reconciled = await c.cleanup({ task_id: id, delete_workspace: false });
-  assert.match(reconciled.cleanup.cleanup_diagnostic, /AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED/);
-  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
-  assert(!attemptRows(c, id).some(row => JSON.parse(row.value).review_result));
+  assert.equal(reconciled.automatic.evidence_retention.reconciliation_required, false);
+  assert.equal(c.task(id).reviewer.received_review_output.output, original.output);
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
   assert.equal(c.automaticJobs.size, 0);
 });
 
-test('SQLite failure while verifying completed review evidence stays unresolved across restart', async t => {
+test('SQLite failure while verifying completed review evidence retains raw output across restart', async t => {
   let fault;
   const value = await automaticAttempt(t, { configure(c) {
     fault = sqliteAbort(c, 'tasks', "json_extract(NEW.value,'$.reviewer.local.phase')='validating' AND json_extract(NEW.value,'$.reviewer.local.server_closed')=1");
@@ -479,9 +731,11 @@ test('SQLite failure while verifying completed review evidence stays unresolved 
   const { id } = value;
   assert.equal(fault.hits, 1); assert.equal(value.c.task(id).reviewer.evidence_retention.review, 'awaiting_receipt');
   const c = await restartEvidenceController(t, value);
+  assert(c.task(id).reviewer.received_review_output);
   const result = await c.cleanup({ task_id: id, delete_workspace: false });
-  assert.match(result.cleanup.cleanup_diagnostic, /AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED/);
-  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, false);
+  assert.equal(result.automatic.evidence_retention.reconciliation_required, false);
+  assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
 });
 
 test('unavailable SQLite writes still allow owned executor stopping and never delete evidence', async t => {
@@ -568,7 +822,8 @@ test('qualified reviewer FAIL is durably retained without correction and repeate
   assert.equal(task.reviewer.review_result.scope_qualification.status, 'qualified');
   assert.equal(task.reviewer.review_result.findings.find(f => f.id === 'TEST_EVIDENCE').status, 'PASS');
   const rows = attemptRows(c, id), observations = rows.map(row => JSON.parse(row.value));
-  assert.deepEqual(observations.map(item => item.kind), ['review_packet', 'review_result', 'outcome']);
+  assert.deepEqual(observations.filter(item => item.kind !== 'review_output').map(item => item.kind), ['review_packet', 'review_result', 'outcome']);
+  assert(observations.some(item => item.kind === 'review_output' && item.received_review_output && item.review_result === null));
   assert.equal(new Set(observations.map(item => item.attempt_id)).size, 1);
   const final = observations.at(-1), packet = observations[0];
   assert.equal(digest(packet.packet_utf8), packet.review_packet.sha256);

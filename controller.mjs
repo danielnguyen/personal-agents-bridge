@@ -352,9 +352,11 @@ export class Controller {
           if (authenticated && (t.reviewer?.authenticated_review_sha256 !== authenticated || t.reviewer.findings_sha256 !== authenticated ||
               (t.reviewer.review_result && digest(t.reviewer.review_result) !== authenticated) ||
               (t.reviewer.pending_review_result && digest(t.reviewer.pending_review_result.result) !== authenticated))) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
+          const received = old.reviewer?.received_output_sha256;
+          if (received && (t.reviewer?.received_output_sha256 !== received || digest(t.reviewer.received_review_output) !== received)) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
         }
         if (packetText !== undefined) this.retainAutomaticAttempt(t, packetText);
-        if (t.automatic && (t.reviewer?.review_result || t.automatic.status !== 'progressing')) this.retainAutomaticAttempt(t);
+        if (t.automatic && (t.reviewer?.review_result || t.reviewer?.received_review_output || t.automatic.status !== 'progressing')) this.retainAutomaticAttempt(t);
         this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?)').run(t.id, JSON.stringify(t));
         for (const row of this.db.prepare('SELECT id,value FROM audit').all()) {
           const a = JSON.parse(row.value); if (a.task_id !== t.id) continue;
@@ -384,7 +386,7 @@ export class Controller {
     // the receipt below remain authoritative; the in-memory latch grants nothing.
     try {
       const task = this.task(id);
-      Object.assign(task.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true });
+      if (task.automatic) Object.assign(task.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true });
       if (task.reviewer) task.reviewer.local.human_attention_required = true;
       this.save(task);
     } catch { /* Explicit reconciliation is still required, even if this write fails. */ }
@@ -617,6 +619,9 @@ export class Controller {
       review_output: output, controller_context: context, controller_binding: this.reviewBinding(task) };
   }
   revalidateVersionedReview(task, packet, result = task.reviewer.review_result, sha = task.reviewer.findings_sha256, pending = false) {
+    const received = task.reviewer.received_review_output;
+    if (received && (digest(received) !== task.reviewer.received_output_sha256 || digest(received.output) !== received.output_sha256 ||
+        received.output !== result?.review_output)) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
     if (this.reviewProtocol(task) !== LOCAL_ACTIONABILITY_REVIEW_VERSION || result?.validation_contract !== LOCAL_ACTIONABILITY_REVIEW_VERSION ||
         digest(result) !== sha || sha !== task.reviewer.authenticated_review_sha256 || digest(result.controller_binding ?? null) !== digest(this.reviewBinding(task)) ||
         result.packet_hash !== task.reviewer.packet_hash || result.thread_id !== task.reviewer.local.thread_id || result.turn_id !== task.reviewer.local.turn_id ||
@@ -648,11 +653,8 @@ export class Controller {
         summary.state = !ref ? 'not_started' : 'malformed_or_uncertain';
         summary.blockers.unshift('REVIEW_RESULT_UNAVAILABLE'); return summary;
       }
-      const file = path.join(this.workspaceRoot, task.id, ref.packet_directory, 'evidence.json'), stat = await fs.lstat(file);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.mode & 0o222 || stat.size > MAX_PACKET) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
-      const text = await fs.readFile(file, 'utf8');
-      if (digest(text) !== ref.packet_hash || Buffer.byteLength(text) !== ref.packet_bytes ||
-          digest(await publicationState(path.join(this.workspaceRoot, task.id, 'repo'))) !== digest(ref.reviewed_git_state.state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+      const packet = await this.verifyLocalReviewPacket(task, { readOnly: true });
+      const text = await fs.readFile(path.join(this.workspaceRoot, task.id, ref.packet_directory, 'evidence.json'), 'utf8');
       const records = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => {
         const record = JSON.parse(row.value);
         if (digest(record) !== row.observation_sha256) throw new BridgeError('AUTOMATIC_RETAINED_EVIDENCE_INVALID');
@@ -660,7 +662,7 @@ export class Controller {
       });
       if (!records.some(record => record.packet_utf8 === text && record.review_packet?.sha256 === ref.packet_hash) ||
           !records.some(record => record.findings_sha256 === ref.findings_sha256 && digest(record.review_result) === ref.findings_sha256)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
-      const assessed = this.revalidateVersionedReview(task, JSON.parse(text)), qualification = assessed.actionability_qualification;
+      const assessed = this.revalidateVersionedReview(task, packet), qualification = assessed.actionability_qualification;
       summary.potentially_correctable = qualification.potentially_correctable;
       summary.state = assessed.overall === 'PASS' ? 'pass' : qualification.potentially_correctable ? 'potentially_correctable_fail' : 'non_correctable_fail';
       summary.blockers = [...qualification.blockers, 'CORRECTION_EXECUTION_DISABLED'].slice(0, 16);
@@ -697,7 +699,7 @@ export class Controller {
     const identity = role => role?.local ? { thread_id: role.local.thread_id, turn_id: role.local.turn_id, model: role.local.model,
       authentication: role.local.authentication || null, execution_state: role.local.execution_state, error: role.error || null } : null;
     const evidence = { version: 1, task_id: task.id, attempt_id: task.automatic.review_request_id,
-      kind: packetText !== null ? 'review_packet' : task.automatic.status === 'progressing' ? 'review_result' : 'outcome',
+      kind: packetText !== null ? 'review_packet' : task.automatic.status !== 'progressing' ? 'outcome' : ref?.review_result ? 'review_result' : 'review_output',
       baseline_commit: task.baseline, reviewed_git_state: ref?.reviewed_git_state || null,
       original_contract: binding || null, limits: task.automatic.authorization, deadline: task.automatic.deadline,
       independent_validation: validation || null, validation_sha256: validation ? digest(validation) : null,
@@ -707,6 +709,7 @@ export class Controller {
       // disposable workspace cleanup. Packet sanitization/coverage limits still apply.
       ...(packetText !== null ? { packet_utf8: packetText } : {}),
       review_result: ref?.review_result || null, findings_sha256: ref?.findings_sha256 || null,
+      ...(ref?.received_review_output ? { received_review_output: ref.received_review_output, received_output_sha256: ref.received_output_sha256 } : {}),
       ...(task.automatic.authorization.review_protocol ? { review_protocol: task.automatic.authorization.review_protocol,
         review_authorization: task.automatic.review_authorization, authenticated_review_sha256: ref?.authenticated_review_sha256 || null,
         actionability_qualification: ref?.review_result?.actionability_qualification || null } : {}),
@@ -731,9 +734,13 @@ export class Controller {
           value.baseline_commit !== task.baseline ||
           (value.packet_utf8 !== undefined && (digest(value.packet_utf8) !== value.review_packet?.sha256 || Buffer.byteLength(value.packet_utf8) !== value.review_packet.bytes)) ||
           (value.review_result && digest(value.review_result) !== value.findings_sha256)) throw new BridgeError('AUTOMATIC_RETAINED_EVIDENCE_INVALID');
+      if (value.received_review_output && digest(value.received_review_output) !== value.received_output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
       return value;
     });
     if (ref?.packet_hash && !records.some(record => record.packet_utf8 !== undefined && record.review_packet.sha256 === ref.packet_hash)) throw new BridgeError('AUTOMATIC_PACKET_NOT_RETAINED');
+    if (ref?.received_review_output && digest(ref.received_review_output) !== ref.received_output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+    if (ref?.pending_review_output || this.pendingReviewResults.get(task.id)?.received_output) throw new BridgeError('AUTOMATIC_REVIEW_RETENTION_UNRESOLVED');
+    if (ref?.received_output_sha256 && !records.some(record => record.received_output_sha256 === ref.received_output_sha256)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
     if (ref?.pending_review_result || ['pending', 'awaiting_receipt'].includes(ref?.evidence_retention?.review)) throw new BridgeError(
       ref.pending_review_result ? 'AUTOMATIC_REVIEW_RETENTION_UNRESOLVED' : 'AUTOMATIC_REVIEW_RESULT_NOT_DURABLY_RECEIVED');
     if (ref?.findings_sha256 && !records.some(record => record.review_result && record.findings_sha256 === ref.findings_sha256 &&
@@ -741,13 +748,88 @@ export class Controller {
     if (!records.some(record => record.kind === 'outcome' && record.outcome === task.automatic.status && record.stop_reason === task.automatic.reason)) throw new BridgeError('AUTOMATIC_OUTCOME_NOT_RETAINED');
     if (ref?.evidence_retention?.packet === 'pending' || this.persistenceFailures.has(task.id)) throw new BridgeError('AUTOMATIC_EVIDENCE_RECONCILIATION_REQUIRED');
   }
+  reviewReceiptBinding(task, contractSha) {
+    const ref = task.reviewer;
+    return { task_id: task.id, request_id: ref.request_id, protocol: task.automatic?.authorization.review_protocol || 'pab.local-review.v2',
+      original_request_id: task.request_id, contract_sha256: contractSha, baseline: task.baseline, deadline: task.deadline,
+      authorization: task.automatic ? { authorization: task.automatic.authorization, contract_binding: task.automatic.contract_binding,
+        review_authorization: task.automatic.review_authorization || null, deadline: task.automatic.deadline,
+        owner_instance: task.automatic.owner_instance, review_request_id: task.automatic.review_request_id,
+        publish_request_id: task.automatic.publish_request_id } : null, packet_hash: ref.packet_hash, packet_bytes: ref.packet_bytes,
+      reviewed_git_state: ref.reviewed_git_state, validation_sha256: digest(task.local_validation),
+      implementer_thread: task.implementer.local.thread_id, implementer_turn: task.implementer.local.turn_id,
+      reviewer_thread: ref.local.thread_id, reviewer_turn: ref.local.turn_id, reviewer_model: ref.local.model,
+      reviewer_owner: ref.local.owner_instance };
+  }
+  receiveLocalReview(task, result, contractSha) {
+    // Only the final model message, never reasoning/events/commands. Receipt is
+    // unverified data; it grants no review, publication or execution authority.
+    result ||= {};
+    const output = Array.isArray(result.messages) ? result.messages.filter(item => item?.provenance === 'model').at(-1)?.text : null;
+    const text = typeof output === 'string' ? this.safe(output).slice(0, 16000) : null;
+    const received = { version: 1, binding: this.reviewReceiptBinding(task, contractSha),
+      output: text, output_sha256: typeof output === 'string' ? digest(output) : null, complete: text !== null && text === output,
+      identity_valid: ['threadId', 'turnId', 'model'].every(key => result[key] == null ||
+        (typeof result[key] === 'string' && !!result[key] && this.bounded(result[key], 200) === result[key])),
+      observed_local: Object.fromEntries(['thread_id', 'turn_id', 'model', 'owner_instance', 'turn_submission_attempted',
+        'turn_submission_acknowledged', 'terminal_observed', 'human_attention_required'].map(key => [key, task.reviewer.local[key]])),
+      result: { ...Object.fromEntries(['threadId', 'turnId', 'model', 'status', 'authentication']
+        .map(key => [key, typeof result[key] === 'string' ? this.bounded(result[key], 200) : null])),
+        ...Object.fromEntries(['turnSubmissionAttempted', 'turnSubmissionAcknowledged', 'terminalObserved'].map(key => [key, result[key] === true])) },
+      uncertainties: (Array.isArray(result.uncertainties) ? result.uncertainties : result.uncertainties == null ? [] : ['LOCAL_RESULT_UNVERIFIED'])
+        .slice(0, 12).map(value => this.bounded(value, 512)) };
+    return received;
+  }
+  applyReceivedReview(local, received) {
+    if (!received.identity_valid) throw new BridgeError('LOCAL_IDENTITY_MISMATCH');
+    const result = received.result;
+    this.localIdentity(local, result);
+    const confirmed = local.turn_submission_acknowledged && local.terminal_observed && local.thread_id && local.turn_id && result.authentication === 'chatgpt';
+    local.authentication = result.authentication === 'chatgpt' ? 'chatgpt' : 'unverified';
+    local.adapter_contract = 'pab.local-codex-backend.v1';
+    Object.assign(local, { execution_state: result.status === 'completed' && !confirmed ? 'uncertain' :
+      ['completed', 'failed', 'interrupted', 'uncertain'].includes(result.status) ? result.status : 'uncertain',
+      phase: 'validating', result_received: true, diagnostics: received.uncertainties });
+  }
+  verifyReceivedReview(task, received, sha, packet) {
+    const binding = this.reviewReceiptBinding(task, packet.local_scope.contract_sha256);
+    if (digest(received) !== sha || (task.reviewer.received_output_sha256 && task.reviewer.received_output_sha256 !== sha) ||
+        digest(received.binding) !== digest(binding) || received.version !== 1 || !received.complete || typeof received.output !== 'string' ||
+        Buffer.byteLength(received.output) > MAX_PACKET || this.safe(received.output) !== received.output || digest(received.output) !== received.output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+    this.reviewProtocol(task);
+    const local = { ...received.observed_local, server_closed: task.reviewer.local.server_closed };
+    this.applyReceivedReview(local, received);
+    if (!localExecutionQualified(local) || task.reviewer.error || !local.server_closed ||
+        local.thread_id !== task.reviewer.local.thread_id || local.turn_id !== task.reviewer.local.turn_id || local.thread_id === task.implementer.local.thread_id ||
+        this.localRuns.has(`${task.id}:reviewer`) || this.validationRuns.has(task.id)) throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
+    return local;
+  }
   async reconcileAutomaticEvidence(id) {
     let task = this.task(id), ref = task.reviewer;
-    if (!task.automatic || task.workspace_deleted) return;
+    if ((!task.automatic && !ref?.received_review_output && !this.pendingReviewResults.has(id)) || task.workspace_deleted) return;
     // Only explicit non-destructive cleanup calls this. It never resumes a model,
     // validation or publication and cannot extend authority or restore progression.
-    if (task.automatic.status === 'progressing') throw new BridgeError('AUTOMATIC_TASK_STILL_ACTIVE');
-    const pending = ref?.pending_review_result || this.pendingReviewResults.get(id);
+    if (task.automatic?.status === 'progressing') throw new BridgeError('AUTOMATIC_TASK_STILL_ACTIVE');
+    let pending = ref?.pending_review_result || this.pendingReviewResults.get(id);
+    if (pending?.received_output || (ref?.pending_review_output && !pending?.result)) {
+      const received = pending?.received_output || ref.received_review_output, sha = pending?.sha256 || ref.received_output_sha256;
+      if (digest(received) !== sha || (ref.received_output_sha256 && ref.received_output_sha256 !== sha)) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+      ref.received_review_output = received; ref.received_output_sha256 = sha; ref.pending_review_output = true;
+      if (pending?.server_closed === true) ref.local.server_closed = true;
+      this.save(task); // A volatile receipt/termination fact must first commit.
+      const packet = await this.verifyLocalReviewPacket(task, { readOnly: true });
+      const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
+      const local = this.verifyReceivedReview(task, received, sha, packet);
+      if (!independentValidationPassed(task.local_validation, contract.test_commands, ref.reviewed_git_state, id)) throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
+      // Historical execution can be reconstructed, never its old authority.
+      Object.assign(ref.local, local, { human_attention_required: true });
+      this.save(task); // Keep reconstructed metadata recoverable if qualification persistence fails next.
+      const validated = this.validateReviewOutput(task, received.output, contract, packet);
+      const result = { ...validated, packet_hash: ref.packet_hash, reviewed_git_state: ref.reviewed_git_state,
+        thread_id: ref.local.thread_id, turn_id: ref.local.turn_id };
+      pending = { result, sha256: digest(result) }; this.pendingReviewResults.set(id, pending);
+      ref.pending_review_result = pending; ref.pending_review_output = false;
+    }
     if (pending) {
       if (digest(pending.result) !== pending.sha256 || pending.result.packet_hash !== ref.packet_hash ||
           pending.result.thread_id !== ref.local.thread_id || pending.result.turn_id !== ref.local.turn_id ||
@@ -766,14 +848,19 @@ export class Controller {
       const packetText = await fs.readFile(path.join(this.workspaceRoot, id, ref.packet_directory, 'evidence.json'), 'utf8');
       if (pending) {
         ref.review_result = pending.result; ref.findings_sha256 = pending.sha256;
-        delete ref.pending_review_result; ref.evidence_retention.review = 'retained';
+        ref.state = 'completed'; ref.local.phase = 'finished';
+        delete ref.pending_review_result; ref.pending_review_output = false; ref.evidence_retention.review = 'retained';
       }
       if (ref.evidence_retention) ref.evidence_retention.packet = 'retained';
       this.save(task, { packetText, ...(pending ? { operation: { id: ref.request_id, status: 'uncertain' } } : {}) });
     } else this.save(task);
     // A successful write is insufficient: reread/hash the committed records.
+    const committed = this.task(id);
+    if (committed.reviewer?.pending_review_output || committed.reviewer?.pending_review_result ||
+        (committed.reviewer?.received_review_output && digest(committed.reviewer.received_review_output) !== committed.reviewer.received_output_sha256) ||
+        (pending && digest(committed.reviewer?.review_result) !== pending.sha256)) throw new BridgeError('AUTOMATIC_REVIEW_RETENTION_UNRESOLVED');
     this.persistenceFailures.delete(id);
-    try { this.verifyAutomaticEvidence(this.task(id)); }
+    try { if (task.automatic) this.verifyAutomaticEvidence(this.task(id)); }
     catch (error) { this.persistenceFailures.add(id); throw error; }
     this.pendingReviewResults.delete(id);
   }
@@ -1264,7 +1351,9 @@ export class Controller {
         result.automatic.status = 'uncertain'; result.automatic.human_attention_required = true;
       }
       if (t.reviewer?.evidence_retention) result.automatic.evidence_retention = { ...t.reviewer.evidence_retention,
-        reconciliation_required: this.persistenceFailures.has(id) || !!t.reviewer.pending_review_result ||
+        received_output: t.reviewer.received_review_output ? 'durable' : this.pendingReviewResults.get(id)?.received_output ? 'volatile_only' : 'unavailable',
+        received_output_complete: (t.reviewer.received_review_output || this.pendingReviewResults.get(id)?.received_output)?.complete === true,
+        reconciliation_required: this.persistenceFailures.has(id) || !!t.reviewer.pending_review_output || !!t.reviewer.pending_review_result ||
           t.reviewer.evidence_retention.packet === 'pending' || t.reviewer.evidence_retention.review === 'awaiting_receipt' };
       const retained = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(id);
       if (retained) {
@@ -1652,13 +1741,13 @@ export class Controller {
       throw new BridgeError('LOCAL_REFERENCE_UNAVAILABLE_OR_UNSAFE');
     }
   }
-  async verifyLocalReviewPacket(task) {
+  async verifyLocalReviewPacket(task, { readOnly = false } = {}) {
     const ref = task.reviewer, root = path.join(this.workspaceRoot, task.id), directory = path.join(root, ref.packet_directory);
     if (await fs.realpath(directory) !== directory) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const file = path.join(directory, 'evidence.json'), stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_PACKET || stat.mode & 0o222) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const text = await fs.readFile(file, 'utf8');
-    if (digest(text) !== ref.packet_hash) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
+    if (digest(text) !== ref.packet_hash || Buffer.byteLength(text) !== ref.packet_bytes) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const packet = JSON.parse(text);
     const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8')), markdown = contractMarkdown(contract, 'local_codex');
     if (packet.contract !== markdown || packet.local_scope?.contract_sha256 !== digest(contract) ||
@@ -1666,11 +1755,18 @@ export class Controller {
     const references = await this.localReferenceEvidence(path.join(root, 'repo'), task.baseline, contract);
     if (digest(packet.source_context ?? null) !== digest(references ?? null)) throw new BridgeError('LOCAL_REVIEW_REFERENCE_CHANGED');
     if (JSON.stringify(await this.localProtectedState(path.join(root, 'repo'))) !== JSON.stringify(packet.local_scope?.protected_at_review)) throw new BridgeError('LOCAL_REVIEW_PROTECTED_PATH_CHANGED');
-    if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state) ||
-        JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+    if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+    if (readOnly) {
+      // Same captured contents/index/HEAD/metadata, without the temporary index
+      // and Git object writes used to construct a new reviewed tree.
+      await verifyTaskWorktree(root, task.repository);
+      if (digest(await publicationState(path.join(root, 'repo'))) !== digest(ref.reviewed_git_state.state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+      if (!/^[a-f0-9]{40,64}$/.test(ref.reviewed_git_state.tree_sha)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+      git(path.join(root, 'repo'), '--no-replace-objects', 'cat-file', '-e', `${ref.reviewed_git_state.tree_sha}^{tree}`);
+    } else if (JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
     const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
     if (compareSnapshots(packet.controller_evidence?.normal_checkout?.at_review, normal).status !== 'unchanged') throw new BridgeError('LOCAL_REVIEW_NORMAL_CHECKOUT_CHANGED');
-    await this.repositoryEvidence(task.id);
+    if (!readOnly) await this.repositoryEvidence(task.id);
     return packet;
   }
   localPacketRetryEligible(task) {
@@ -1817,6 +1913,7 @@ export class Controller {
     }
     if (this.closed || this.task(id).reviewer.stopping) return;
     const key = `${id}:reviewer`, abort = new AbortController();
+    let receivedTask;
     const backend = this.localBackendFactory({ cwd: path.join(this.workspaceRoot, id, task.reviewer.packet_directory), reviewOnly: true, timeoutMs: this.executionTimeout(this.task(id)),
       onLifecycle: event => {
         if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
@@ -1831,6 +1928,7 @@ export class Controller {
         }
         if (event.phase === 'turn_acknowledged') { local.execution_state = 'running'; ref.state = 'running'; }
         if (event.phase === 'terminal_observed') { local.execution_state = event.status; ref.state = 'finishing'; }
+        receivedTask = structuredClone(current);
         this.save(current);
         if (ref.stopping || this.closed) throw new BridgeError('LOCAL_STOP_REQUESTED');
       }, onProgress: event => {
@@ -1843,24 +1941,31 @@ export class Controller {
     task = this.task(id); Object.assign(task.reviewer.local, { instance_started: true, owner_instance: this.instanceId });
     if (task.automatic) task.reviewer.evidence_retention.review = 'awaiting_receipt';
     this.save(task);
+    receivedTask = structuredClone(task);
     let result;
     try {
       this.automaticGuard(this.task(id));
       const protocol = this.reviewProtocol(this.task(id));
       result = await backend.run({ prompt: protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION ? localActionabilityReviewerInstructions : localReviewerInstructions, allowedFiles: [], signal: abort.signal });
+      // Capture before any database read/write or asynchronous resource closure.
+      // Lifecycle observations above are owned Controller observations, not model
+      // assertions. Exact bounded output is still explicitly unverified here.
+      const received = this.receiveLocalReview(receivedTask, result, data.local_scope.contract_sha256);
+      const receipt = { received_output: received, sha256: digest(received) };
+      this.pendingReviewResults.set(id, receipt);
       if (this.dbClosed) return;
       task = this.task(id); const ref = task.reviewer;
-      this.localIdentity(ref.local, result);
-      const confirmed = ref.local.turn_submission_acknowledged && ref.local.terminal_observed && ref.local.thread_id && ref.local.turn_id && result.authentication === 'chatgpt';
-      ref.local.authentication = result.authentication === 'chatgpt' ? 'chatgpt' : 'unverified';
-      ref.local.adapter_contract = 'pab.local-codex-backend.v1';
-      Object.assign(ref.local, { execution_state: result.status === 'completed' && !confirmed ? 'uncertain' : ['completed', 'failed', 'interrupted', 'uncertain'].includes(result.status) ? result.status : 'uncertain',
-        phase: 'validating', result_received: true, diagnostics: (result.uncertainties || []).slice(0, 12).map(value => this.bounded(value, 512)) });
+      ref.received_review_output = received; ref.received_output_sha256 = receipt.sha256; ref.pending_review_output = true;
+      ref.evidence_retention ||= { review: 'received' };
+      this.save(task); // Receipt and history commit before completion metadata.
+      this.applyReceivedReview(ref.local, received);
       ref.state = 'finishing'; this.save(task);
     } finally {
       const closed = await settledWithin(Promise.resolve().then(() => backend.close()));
-      if (!this.dbClosed) { task = this.task(id); task.reviewer.local.server_closed = closed.ok && closed.value === true; this.save(task); }
+      const pending = this.pendingReviewResults.get(id);
+      if (pending?.received_output) pending.server_closed = closed.ok && closed.value === true;
       if (closed.ok && closed.value === true) this.localRuns.delete(key);
+      if (!this.dbClosed) { task = this.task(id); task.reviewer.local.server_closed = closed.ok && closed.value === true; this.save(task); }
     }
     if (this.dbClosed) return;
     task = this.task(id);
@@ -1871,7 +1976,9 @@ export class Controller {
           result.authentication !== 'chatgpt') throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
       const packet = await this.verifyLocalReviewPacket(task);
       const contract = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, id, 'contract.json'), 'utf8'));
-      const output = result.messages?.filter(item => item.provenance === 'model').at(-1)?.text;
+      const received = ref.received_review_output;
+      this.verifyReceivedReview(task, received, ref.received_output_sha256, packet);
+      const output = received.output;
       task = this.task(id);
       const validated = this.validateReviewOutput(task, output, contract, packet);
       if (this.closed || task.reviewer.stopping) throw new BridgeError('LOCAL_REVIEW_CANCELLED');
@@ -1880,8 +1987,9 @@ export class Controller {
       task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
       if (this.reviewProtocol(task) === LOCAL_ACTIONABILITY_REVIEW_VERSION) task.reviewer.authenticated_review_sha256 = task.reviewer.findings_sha256;
       task.reviewer.state = 'completed'; task.reviewer.local.phase = 'finished';
+      task.reviewer.pending_review_output = false;
     } catch (error) {
-      if (task.automatic && (this.persistenceFailures.has(id) || sqliteFailure(error))) {
+      if (this.persistenceFailures.has(id) || this.transactionUnresolved || sqliteFailure(error)) {
         this.persistenceFailures.add(id);
         throw error; // Preserve awaiting_receipt; storage failure is not an invalid review.
       }
@@ -1889,6 +1997,7 @@ export class Controller {
       task.reviewer.error ||= this.bounded(error.code || 'INVALID_LOCAL_REVIEW_OUTPUT', 128);
       task.reviewer.local.human_attention_required = true;
       task.reviewer.local.diagnostics.push(task.reviewer.error);
+      task.reviewer.pending_review_output = false;
       if (task.automatic) task.reviewer.evidence_retention.review = 'invalid';
     }
     if (task.automatic && task.reviewer.review_result) {
@@ -1904,6 +2013,7 @@ export class Controller {
       delete task.reviewer.pending_review_result;
       task.reviewer.evidence_retention.review = 'retained';
     }
+    if (!task.automatic) task.reviewer.evidence_retention.review = task.reviewer.review_result ? 'retained' : 'invalid';
     this.save(task, { operation: { id: task.reviewer.request_id, status: task.reviewer.review_result ? 'accepted' : 'uncertain' } });
     this.pendingReviewResults.delete(id);
   }
@@ -2189,7 +2299,7 @@ export class Controller {
       for (const diagnostic of reviewer.diagnostics) diagnostics.add(`REVIEWER_${diagnostic}`);
     }
     let task = this.task(id); const workspace = path.join(this.workspaceRoot, id);
-    if (task.automatic && reconcile && !deleteWorkspace && (this.persistenceFailures.has(id) || task.reviewer?.pending_review_result ||
+    if (reconcile && !deleteWorkspace && (this.persistenceFailures.has(id) || task.reviewer?.pending_review_output || this.pendingReviewResults.has(id) || task.reviewer?.pending_review_result ||
         task.reviewer?.evidence_retention?.packet === 'pending' || task.reviewer?.evidence_retention?.review === 'awaiting_receipt')) {
       try { await this.reconcileAutomaticEvidence(id); }
       catch (error) { diagnostics.add(error instanceof BridgeError ? error.code : 'AUTOMATIC_EVIDENCE_RECONCILIATION_UNCONFIRMED'); }
@@ -2208,6 +2318,10 @@ export class Controller {
       if (task.cleaned) {
         try {
           try { await this.repositoryEvidence(id); } catch { diagnostics.add('REPOSITORY_EVIDENCE_UNAVAILABLE'); }
+          if (task.reviewer?.pending_review_output || this.pendingReviewResults.has(id)) {
+            diagnostics.add('AUTOMATIC_REVIEW_RETENTION_UNRESOLVED');
+            throw new BridgeError('WORKSPACE_DELETE_BLOCKED_EVIDENCE_UNRESOLVED');
+          }
           if (task.automatic) {
             try {
               this.verifyAutomaticEvidence(this.task(id));
