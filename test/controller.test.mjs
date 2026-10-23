@@ -21,6 +21,25 @@ async function setup(t) {
 async function started(c) { const x = await c.start({ contract: contract(), request_id: 'request_start' }); await Promise.all([...c.jobs.values()]); return await c.get(x.task_id); }
 
 const attemptRows = (c, id) => c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+const statusTables = ['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'];
+const statusLedger = reader => JSON.stringify(Object.fromEntries(statusTables.map(table => [table, reader.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+async function statusClient(t, c, authorize = async () => {}) {
+  const server = createServer(c, authorize), client = new Client({ name: 'status-fixture', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  t.after(async () => { await client.close(); await server.close(); });
+  return { client, get: id => client.callTool({ name: 'get_task', arguments: { task_id: id } }) };
+}
+async function statusFiles(...roots) {
+  const entries = [];
+  async function walk(file) {
+    const stat = await fs.lstat(file);
+    entries.push([file, stat.dev, stat.ino, stat.mode, stat.nlink, stat.size, stat.mtimeMs, stat.ctimeMs,
+      stat.isFile() ? digest(await fs.readFile(file)) : stat.isSymbolicLink() ? await fs.readlink(file) : null]);
+    if (stat.isDirectory()) for (const name of (await fs.readdir(file)).sort()) await walk(path.join(file, name));
+  }
+  for (const root of roots) await walk(root);
+  return JSON.stringify(entries);
+}
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
   let active;
@@ -66,7 +85,7 @@ async function automaticAttempt(t, mode = {}) {
   if (mode.versioned) input.automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
   if (mode.manual) delete input.automatic;
   if (mode.validationFailure) input.contract.test_commands = ['true'];
-  mode.configure?.(c, input);
+  await mode.configure?.(c, input);
   const result = await c.start(input);
   if (mode.activeReviewer) await reviewerActive;
   else { await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
@@ -120,6 +139,183 @@ test('versioned automatic FAIL retains authenticated actionability without corre
   await assert.rejects(c.start(legacy), /REQUEST_ID_REUSED/);
   assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []); assert.equal(value.api.created.length, 0);
   assert.equal(task.deadline, task.automatic.deadline); assert.equal(task.automatic.authorization.max_codex_turns, 2); assert.equal(task.automatic.authorization.max_corrections, 0);
+});
+
+test('MCP versioned status is observational across the complete invocation and filesystem', async t => {
+  const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  let authorizations = 0;
+  const { get } = await statusClient(t, c, async () => { authorizations++; });
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  const registry = path.join(c.stateRoot, 'repositories.json'), workspace = path.join(c.workspaceRoot, id);
+  const before = statusLedger(reader), files = await statusFiles(normal, workspace, registry), writes = [];
+  c.db.setAuthorizer((action, table) => {
+    if ([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE].includes(action) && statusTables.includes(table)) writes.push(table);
+    return sqlite.SQLITE_OK;
+  });
+  try {
+    for (let count = 0; count < 3; count++) {
+      const result = await get(id); assert.notEqual(result.isError, true);
+      assert.equal(result.structuredContent.automatic.review.potentially_correctable, true);
+      assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
+    }
+    assert.deepEqual(writes, [], 'MCP status must not even prepare a ledger write');
+    assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, workspace, registry), files);
+    assert.equal(authorizations, 3); assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  } finally { c.db.setAuthorizer(null); reader.close(); }
+});
+
+test('MCP versioned status never attempts the previously failing SQLite task save', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }), { get } = await statusClient(t, c);
+  const before = statusLedger(c.db), fault = sqliteAbort(c, 'tasks', '1');
+  try {
+    const result = await get(id);
+    assert.equal(fault.hits, 0, 'Unnecessary status task write triggered an actual SQLite ABORT');
+    assert.notEqual(result.isError, true); assert.equal(result.structuredContent.automatic.review.potentially_correctable, true);
+    assert.equal(c.persistenceFailures.has(id), false); assert.equal(c.transactionUnresolved, false);
+    assert.equal(statusLedger(c.db), before);
+  } finally { c.db.exec('DROP TRIGGER evidence_fault'); }
+});
+
+test('MCP versioned status denies qualification after actual registration removal without rewriting history', async t => {
+  const { c, id, input, calls, publisherCalls } = await automaticAttempt(t, { versioned: true }), { get } = await statusClient(t, c);
+  const registry = path.join(c.stateRoot, 'repositories.json'), original = await fs.readFile(registry, 'utf8');
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  await fs.writeFile(registry, JSON.stringify({ version: 1, repositories: {} }));
+  await assert.rejects(c.start({ ...input, request_id: 'removed_registration' }), /UNKNOWN_REPOSITORY_ID/);
+  const before = statusLedger(c.db), result = await get(id);
+  assert.notEqual(result.isError, true); assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+  assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+  assert.equal(statusLedger(c.db), before); assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
+  await fs.writeFile(registry, original);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const changed of ['identity', 'path', 'corrupt', 'missing', 'unsafe', 'symlink']) test(`MCP versioned status rejects ${changed} registry authority and recovers observationally`, async t => {
+  const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true }), { get } = await statusClient(t, c);
+  const file = path.join(c.stateRoot, 'repositories.json'), original = await fs.readFile(file, 'utf8'), registry = JSON.parse(original);
+  const historical = c.task(id).reviewer.review_result, workspace = path.join(c.workspaceRoot, id);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  if (changed === 'identity') { registry.repositories.fixture.git_identity.ino = 'changed'; await fs.writeFile(file, JSON.stringify(registry)); }
+  if (changed === 'path') { registry.repositories.fixture.path = path.join(normal, 'missing'); await fs.writeFile(file, JSON.stringify(registry)); }
+  if (changed === 'corrupt') await fs.writeFile(file, '{"version":');
+  if (changed === 'missing') await fs.unlink(file);
+  if (changed === 'unsafe') await fs.chmod(file, 0o666);
+  if (changed === 'symlink') { await fs.unlink(file); await fs.symlink(path.join(workspace, 'contract.json'), file); }
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  try {
+    const before = statusLedger(reader), files = await statusFiles(normal, workspace);
+    for (let count = 0; count < 3; count++) {
+      const result = await get(id); assert.notEqual(result.isError, true);
+      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+    }
+    assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, workspace), files);
+    assert.deepEqual(c.task(id).reviewer.review_result, historical);
+  } finally { reader.close(); }
+  if (changed === 'symlink') await fs.unlink(file);
+  await fs.writeFile(file, original, { mode: 0o600 }); await fs.chmod(file, 0o600);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+async function githubStatusFixture(c, input) {
+  // Existing locally seeded fixture registration only; no registration service,
+  // GitHub request, fetch or production registry is used by this test.
+  const normal = path.join(path.dirname(c.stateRoot), 'normal');
+  await fs.chmod(normal, 0o700);
+  await fs.chmod(path.join(normal, 'greeting.txt'), 0o644);
+  await fs.rm(path.join(normal, '.git/hooks'), { recursive: true });
+  await fs.rmdir(path.join(normal, '.git/branches'));
+  await fs.unlink(path.join(normal, '.git/COMMIT_EDITMSG'));
+  repoGit(normal, 'remote', 'add', 'origin', 'https://github.com/fixture/repository.git');
+  const baseline = repoGit(normal, 'rev-parse', 'HEAD').trim();
+  input.repository_id = 'github_123';
+  await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1,
+    repositories: { github_123: await repositoryIdentity(normal) }, github_repositories: {
+      github_123: { repository_id: 123, owner_id: 456, full_name: 'fixture/repository', private: true, default_branch: 'main', baseline_commit: baseline },
+    } }));
+}
+
+for (const changed of ['metadata removed', 'origin binding', 'baseline binding', 'owner binding'])
+  test(`MCP versioned status verifies current GitHub registration: ${changed}`, async t => {
+    const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, configure: githubStatusFixture });
+    const { get } = await statusClient(t, c), file = path.join(c.stateRoot, 'repositories.json');
+    const original = await fs.readFile(file, 'utf8'), registry = JSON.parse(original);
+    assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+    const binding = registry.github_repositories.github_123;
+    if (changed === 'metadata removed') delete registry.github_repositories;
+    if (changed === 'origin binding') binding.full_name = 'fixture/another-repository';
+    if (changed === 'baseline binding') binding.baseline_commit = 'f'.repeat(40);
+    if (changed === 'owner binding') binding.owner_id++;
+    await fs.writeFile(file, JSON.stringify(registry));
+    const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+    try {
+      const before = statusLedger(reader), files = await statusFiles(normal, path.join(c.workspaceRoot, id), file);
+      for (let count = 0; count < 2; count++) {
+        const result = await get(id); assert.notEqual(result.isError, true);
+        assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      }
+      assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, path.join(c.workspaceRoot, id), file), files);
+      assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
+    } finally { reader.close(); }
+    await fs.writeFile(file, original);
+    assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+    assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  });
+
+test('MCP versioned status preserves live personal tunnel authorization on every lookup', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  const now = Date.now(), live = { id: 'tunnel_test', organization_ids: ['org_fixture'], workspace_ids: ['workspace_fixture'] };
+  const file = path.join(c.stateRoot, 'personal-tunnel.json');
+  await fs.writeFile(file, JSON.stringify({ tunnel_id: 'tunnel_test', personal_only: true, sole_authorized_user: true,
+    verification_method: 'owner_checked_platform_settings', platform_organization_id: 'org_fixture', chatgpt_workspace_id: 'workspace_fixture',
+    associated_organizations: ['org_fixture'], associated_workspaces: ['workspace_fixture'],
+    verified_at: new Date(now).toISOString(), expires_at: new Date(now + 60000).toISOString() }), { mode: 0o600 });
+  let lookups = 0;
+  const { get } = await statusClient(t, c, () => authorizePersonalTunnel({ stateRoot: c.stateRoot, expectedTunnel: 'tunnel_test', now,
+    lookup: async () => { lookups++; return live; } }));
+  const before = statusLedger(c.db), confirmation = await fs.readFile(file, 'utf8');
+  for (let count = 0; count < 2; count++) assert.notEqual((await get(id)).isError, true);
+  live.organization_ids = ['other']; const denied = await get(id);
+  assert.equal(denied.isError, true); assert.match(denied.content[0].text, /LIVE_TUNNEL_ASSOCIATION_MISMATCH/);
+  assert.equal(lookups, 3); assert.equal(statusLedger(c.db), before); assert.equal(await fs.readFile(file, 'utf8'), confirmation);
+});
+
+test('MCP versioned status never repairs a conflicting backend or synthesizes a failure diagnostic', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }), { get } = await statusClient(t, c);
+  const original = c.task(id), changed = structuredClone(original);
+  changed.execution_backend = 'agents_api'; changed.implementer.state = 'failed';
+  // Inject an inconsistent stored record; this is not authorized admission or a
+  // claim of immunity to privileged SQLite tampering.
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(changed), id);
+  const before = statusLedger(c.db), fault = sqliteAbort(c, 'failures', '1');
+  try {
+    const result = await get(id); assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    assert.equal(fault.hits, 0); assert.equal(statusLedger(c.db), before);
+  } finally {
+    c.db.exec('DROP TRIGGER evidence_fault');
+    c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(original), id);
+  }
+});
+
+test('MCP versioned status exemption preserves mutation audit and legacy/manual observation behavior', async t => {
+  const { c, api } = await setup(t), { client, get } = await statusClient(t, c);
+  const started = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_mutation_start' } });
+  assert.notEqual(started.isError, true); const id = started.structuredContent.task_id;
+  await Promise.all([...c.jobs.values()]); api.completed(c.task(id).implementer.session_id);
+  assert.notEqual((await get(id)).isError, true);
+  const audited = c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value));
+  assert(audited.some(row => row.tool === 'start_task' && row.task_id === id && row.session_id));
+  assert(audited.some(row => row.tool === 'get_task' && row.task_id === id));
+  assert.notEqual((await client.callTool({ name: 'cleanup_task', arguments: { task_id: id, delete_workspace: false } })).isError, true);
+  assert(c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'cleanup_task' && row.task_id === id));
+  const legacy = await automaticAttempt(t), status = await statusClient(t, legacy.c);
+  assert.notEqual((await status.get(legacy.id)).isError, true);
+  assert(legacy.c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'get_task'));
+  assert.equal(legacy.c.task(legacy.id).automatic.authorization.max_codex_turns, 2);
+  assert.equal(legacy.c.task(legacy.id).automatic.authorization.max_corrections, 0);
 });
 
 for (const mode of [{ cause: 'missing_evidence' }, { cause: 'unknown_cause' }, { cause: 'human_decision_required' },

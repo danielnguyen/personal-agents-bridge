@@ -401,6 +401,14 @@ export class Controller {
       .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
   }
   async invoke(name, input, extra, handler) {
+    if (name === 'get_task') {
+      const task = this.task(input.task_id);
+      if (task.automatic && (task.automatic.authorization.review_protocol !== undefined || task.automatic.review_authorization)) {
+        // Server authorization still precedes invoke. This status contract also
+        // excludes audit inserts/final task saves, including inherited audit context.
+        return this.context.run(undefined, () => handler(input));
+      }
+    }
     // Diagnostics and cancellation remain available without writing an audit
     // transition into a connection whose committed authority cannot be trusted.
     try { this.storageAuthority(); }
@@ -653,6 +661,12 @@ export class Controller {
         summary.state = !ref ? 'not_started' : 'malformed_or_uncertain';
         summary.blockers.unshift('REVIEW_RESULT_UNAVAILABLE'); return summary;
       }
+      // Resolving an existing entry only reads the private registry and local Git
+      // identity/binding. No registration, fetch, lock or checkout synchronization.
+      const current = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), task.repository.repository_id,
+        task.repository.base_ref, this.workspaceRoot, this.stateRoot);
+      if (current.baseline_commit !== task.baseline || ['repository_id', 'canonical_path', 'registered_identity', 'base_ref', 'baseline_commit', 'github_identity']
+        .some(key => digest(current[key] ?? null) !== digest(task.repository[key] ?? null))) throw new BridgeError('REPOSITORY_PATH_CHANGED');
       const packet = await this.verifyLocalReviewPacket(task, { readOnly: true });
       const text = await fs.readFile(path.join(this.workspaceRoot, task.id, ref.packet_directory, 'evidence.json'), 'utf8');
       const records = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => {
@@ -1315,7 +1329,7 @@ export class Controller {
             failure_diagnostic: d, latest_output: d?.latest_output?.text || null };
         }
       } else {
-        if (!storageDiagnostic && t[role].state === 'failed' && !this.diagnostic(t[role])) this.recordFailure(id, role, { reason: t[role].deleted ? 'Remote session already deleted; original diagnostic was not retained' : 'No retained API diagnostic' });
+        if (!versioned && !storageDiagnostic && t[role].state === 'failed' && !this.diagnostic(t[role])) this.recordFailure(id, role, { reason: t[role].deleted ? 'Remote session already deleted; original diagnostic was not retained' : 'No retained API diagnostic' });
         const d = this.diagnostic(t[role]);
         result[role] = { state: t[role].state, session_id: t[role].session_id || null, turn_id: t[role].turn_id || null, environment_id: t[role].environment_id || null, error: d ? d.api_error?.code || d.status : t[role].error || null, failure_diagnostic: d, latest_output: d?.latest_output?.text || null };
       }
