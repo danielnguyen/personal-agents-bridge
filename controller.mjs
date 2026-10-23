@@ -9,7 +9,7 @@ import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetL
 import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding, localCorrectionEligibility,
   LOCAL_ACTIONABILITY_REVIEW_VERSION, localActionabilityReviewerInstructions, validateLocalActionabilityReview } from './local-reviewer-instructions.mjs';
 import { LocalValidation, VALIDATION_VERSION, independentValidationPassed } from './local-validation.mjs';
-import { resolveRepository, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
+import { resolveRepository, asynchronousRepoGit, createTaskWorktree, verifyTaskWorktree, removeTaskWorktree } from './repositories.mjs';
 import { GitHubRegistration, RegistrationError, validName } from './github-registration.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -664,7 +664,7 @@ export class Controller {
       // Resolving an existing entry only reads the private registry and local Git
       // identity/binding. No registration, fetch, lock or checkout synchronization.
       const current = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), task.repository.repository_id,
-        task.repository.base_ref, this.workspaceRoot, this.stateRoot);
+        task.repository.base_ref, this.workspaceRoot, this.stateRoot, asynchronousRepoGit(AbortSignal.timeout(10000)));
       if (current.baseline_commit !== task.baseline || ['repository_id', 'canonical_path', 'registered_identity', 'base_ref', 'baseline_commit', 'github_identity']
         .some(key => digest(current[key] ?? null) !== digest(task.repository[key] ?? null))) throw new BridgeError('REPOSITORY_PATH_CHANGED');
       const packet = await this.verifyLocalReviewPacket(task, { readOnly: true });
@@ -1671,7 +1671,7 @@ export class Controller {
       return this.get(id, false);
     });
   }
-  async localReferenceEvidence(repo, baseline, contract, verifyWorktree = true) {
+  async localReferenceEvidence(repo, baseline, contract, verifyWorktree = true, readOnly = false) {
     const names = localReferencePaths(contract);
     if (!names.length) return undefined;
     try {
@@ -1683,7 +1683,9 @@ export class Controller {
         if (!objects.has(key)) {
           const buffer = execFileSync('/usr/bin/git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'cat-file', type, oid], {
             cwd: repo, maxBuffer: MAX_PACKET * 2, timeout: 10000,
-            env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0' },
+            // Binary trees must retain their exact bytes, unlike the text Git runner.
+            env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0',
+              ...(readOnly ? { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } : {}) },
           });
           if (createHash(baseline.length === 40 ? 'sha1' : 'sha256').update(`${type} ${buffer.length}\0`).update(buffer).digest('hex') !== oid) throw new BridgeError('LOCAL_REFERENCE_OBJECT_INTEGRITY');
           objects.set(key, buffer);
@@ -1757,6 +1759,7 @@ export class Controller {
   }
   async verifyLocalReviewPacket(task, { readOnly = false } = {}) {
     const ref = task.reviewer, root = path.join(this.workspaceRoot, task.id), directory = path.join(root, ref.packet_directory);
+    const readGit = readOnly ? asynchronousRepoGit(AbortSignal.timeout(10000)) : undefined;
     if (await fs.realpath(directory) !== directory) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
     const file = path.join(directory, 'evidence.json'), stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_PACKET || stat.mode & 0o222) throw new BridgeError('LOCAL_REVIEW_PACKET_CHANGED');
@@ -1766,19 +1769,28 @@ export class Controller {
     const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8')), markdown = contractMarkdown(contract, 'local_codex');
     if (packet.contract !== markdown || packet.local_scope?.contract_sha256 !== digest(contract) ||
         digest(packet.contract_binding ?? null) !== digest(localContractBinding(contract, markdown))) throw new BridgeError('LOCAL_REVIEW_CONTRACT_BINDING_CHANGED');
-    const references = await this.localReferenceEvidence(path.join(root, 'repo'), task.baseline, contract);
+    const references = await this.localReferenceEvidence(path.join(root, 'repo'), task.baseline, contract, true, readOnly);
     if (digest(packet.source_context ?? null) !== digest(references ?? null)) throw new BridgeError('LOCAL_REVIEW_REFERENCE_CHANGED');
     if (JSON.stringify(await this.localProtectedState(path.join(root, 'repo'))) !== JSON.stringify(packet.local_scope?.protected_at_review)) throw new BridgeError('LOCAL_REVIEW_PROTECTED_PATH_CHANGED');
     if (JSON.stringify(packet.reviewed_git_state) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
     if (readOnly) {
+      // Status can run clean filters or recurse into submodules. Neither can
+      // supply an observational snapshot, even with optional locks disabled.
+      for (const repo of [path.join(root, 'repo'), task.repository.canonical_path]) {
+        const configuration = await readGit(repo, 'config', '--name-only', '--list');
+        const index = await readGit(repo, 'ls-files', '--stage', '-z');
+        const head = await readGit(repo, 'ls-tree', '-r', '-z', 'HEAD');
+        if (configuration.split('\n').some(key => /^filter\./i.test(key)) ||
+            [index, head].some(entries => entries.split('\0').some(entry => entry.startsWith('160000 ')))) throw new BridgeError('LOCAL_REVIEW_EXECUTION_UNVERIFIED');
+      }
       // Same captured contents/index/HEAD/metadata, without the temporary index
       // and Git object writes used to construct a new reviewed tree.
       await verifyTaskWorktree(root, task.repository);
-      if (digest(await publicationState(path.join(root, 'repo'))) !== digest(ref.reviewed_git_state.state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
+      if (digest(await publicationState(path.join(root, 'repo'), readGit)) !== digest(ref.reviewed_git_state.state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
       if (!/^[a-f0-9]{40,64}$/.test(ref.reviewed_git_state.tree_sha)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
-      git(path.join(root, 'repo'), '--no-replace-objects', 'cat-file', '-e', `${ref.reviewed_git_state.tree_sha}^{tree}`);
+      await readGit(path.join(root, 'repo'), 'cat-file', '-e', `${ref.reviewed_git_state.tree_sha}^{tree}`);
     } else if (JSON.stringify(await reviewedGitState(root, task)) !== JSON.stringify(ref.reviewed_git_state)) throw new BridgeError('LOCAL_REVIEW_TREE_CHANGED');
-    const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
+    const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this), readGit);
     if (compareSnapshots(packet.controller_evidence?.normal_checkout?.at_review, normal).status !== 'unchanged') throw new BridgeError('LOCAL_REVIEW_NORMAL_CHECKOUT_CHANGED');
     if (!readOnly) await this.repositoryEvidence(task.id);
     return packet;

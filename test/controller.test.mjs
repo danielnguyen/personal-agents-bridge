@@ -176,6 +176,67 @@ test('MCP versioned status never attempts the previously failing SQLite task sav
   } finally { c.db.exec('DROP TRIGGER evidence_fault'); }
 });
 
+for (const [location, missing] of [['source', 'baseline'], ['source', 'tree'], ['source', 'blob'],
+  ['github', 'baseline'], ['github', 'tree'], ['reference', 'baseline'], ['reference', 'tree'], ['reference', 'blob']])
+test(`MCP versioned status cannot lazily fetch a missing ${location} ${missing}`, async t => {
+  const { c, id, normal, root, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, async configure(c, input) {
+    if (location === 'github') await githubStatusFixture(c, input);
+    if (location === 'reference') {
+      const normal = path.join(path.dirname(c.stateRoot), 'normal');
+      await fs.writeFile(path.join(normal, 'reference.txt'), 'unchanged reference\n');
+      repoGit(normal, 'add', 'reference.txt');
+      repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'reference');
+      input.contract.reference_files = ['reference.txt'];
+    }
+  } });
+  const { get } = await statusClient(t, c);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  // Only this disposable local remote can supply the promised objects. No
+  // external transport, production registration or shared repository is used.
+  const remote = path.join(root, 'promisor.git');
+  const workspace = path.join(c.workspaceRoot, id), repo = location === 'reference' ? path.join(workspace, 'repo') : normal;
+  repoGit(repo, 'clone', '--bare', '--no-hardlinks', repo, remote);
+  repoGit(repo, 'remote', 'add', 'fixture', remote);
+  repoGit(repo, 'config', 'remote.fixture.promisor', 'true');
+  repoGit(repo, 'config', 'remote.fixture.partialclonefilter', 'blob:none');
+  const oid = missing === 'baseline' ? c.task(id).baseline : repoGit(repo, 'rev-parse', missing === 'tree' ? 'HEAD^{tree}' :
+    `HEAD:${location === 'reference' ? 'reference.txt' : 'greeting.txt'}`).trim();
+  const store = location === 'reference' ? path.join(workspace, 'git-store') : path.join(normal, '.git');
+  const object = path.join(store, 'objects', oid.slice(0, 2), oid.slice(2));
+  await fs.unlink(object);
+  const reader = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'), { readOnly: true });
+  const registry = path.join(c.stateRoot, 'repositories.json');
+  const before = statusLedger(reader), files = await statusFiles(normal, workspace, registry, remote), writes = [];
+  const packs = await fs.readdir(path.join(store, 'objects/pack'));
+  const historical = c.task(id).reviewer.review_result, deadline = c.task(id).deadline;
+  const fault = sqliteAbort(c, 'tasks', '1');
+  c.db.setAuthorizer((action, table) => {
+    if ([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE].includes(action) && statusTables.includes(table)) writes.push(table);
+    return sqlite.SQLITE_OK;
+  });
+  // These are forbidden even if a status verification fails midway through.
+  const starts = [];
+  c.localBackendFactory = () => { starts.push('model'); throw Error('Status started a model'); };
+  c.localValidationFactory = () => { starts.push('validation'); throw Error('Status started validation'); };
+  c.publisher = { target() { starts.push('publication'); throw Error('Status started publication'); } };
+  try {
+    for (let count = 0; count < 3; count++) {
+      const result = await get(id); assert.notEqual(result.isError, true);
+      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
+      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+      assert.deepEqual(await fs.readdir(path.join(store, 'objects/pack')), packs, 'Status lazily fetched promised objects');
+      await assert.rejects(fs.access(object), { code: 'ENOENT' });
+      assert.equal(await statusFiles(normal, workspace, registry, remote), files);
+      assert.equal(statusLedger(reader), before);
+      assert.equal(c.task(id).deadline, deadline);
+      assert.deepEqual(c.task(id).reviewer.review_result, historical);
+    }
+    assert.equal(fault.hits, 0); assert.deepEqual(writes, []); assert.deepEqual(starts, []);
+    assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+  } finally { c.db.setAuthorizer(null); c.db.exec('DROP TRIGGER evidence_fault'); reader.close(); }
+});
+
 test('MCP versioned status denies qualification after actual registration removal without rewriting history', async t => {
   const { c, id, input, calls, publisherCalls } = await automaticAttempt(t, { versioned: true }), { get } = await statusClient(t, c);
   const registry = path.join(c.stateRoot, 'repositories.json'), original = await fs.readFile(registry, 'utf8');
@@ -188,6 +249,54 @@ test('MCP versioned status denies qualification after actual registration remova
   assert.equal(statusLedger(c.db), before); assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
   await fs.writeFile(registry, original);
   assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const location of ['source', 'candidate']) test(`MCP versioned status cannot execute a ${location} clean filter`, async t => {
+  const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  const { get } = await statusClient(t, c), workspace = path.join(c.workspaceRoot, id);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  const repo = location === 'source' ? normal : path.join(workspace, 'repo');
+  const store = location === 'source' ? path.join(normal, '.git') : path.join(workspace, 'git-store');
+  await fs.writeFile(path.join(store, 'info/attributes'), '*.txt filter=fixture\n');
+  repoGit(repo, 'config', 'filter.fixture.clean', 'cat; printf ran > status-filter-ran');
+  // Matching indexed size forces Git to compare bytes instead of stopping at
+  // the stat size difference, which would hide execution of the clean filter.
+  await fs.writeFile(path.join(repo, 'greeting.txt'), 'changed!\n');
+  const registry = path.join(c.stateRoot, 'repositories.json'), before = await statusFiles(normal, workspace, registry);
+  const ledger = statusLedger(c.db);
+  for (let count = 0; count < 3; count++) {
+    const result = await get(id); assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
+    await assert.rejects(fs.access(path.join(repo, 'status-filter-ran')), { code: 'ENOENT' });
+    assert.equal(await statusFiles(normal, workspace, registry), before);
+    assert.equal(statusLedger(c.db), ledger);
+  }
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const location of ['index', 'head']) test(`MCP versioned status rejects current ${location} submodule entries before status recursion`, async t => {
+  const { c, id, normal, calls, publisherCalls } = await automaticAttempt(t, { versioned: true });
+  const { get } = await statusClient(t, c), task = c.task(id), workspace = path.join(c.workspaceRoot, id);
+  assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
+  if (location === 'head') repoGit(normal, 'switch', '-c', 'other');
+  repoGit(normal, 'update-index', '--add', '--cacheinfo', `160000,${task.baseline},nested`);
+  if (location === 'head') {
+    repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'gitlink');
+    repoGit(normal, 'update-index', '--force-remove', 'nested');
+  }
+  const registry = path.join(c.stateRoot, 'repositories.json'), before = await statusFiles(normal, workspace, registry);
+  const ledger = statusLedger(c.db);
+  await assert.rejects(c.verifyLocalReviewPacket(task, { readOnly: true }), { code: 'LOCAL_REVIEW_EXECUTION_UNVERIFIED' });
+  for (let count = 0; count < 3; count++) {
+    const result = await get(id); assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
+    assert.equal(await statusFiles(normal, workspace, registry), before);
+    assert.equal(statusLedger(c.db), ledger);
+  }
+  assert.deepEqual(c.task(id).reviewer.review_result, task.reviewer.review_result);
   assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
 });
 

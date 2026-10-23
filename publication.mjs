@@ -21,8 +21,8 @@ export function publicationGit(repo, args, { env = {}, input, hooks = '/dev/null
     });
   } catch { fail('PUBLICATION_GIT_FAILED'); }
 }
-export async function publicationState(repo) {
-  const s = await checkoutSnapshot(repo, x => x);
+export async function publicationState(repo, git = repoGit) {
+  const s = await checkoutSnapshot(repo, x => x, git);
   if (s.status !== 'captured') fail('PUBLICATION_SNAPSHOT_UNAVAILABLE');
   return { head: s.git.head, contents_sha256: s.contents.sha256, index_sha256: s.git.index_sha256,
     git_metadata_sha256: s.git.metadata.sha256, status_sha256: s.index_worktree_status.sha256 };

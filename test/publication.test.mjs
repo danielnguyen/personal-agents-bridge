@@ -4,8 +4,9 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { Controller, digest, contractMarkdown } from '../controller.mjs';
-import { GitHubPublisher, publicationGit, githubRepository } from '../publication.mjs';
-import { repoGit, repositoryIdentity } from '../repositories.mjs';
+import { GitHubPublisher, publicationGit, publicationState, githubRepository } from '../publication.mjs';
+import { repoGit, asynchronousRepoGit, repositoryIdentity } from '../repositories.mjs';
+import { gitState, checkoutSnapshot } from '../review-evidence.mjs';
 import { FakeAPI, FakeExecutor } from './helpers.mjs';
 import { createServer } from '../server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -94,6 +95,29 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   const input = { task_id: id, title: 'Publish isolated fixture' };
   return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls, localPrompts };
 }
+
+test('snapshot and publication state await the selected Git runner without changing the captured state', async context => {
+  const { normal } = await setup(context), safeGit = asynchronousRepoGit(AbortSignal.timeout(10000));
+  assert.deepEqual(await gitState(normal, x => x, safeGit), await gitState(normal, x => x));
+  const snapshot = await checkoutSnapshot(normal, x => x), safeSnapshot = await checkoutSnapshot(normal, x => x, safeGit);
+  assert.equal(snapshot.status, 'captured');
+  delete snapshot.captured_at; delete safeSnapshot.captured_at;
+  assert.deepEqual(safeSnapshot, snapshot);
+  assert.deepEqual(await publicationState(normal, safeGit), await publicationState(normal));
+});
+
+for (const failure of ['interrupted', 'status_error']) test(`snapshot and publication state never fall back after ${failure}`, async context => {
+  const { normal } = await setup(context), safeGit = asynchronousRepoGit(AbortSignal.abort());
+  const selected = failure === 'interrupted' ? safeGit : async (cwd, ...args) => {
+    if (args[0] === 'status') throw Error('Unavailable status evidence');
+    return asynchronousRepoGit()(cwd, ...args);
+  };
+  const before = await publicationState(normal);
+  const snapshot = await checkoutSnapshot(normal, x => x, selected);
+  assert.equal(snapshot.status, 'unavailable');
+  await assert.rejects(publicationState(normal, selected), /PUBLICATION_SNAPSHOT_UNAVAILABLE/);
+  assert.deepEqual(await publicationState(normal), before);
+});
 
 test('explicit versioned automatic PASS uses authenticated findings and exact-tree draft publication', async context => {
   const value = await setup(context, ['one.txt'], true, ['test "$(cat one.txt)" = exact'], { versioned: true });
