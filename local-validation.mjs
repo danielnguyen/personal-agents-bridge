@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process';
-import { promises as fs, readFileSync, readdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { promises as fs } from 'node:fs';
+import { homedir, constants } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -38,52 +38,187 @@ export async function materializeValidationTree(repo, tree, destination, signal)
   return { files: entries.length, bytes, source: 'git_tree_blobs', filters_applied: false };
 }
 
-function groupAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return true;
-  try {
-    for (const name of readdirSync('/proc')) {
-      if (!/^\d+$/.test(name)) continue;
-      let stat;
-      try { stat = readFileSync(`/proc/${name}/stat`, 'utf8'); }
-      catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') continue; return true; }
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      if (Number(fields[2]) === pid && !['Z', 'X'].includes(fields[0])) return true;
-    }
-    return false;
-  } catch { return true; }
-}
+// Keep supervision outside the namespace and outside the command's sandbox.
+// The private pipes are closed before command exec. No task output can attest
+// ownership or completion. PID 1 exit is the kernel's descendant-reaping barrier;
+// a wrapper exit or a successful signal alone is deliberately insufficient.
+const namespaceObserver = String.raw`
+import ctypes,json,os,select,signal,subprocess,sys,time
+request=json.loads(sys.argv[1])
+libc=ctypes.CDLL(None,use_errno=True)
+def prctl(option,value):
+ if libc.prctl(option,value,0,0,0)!=0: raise OSError(ctypes.get_errno(),'process ownership unavailable')
+def emit(event,**fields):
+ os.write(3,(json.dumps(dict(event=event,nonce=request['nonce'],**fields))+'\n').encode())
+def exited(fd): return bool(select.select([fd],[],[],0)[0])
+def stop(fd):
+ if fd is not None and not exited(fd): signal.pidfd_send_signal(fd,signal.SIGKILL)
+stopping=False
+def cancel(*_):
+ global stopping
+ stopping=True
+signal.signal(signal.SIGTERM,cancel)
+signal.signal(signal.SIGINT,cancel)
+inner=r'''
+import json,os,signal,subprocess,sys
+info,gate,command=int(sys.argv[1]),int(sys.argv[2]),json.loads(sys.argv[3])
+def report(**fields): os.write(info,(json.dumps(fields)+'\n').encode())
+try:
+ assert os.getpid()==1
+ status=dict(line.split(':',1) for line in open('/proc/self/status') if ':' in line)
+ report(event='ready',pid=int(status['NSpid'].split()[0]))
+ assert os.read(gate,1)==b'1'
+ os.close(gate)
+ # unshare may leave SIGTERM ignored; commands retain normal signal behavior.
+ signal.signal(signal.SIGTERM,signal.SIG_DFL)
+ child=subprocess.Popen(command,close_fds=True)
+ code=child.wait()
+ background=False
+ while True:
+  try:
+   pid,_=os.waitpid(-1,os.WNOHANG)
+   if pid==0:
+    background=True
+    break
+  except ChildProcessError: break
+ report(event='command',code=code,background=background)
+except BaseException:
+ report(event='incomplete')
+finally:
+ os._exit(0)
+'''
+wrapper=None
+wrapper_fd=init_fd=None
+init_pid=None
+initialized=False
+command=None
+buffer=b''
+eof=False
+try:
+ prctl(36,1) # PR_SET_CHILD_SUBREAPER, scoped to this observer.
+ parent=request['owner_pid']
+ prctl(1,signal.SIGTERM) # Owner death initiates the same bounded shutdown.
+ if os.getppid()!=parent: raise RuntimeError('owner exited')
+ if stopping:
+  emit('complete',termination_confirmed=True,command=None,not_started=True)
+  os._exit(0)
+ reader,writer=os.pipe()
+ gate_reader,gate_writer=os.pipe()
+ owner=os.getpid()
+ def owned_child():
+  prctl(1,signal.SIGKILL)
+  if os.getppid()!=owner: os._exit(125)
+ wrapper=subprocess.Popen(['/usr/bin/unshare','--user','--map-current-user','--pid','--fork','--kill-child=KILL',
+  '/usr/bin/python3','-B','-c',inner,str(writer),str(gate_reader),json.dumps([request['binary'],*request['args']])],
+  pass_fds=(writer,gate_reader),preexec_fn=owned_child)
+ wrapper_fd=os.pidfd_open(wrapper.pid)
+ os.close(writer)
+ os.close(gate_reader)
+ while True:
+  # On early cancellation, finish trusted namespace setup without opening the
+  # dispatch gate. This lets ownership be proved within the existing grace.
+  if stopping and initialized:
+   stop(wrapper_fd)
+   stop(init_fd)
+  if select.select([reader],[],[],0.01)[0]:
+   data=os.read(reader,4096)
+   if not data: eof=True
+   buffer+=data
+   if len(buffer)>4096: raise RuntimeError('oversized observation')
+   while b'\n' in buffer:
+    line,buffer=buffer.split(b'\n',1)
+    message=json.loads(line)
+    if message['event']=='ready':
+     if initialized: raise RuntimeError('duplicate ownership')
+     candidate=message['pid']
+     if not isinstance(candidate,int) or candidate<=1: raise RuntimeError('invalid owner')
+     candidate_fd=os.pidfd_open(candidate)
+     status=dict(line.split(':',1) for line in open('/proc/%d/status'%candidate) if ':' in line)
+     ids=list(map(int,status['NSpid'].split()))
+     own_ids=list(map(int,dict(line.split(':',1) for line in open('/proc/self/status') if ':' in line)['NSpid'].split()))
+     namespace=os.readlink('/proc/%d/ns/pid'%candidate)
+     assert own_ids[0]==os.getpid() and ids[0]==candidate and ids[-1]==1 and len(ids)==len(own_ids)+1
+     assert int(status['PPid'])==wrapper.pid and int(status['Uid'].split()[0])==os.getuid()
+     assert namespace!=os.readlink('/proc/self/ns/pid') and not exited(candidate_fd)
+     init_pid,init_fd=candidate,candidate_fd
+     initialized=True
+     emit('ready',init_pid=init_pid,namespace=namespace)
+     if not stopping: os.write(gate_writer,b'1')
+     os.close(gate_writer)
+    elif message['event']=='command':
+     if not initialized or command is not None: raise RuntimeError('unowned completion')
+     if type(message['code']) is not int or type(message['background']) is not bool: raise RuntimeError('invalid completion')
+     command=message
+    elif message['event']!='incomplete': raise RuntimeError('unknown observation')
+  if eof and wrapper.poll() is not None and (init_fd is None or exited(init_fd)): break
+ # A pidfd refers to the original task even after PID reuse. In particular,
+ # do not substitute /proc group absence for this namespace-init exit proof.
+ if buffer: raise RuntimeError('truncated observation')
+ wrapper.wait()
+ confirmed=initialized and exited(init_fd) and exited(wrapper_fd)
+ if init_pid is not None:
+  try: os.waitpid(init_pid,os.WNOHANG)
+  except ChildProcessError: pass
+ emit('complete',termination_confirmed=confirmed,command=command,
+  diagnostic=None if command is not None else 'VALIDATION_NAMESPACE_EXECUTION_UNAVAILABLE')
+except BaseException:
+ try:
+  stop(wrapper_fd)
+  stop(init_fd)
+  if wrapper is not None and wrapper_fd is None: wrapper.kill()
+  if wrapper is not None: wrapper.wait(timeout=0.5)
+ except BaseException: pass
+ # Interrupted ownership/observation must never manufacture an exit proof.
+ try: emit('incomplete')
+ except BaseException: pass
+finally:
+ for fd in [wrapper_fd,init_fd]:
+  if fd is not None: os.close(fd)
+`;
 
-export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, bound, spawnProcess = spawn, alive = groupAlive, kill = process.kill }) {
+export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, bound, spawnProcess = spawn }) {
   return new Promise(resolve => {
     const output = { stdout: { data: Buffer.alloc(0), bytes: 0 }, stderr: { data: Buffer.alloc(0), bytes: 0 } };
     let child, timer, grace, settled = false, closed = false, spawned = false, spawnFailed = false;
+    const nonce = randomUUID();
     let timedOut = false, cancelled = signal?.aborted === true, background = false, exitCode = null, exitSignal = null;
+    let ownership = null, completion = null, observationFailed = false, control = '', supervisorCode = null;
     const finish = () => {
       if (settled) return;
       settled = true; clearTimeout(timer); clearTimeout(grace); signal?.removeEventListener('abort', abort);
-      const terminationConfirmed = spawnFailed || (spawned && closed && !alive(child.pid));
       const streams = Object.fromEntries(Object.entries(output).map(([name, value]) => {
         let text, encodingError = false;
         try { text = new TextDecoder('utf-8', { fatal: true }).decode(value.data); }
         catch { text = value.data.toString('utf8'); encodingError = true; }
-        const sanitized = bound(text, OUTPUT_LIMIT);
+        let sanitized;
+        try { sanitized = bound(text, OUTPUT_LIMIT); if (typeof sanitized !== 'string') throw Error('invalid output'); }
+        catch { sanitized = ''; observationFailed = true; }
         return [name, { text: sanitized, bytes_observed: value.bytes, truncated: value.bytes > OUTPUT_LIMIT,
           redacted: sanitized !== text, encoding_error: encodingError, available: spawned && closed }];
       }));
+      const terminationConfirmed = spawnFailed || (spawned && closed && supervisorCode === 0 && !observationFailed &&
+        (ownership !== null || (completion?.not_started === true && (cancelled || timedOut))) && completion?.termination_confirmed === true);
       const status = !terminationConfirmed ? 'uncertain' : cancelled || background ? 'interrupted' : timedOut ? 'timed_out' :
         !closed || !Number.isInteger(exitCode) ? 'unavailable' : exitCode !== 0 || exitSignal ? 'failed' :
           Object.values(streams).some(value => value.truncated || value.redacted || value.encoding_error || !value.available) ? 'incomplete' : 'passed';
       resolve({ status, start_observed: spawned, completion_observed: closed, exit_code: exitCode, signal: exitSignal,
         timeout: timedOut, cancelled, background_processes_observed: background, termination_confirmed: terminationConfirmed,
+        termination_scope: 'linux_pid_namespace', namespace_initialized: ownership !== null,
+        namespace_identity: ownership, escaped_descendants_verified: ownership !== null && terminationConfirmed,
+        ...(completion?.diagnostic ? { diagnostic: completion.diagnostic } : {}),
         independently_observed: true, ...streams });
     };
     const terminate = () => {
-      if (spawned) { try { kill(-child.pid, 'SIGKILL'); } catch {} }
-      if (!grace) grace = setTimeout(finish, 1000);
+      if (spawned && !closed) { try { child.kill('SIGTERM'); } catch { observationFailed = true; } }
+      if (!grace) grace = setTimeout(() => {
+        if (!closed) { try { child.kill('SIGKILL'); } catch {} }
+        observationFailed = true; finish();
+      }, 1000);
     };
     const abort = () => { cancelled = true; terminate(); };
     if (cancelled) { spawnFailed = true; finish(); return; }
-    try { child = spawnProcess(binary, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawnProcess('/usr/bin/python3', ['-B', '-c', namespaceObserver, JSON.stringify({ binary, args, nonce, owner_pid: process.pid })],
+      { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }); }
     catch { spawnFailed = true; finish(); return; }
     for (const name of ['stdout', 'stderr']) child[name]?.on('data', buffer => {
       const value = output[name], remaining = Math.max(0, OUTPUT_LIMIT - value.bytes);
@@ -91,10 +226,37 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
     });
     child.once('spawn', () => { spawned = true; if (cancelled) terminate(); });
     child.once('error', () => { spawnFailed = !spawned; if (spawned) terminate(); else finish(); });
+    const invalid = () => { observationFailed = true; terminate(); };
+    child.stdio?.[3]?.on('data', buffer => {
+      if (settled) return;
+      try {
+        control += buffer.toString('utf8');
+        if (control.length > 4096) throw Error('oversized observation');
+        while (control.includes('\n')) {
+          const newline = control.indexOf('\n'), message = JSON.parse(control.slice(0, newline)); control = control.slice(newline + 1);
+          if (message.nonce !== nonce || completion || observationFailed) throw Error('invalid observation');
+          if (message.event === 'ready' && !ownership && Number.isSafeInteger(message.init_pid) && message.init_pid > 1 && /^pid:\[\d+\]$/.test(message.namespace)) {
+            ownership = { init_pid: message.init_pid, namespace: message.namespace };
+          } else if (message.event === 'complete' && typeof message.termination_confirmed === 'boolean') {
+            completion = message;
+            const command = message.command;
+            if (command !== null) {
+              if (!ownership || !Number.isSafeInteger(command.code) || typeof command.background !== 'boolean') throw Error('invalid completion');
+              exitCode = command.code >= 0 ? command.code : null;
+              exitSignal = command.code < 0 ? Object.keys(constants.signals).find(name => constants.signals[name] === -command.code) || null : null;
+              background = command.background;
+            }
+          } else throw Error('incomplete observation');
+        }
+      } catch { invalid(); }
+    });
+    child.stdio?.[3]?.on('error', invalid);
+    child.stdout?.on('error', invalid); child.stderr?.on('error', invalid);
+    child.once('exit', () => { if (!grace) grace = setTimeout(() => { observationFailed = true; finish(); }, 1000); });
     child.once('close', (code, observedSignal) => {
-      closed = true; exitCode = Number.isInteger(code) ? code : null; exitSignal = observedSignal || null;
-      if (spawned && alive(child.pid)) { background = true; terminate(); }
-      else finish();
+      closed = true; supervisorCode = code;
+      if (observedSignal || control.length) observationFailed = true;
+      finish();
     });
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
@@ -121,7 +283,7 @@ export class LocalValidation {
       const record = { attempt_id: randomUUID(), validation_attempt_id: attemptId, command_index: index, command,
         candidate_tree: tree, cwd: null, status: 'preparing', start_attempted: false, start_observed: false,
         completion_observed: false, independently_observed: true, termination_confirmed: true,
-        termination_scope: 'launched_process_group_only', escaped_descendants_verified: false,
+        termination_scope: 'linux_pid_namespace', namespace_initialized: false, namespace_identity: null, escaped_descendants_verified: false,
         exit_code: null, signal: null, timeout: false, cancelled: false, started_at: null, completed_at: null,
         stdout: { text: '', available: false, bytes_observed: 0, truncated: false, redacted: false },
         stderr: { text: '', available: false, bytes_observed: 0, truncated: false, redacted: false } };

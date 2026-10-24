@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import path from 'node:path';
@@ -109,13 +111,31 @@ for (const action of ['timeout', 'cancel']) test(`independent ${action} terminat
   assert.equal(results[0].termination_confirmed, true); assert.equal(results[0].exit_code, null);
 });
 
-test('missing completion stays uncertain even after attempted termination', async () => {
+function observationFixture(events, { close = true, code = 0, observedSignal = null } = {}) {
   const child = new EventEmitter(); child.pid = 424242; child.stdout = new PassThrough(); child.stderr = new PassThrough();
-  let kills = 0;
+  child.stdio = [null, child.stdout, child.stderr, new PassThrough()];
+  const kills = []; child.kill = signal => { kills.push(signal); return true; };
+  return { child, kills, spawnProcess(binary, args, options) {
+    assert.equal(binary, '/usr/bin/python3'); assert.equal(options.stdio[3], 'pipe');
+    const request = JSON.parse(args.at(-1));
+    queueMicrotask(() => {
+      child.emit('spawn');
+      for (const event of events) child.stdio[3].write(JSON.stringify({ nonce: request.nonce, ...event }) + '\n');
+      if (close) child.emit('close', code, observedSignal);
+    });
+    return child;
+  } };
+}
+const ownership = { event: 'ready', init_pid: 424243, namespace: 'pid:[123456]' };
+const completion = (command = { code: 0, background: false }) => ({ event: 'complete', termination_confirmed: true, command });
+
+test('missing completion stays uncertain even after attempted termination', async () => {
+  const fixture = observationFixture([ownership], { close: false });
   const result = await observeValidationProcess('synthetic', [], { cwd: '/tmp', env: {}, timeoutMs: 5, bound: value => value,
-    spawnProcess: () => { queueMicrotask(() => child.emit('spawn')); return child; }, alive: () => true, kill: () => { kills++; } });
+    spawnProcess: fixture.spawnProcess });
   assert.equal(result.status, 'uncertain'); assert.equal(result.completion_observed, false);
-  assert.equal(result.termination_confirmed, false); assert.equal(result.stdout.available, false); assert.equal(kills, 1);
+  assert.equal(result.termination_confirmed, false); assert.equal(result.stdout.available, false);
+  assert.deepEqual(fixture.kills, ['SIGTERM', 'SIGKILL']);
 });
 
 test('pre-spawn persistence failure prevents execution and cannot produce observed PASS', async context => {
@@ -129,22 +149,201 @@ test('output-size controls retain independent results or reject the complete pac
   assert.throws(() => budgetLocalPacket({ independent_validation: { results: [{ stdout: { text: 'x'.repeat(128 * 1024) } }] } }), /EVIDENCE_SIZE_LIMIT/);
 });
 
-test('observed process close without an exit code is not a verified PASS', async () => {
-  const child = new EventEmitter(); child.pid = 424242; child.stdout = new PassThrough(); child.stderr = new PassThrough();
+test('observed supervisor close without command completion is not a verified PASS', async () => {
+  const fixture = observationFixture([ownership, completion(null)]);
   const result = await observeValidationProcess('synthetic', [], { cwd: '/tmp', env: {}, timeoutMs: 1000, bound: value => value,
-    spawnProcess: () => { queueMicrotask(() => { child.emit('spawn'); child.emit('close', null, 'SIGTERM'); }); return child; }, alive: () => false });
-  assert.equal(result.status, 'unavailable'); assert.equal(result.exit_code, null); assert.equal(result.signal, 'SIGTERM');
+    spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'unavailable'); assert.equal(result.exit_code, null);
   assert.equal(result.completion_observed, true); assert.equal(result.termination_confirmed, true);
 });
 
-test('background group activity prevents PASS even when the shell exits zero', async () => {
-  const child = new EventEmitter(); child.pid = 424242; child.stdout = new PassThrough(); child.stderr = new PassThrough();
-  let active = true;
+test('background namespace activity prevents PASS even when the shell exits zero', async () => {
+  const fixture = observationFixture([ownership, completion({ code: 0, background: true })]);
   const result = await observeValidationProcess('synthetic', [], { cwd: '/tmp', env: {}, timeoutMs: 10000, bound: value => value,
-    spawnProcess: () => { queueMicrotask(() => { child.emit('spawn'); child.emit('close', 0, null); }); return child; },
-    alive: () => active, kill: () => { active = false; } });
+    spawnProcess: fixture.spawnProcess });
   assert.equal(result.status, 'interrupted'); assert.equal(result.background_processes_observed, true);
   assert.equal(result.termination_confirmed, true);
+});
+
+for (const [label, events, options] of [
+  ['missing ownership', [completion()], {}],
+  ['namespace initialization failure', [{ event: 'complete', termination_confirmed: false, command: null }], {}],
+  ['unconfirmed termination', [ownership, { ...completion(), termination_confirmed: false }], {}],
+  ['unobserved exit', [ownership], {}],
+  ['foreign observation', [{ ...ownership, nonce: 'foreign' }, completion()], {}],
+  ['duplicate completion', [ownership, completion(), completion()], {}],
+  ['supervisor killed after reporting', [ownership, completion()], { code: null, observedSignal: 'SIGKILL' }],
+  ['invalid command status', [ownership, completion({ code: null, background: false })], {}],
+]) test(`${label} cannot claim PASS or confirmed termination`, async () => {
+  const fixture = observationFixture(events, options);
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value, spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'uncertain'); assert.equal(result.termination_confirmed, false);
+  assert.equal(result.escaped_descendants_verified, false);
+});
+
+test('pre-cancelled observation never launches a process', async () => {
+  const abort = new AbortController(); abort.abort();
+  const result = await observeValidationProcess('synthetic', [], { signal: abort.signal, timeoutMs: 1000, bound: value => value,
+    spawnProcess: () => assert.fail('must not spawn') });
+  assert.equal(result.status, 'interrupted'); assert.equal(result.start_observed, false);
+  assert.equal(result.termination_confirmed, true); assert.equal(result.namespace_initialized, false);
+});
+
+test('missing command executable stays unavailable inside an owned namespace', async () => {
+  const result = await observeValidationProcess('/nonexistent-pab-command', [], { timeoutMs: 3000, bound: value => value });
+  assert.equal(result.status, 'unavailable'); assert.equal(result.namespace_initialized, true);
+  assert.equal(result.termination_confirmed, true); assert.equal(result.exit_code, null);
+});
+
+test('ordinary real command has owned namespace and complete output', async () => {
+  const result = await observeValidationProcess('/bin/sh', ['-c', 'printf namespace-ok'], { timeoutMs: 3000, bound: value => value });
+  assert.equal(result.status, 'passed', JSON.stringify(result)); assert.equal(result.stdout.text, 'namespace-ok');
+  assert.equal(result.termination_scope, 'linux_pid_namespace'); assert.equal(result.namespace_initialized, true);
+  assert.equal(result.escaped_descendants_verified, true);
+});
+
+test('a fast command exit cannot overtake its buffered completion observation', async () => {
+  const result = await observeValidationProcess('/bin/true', [], { timeoutMs: 3000, bound: value => value,
+    spawnProcess(binary, args, options) {
+      const changed = [...args]; changed[2] = args[2].replace('os.close(gate_writer)', 'os.close(gate_writer); time.sleep(0.1)');
+      assert.notEqual(changed[2], args[2]);
+      return spawn(binary, changed, options);
+    }
+  });
+  assert.equal(result.status, 'passed', JSON.stringify(result)); assert.equal(result.exit_code, 0);
+  assert.equal(result.termination_confirmed, true);
+});
+
+for (const fault of ['namespace creation', 'ownership verification']) test(`real ${fault} failure never dispatches the command or falls back`, async () => {
+  const result = await observeValidationProcess('/bin/echo', ['must-not-execute'], { timeoutMs: 3000, bound: value => value,
+    spawnProcess(binary, args, options) {
+      const changed = [...args];
+      changed[2] = fault === 'namespace creation' ? args[2].replace("'--map-current-user'", "'--pab-invalid-option'") :
+        args[2].replace("assert int(status['PPid'])==wrapper.pid", "assert False and int(status['PPid'])==wrapper.pid");
+      assert.notEqual(changed[2], args[2]);
+      return spawn(binary, changed, options);
+    }
+  });
+  assert.equal(result.status, 'uncertain'); assert.equal(result.namespace_initialized, false);
+  assert.equal(result.termination_confirmed, false); assert.equal(result.stdout.text, '');
+});
+
+test('interrupted output processing cannot fabricate a passing result', async () => {
+  const fixture = observationFixture([ownership, completion()]);
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000,
+    bound() { throw Error('output processing failed'); }, spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'uncertain'); assert.equal(result.termination_confirmed, false);
+});
+
+test('command output cannot substitute for the private observation channel', async () => {
+  const fixture = observationFixture([]);
+  fixture.child.stdout.write(JSON.stringify({ ...ownership, ...completion() }));
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value, spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'uncertain'); assert.equal(result.termination_confirmed, false);
+});
+
+// This observer runs in the test's namespace, holds a pidfd while the escaped
+// process is alive, and requires actual exit plus /proc disappearance afterward.
+const watchExit = `import json,os,select,sys,time
+pid=int(sys.argv[1]); fd=os.pidfd_open(pid)
+assert not select.select([fd],[],[],0)[0], 'escaped process was not observed alive'
+print('WATCHING',flush=True)
+assert select.select([fd],[],[],2.5)[0], 'escaped process still running before its safety alarm'
+deadline=time.monotonic()+1
+while os.path.exists('/proc/%d'%pid) and time.monotonic()<deadline: time.sleep(.005)
+assert not os.path.exists('/proc/%d'%pid), 'escaped process not reaped'
+os.close(fd)
+print('EXIT_VERIFIED',flush=True)`;
+const escapingCommand = `import ctypes,json,os,signal,time
+reader,writer=os.pipe()
+child=os.fork()
+if child==0:
+ os.close(reader); os.setsid()
+ ctypes.CDLL(None).prctl(15,ctypes.c_char_p(b'pab-escape'),0,0,0)
+ signal.signal(signal.SIGALRM,lambda *_:os._exit(124)); signal.alarm(4)
+ status=dict(line.split(':',1) for line in open('/proc/self/status') if ':' in line)
+ os.write(writer,(json.dumps({'pid':int(status['NSpid'].split()[0]),'inner_pid':os.getpid(),'pgid':os.getpgrp(),'sid':os.getsid(0)})+'\\n').encode())
+ os.close(writer)
+ while True: signal.pause()
+os.close(writer)
+print(os.read(reader,1024).decode(),end='',flush=True)
+time.sleep(float(__import__('sys').argv[1]))`;
+
+for (const mode of ['background exit', 'timeout', 'cancel', 'observer loss']) test(`real escaped session is killed and reaped after ${mode}`, async context => {
+  const abort = new AbortController(); let watcher, watching, identity, output = '';
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', escapingCommand, mode === 'background exit' ? '0.5' : '10'], {
+    timeoutMs: mode === 'timeout' ? 1000 : 3000, signal: abort.signal, bound: value => value,
+    spawnProcess(binary, args, options) {
+      const child = spawn(binary, args, options);
+      child.stdout.on('data', data => {
+        output += data;
+        if (identity || !output.includes('\n')) return;
+        identity = JSON.parse(output.slice(0, output.indexOf('\n')));
+        assert.equal(identity.inner_pid, identity.pgid); assert.equal(identity.pgid, identity.sid);
+        const status = readFileSync(`/proc/${identity.pid}/stat`, 'utf8');
+        assert.notEqual(status.slice(status.lastIndexOf(')') + 2).split(' ')[0], 'Z');
+        watcher = spawn('/usr/bin/python3', ['-B', '-c', watchExit, String(identity.pid)]);
+        watching = new Promise((resolve, reject) => {
+          let text = '', error = ''; watcher.stdout.on('data', data => {
+            text += data;
+            if (mode === 'cancel' && text.includes('WATCHING')) abort.abort();
+            if (mode === 'observer loss' && text.includes('WATCHING')) child.kill('SIGKILL');
+          });
+          watcher.stderr.on('data', data => { error += data; });
+          watcher.once('error', reject);
+          watcher.once('close', code => code === 0 ? resolve(text) : reject(Error(error)));
+        });
+        watching.catch(() => {});
+      });
+      return child;
+    }
+  });
+  assert(identity, JSON.stringify(result));
+  assert.match(await watching, /EXIT_VERIFIED/);
+  assert.equal(result.status, mode === 'observer loss' ? 'uncertain' : mode === 'timeout' ? 'timed_out' : 'interrupted', JSON.stringify(result));
+  assert.equal(result.termination_confirmed, mode !== 'observer loss'); assert.equal(result.escaped_descendants_verified, mode !== 'observer loss');
+  if (mode === 'background exit') assert.equal(result.background_processes_observed, true);
+  context.diagnostic(JSON.stringify({ mode, escaped: identity, namespace: result.namespace_identity, actual_exit_verified: true }));
+});
+
+test('native validation contains an escaped session after the main command exits', async context => {
+  const value = await fixture(context), runner = new LocalValidation({ root: value.root });
+  const nonce = randomUUID();
+  const command = '/usr/bin/python3 -B -c ' + "'" + escapingCommand.replaceAll("'", "'\\''") + "' 1 " + nonce;
+  assert(command.length <= 1000);
+  let settled = false, watcher, watching, identity;
+  const running = runner.run({ ...value, commands: [command], attemptId: 'escaped-native', onRecord() {} }).finally(() => { settled = true; });
+  // Codex may mount /proc for its own nested PID namespace. Discover the
+  // uniquely tagged test child in the observer's /proc rather than confusing
+  // the command's local PID with an unrelated process in the parent namespace.
+  while (!settled && !identity) {
+    for (const pid of await fs.readdir('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      try {
+        if ((await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim() !== 'pab-escape') continue;
+        if (!(await fs.readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0').includes(nonce)) continue;
+        const status = await fs.readFile(`/proc/${pid}/stat`, 'utf8'), fields = status.slice(status.lastIndexOf(')') + 2).split(' ');
+        assert.equal(Number(fields[2]), Number(pid)); assert.equal(Number(fields[3]), Number(pid));
+        identity = { pid: Number(pid), starttime: fields[19] };
+        watcher = spawn('/usr/bin/python3', ['-B', '-c', watchExit, pid]);
+        watching = new Promise((resolve, reject) => {
+          let output = '', error = '';
+          watcher.stdout.on('data', data => { output += data; }); watcher.stderr.on('data', data => { error += data; });
+          watcher.once('error', reject); watcher.once('close', code => code === 0 ? resolve(output) : reject(Error(error)));
+        });
+        watching.catch(() => {});
+        break;
+      } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
+    }
+    if (!identity && !settled) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const [result] = await running;
+  assert(['passed', 'interrupted'].includes(result.status), JSON.stringify(result));
+  assert(identity, 'escaped child was never independently observed');
+  assert.match(await watching, /EXIT_VERIFIED/);
+  await assert.rejects(fs.stat(`/proc/${identity.pid}`), { code: 'ENOENT' });
+  assert.equal(result.termination_confirmed, true); assert.equal(result.escaped_descendants_verified, true);
+  context.diagnostic(JSON.stringify({ native_sandbox: true, escaped: identity, actual_exit_verified: true }));
 });
 
 test('unsupported candidate entries and invalid tree identities fail closed', async context => {
