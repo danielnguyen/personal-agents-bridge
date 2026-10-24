@@ -243,8 +243,11 @@ for (const point of ['before reservation', 'after push']) test(`corrective publi
 
 for (const effect of ['ABORT', 'IGNORE']) for (const boundary of ['operation', 'parent reservation', 'child reservation', 'history', 'prepared', 'push intent', 'PR intent', 'completion', 'acceptance', 'parent result'])
 test(`corrective publication SQLite ${effect} at ${boundary} cannot fabricate authority or completion`, async context => {
-  let hits = 0;
-  const value = await correctiveWorkflow(context, { configure(c) {
+  let hits = 0, evidence;
+  const value = await correctiveWorkflow(context, { async beforePublication(c, parentId, childId) {
+    await historicalStatus(c, parentId, childId, 'PASS');
+    evidence = await retainedReviewEvidence(c, parentId, childId);
+  }, configure(c) {
     c.db.function('publication_fault', () => ++hits === 1 ? 1 : 0);
     let table = 'tasks', event = 'INSERT', condition = "json_extract(NEW.value,'$.automatic.corrective_publication.operation_id') IS NOT NULL";
     if (boundary === 'operation' || boundary === 'acceptance') {
@@ -269,6 +272,8 @@ test(`corrective publication SQLite ${effect} at ${boundary} cannot fabricate au
   if (['operation', 'parent reservation', 'child reservation', 'history', 'prepared', 'push intent'].includes(boundary)) assert.equal(value.publisher.pushes, 0);
   assert.notEqual((await value.c.get(value.id)).correction.publication?.confirmed, true);
   assert.equal(value.parent.reviewer.review_result.overall, 'FAIL'); assert(value.child.reviewer.review_result);
+  await historicalStatus(value.c, value.id, value.child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(value.c, value.id, value.child.id, evidence.rows), evidence);
   const counts = [value.publisher.pushes, value.publisher.creates];
   await value.c.close();
   const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: path.join(value.root, 'tasks'), api: value.api,
@@ -277,6 +282,9 @@ test(`corrective publication SQLite ${effect} at ${boundary} cannot fabricate au
   await restarted.start(value.startInput); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
   assert.notEqual((await restarted.get(value.id)).correction.publication?.confirmed, true);
   assert.deepEqual([value.publisher.pushes, value.publisher.creates], counts);
+  await historicalStatus(restarted, value.id, value.child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(restarted, value.id, value.child.id, evidence.rows), evidence);
+  assert.equal(value.localCalls.length, 4); assert.equal(restarted.task(value.id).deadline, evidence.deadline);
 });
 
 test('corrective publication duplicate dispatch cannot reserve or publish another draft', async context => {
@@ -331,6 +339,144 @@ async function publicationFiles(root) {
   }
   await visit(root); return digest(files);
 }
+
+async function retainedReviewEvidence(c, parentId, childId, originalRows) {
+  const parent = c.task(parentId), child = c.task(childId);
+  const rows = c.db.prepare('SELECT task_id,attempt_id,observation_sha256,value FROM automatic_attempts WHERE task_id=? OR task_id=?').all(parentId, childId);
+  const selected = originalRows ? originalRows.map(prior => {
+    assert(rows.some(row => JSON.stringify(row) === JSON.stringify(prior)), 'A prior evidence observation disappeared'); return prior;
+  }) : rows;
+  return { deadline: parent.deadline, lineage: child.correction, tree: child.reviewer.reviewed_git_state.tree_sha,
+    original_packet: await fs.readFile(path.join(c.workspaceRoot, parentId, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'),
+    packet: await fs.readFile(path.join(c.workspaceRoot, childId, child.reviewer.packet_directory, 'evidence.json'), 'utf8'),
+    findings: JSON.stringify(child.reviewer.review_result), validation: JSON.stringify(child.local_validation), rows: selected };
+}
+
+async function historicalStatus(c, parentId, childId, overall, publicationUncertain = false, readUnavailable = false) {
+  clearInterval(c.sweeper);
+  let authorizations = 0, writes = 0, readFailures = 0;
+  const server = createServer(c, async () => { authorizations++; }), client = new Client({ name: 'retained-review-status', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  const ledger = () => JSON.stringify(['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const before = ledger(), files = await publicationFiles(c.workspaceRoot), source = await publicationFiles(c.task(childId).repository.canonical_path);
+  const calls = [...c.publisher.calls], mutations = new Set([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE]);
+  c.db.setAuthorizer((action, table) => {
+    if (mutations.has(action)) { writes++; return sqlite.SQLITE_DENY; }
+    if (readUnavailable && action === sqlite.SQLITE_READ && table === 'automatic_attempts') { readFailures++; return sqlite.SQLITE_DENY; }
+    return sqlite.SQLITE_OK;
+  });
+  try {
+    for (const id of [parentId, childId]) {
+      const result = await client.callTool({ name: 'get_task', arguments: { task_id: id } });
+      if (readUnavailable && result.isError) { assert.equal(result.structuredContent, undefined); continue; }
+      assert.notEqual(result.isError, true);
+      const view = result.structuredContent, review = view.correction.review;
+      assert.equal(review.overall, overall, `Historical review for ${id}: ${JSON.stringify(review)}`);
+      assert.equal(review.qualified, overall !== null); assert.equal(review.evidence, overall === null ? 'unavailable' : 'retained');
+      assert.equal(review.execution_authorized, false); assert.equal(review.publication_authorized, false);
+      assert.equal(view.correction.execution_authorized, false);
+      if (!readUnavailable) assert.equal(view.correction.codex_turns_attempted, 4);
+      if (publicationUncertain) {
+        assert.notEqual(view.correction.publication?.confirmed, true);
+        if (view.correction.publication) { assert.equal(view.correction.publication.uncertain, true); assert.equal(view.correction.publication.execution_authorized, false); }
+        assert.equal(view.automatic.status, 'uncertain');
+      }
+    }
+    assert.equal(authorizations, 2); assert.equal(writes, 0); c.db.setAuthorizer(null); assert.equal(ledger(), before);
+    if (readUnavailable) assert(readFailures > 0);
+    assert.equal(await publicationFiles(c.workspaceRoot), files); assert.equal(await publicationFiles(c.task(childId).repository.canonical_path), source);
+    assert.deepEqual(c.publisher.calls, calls);
+  } finally { c.db.setAuthorizer(null); await client.close(); await server.close(); }
+}
+
+test('historical corrective review remains fail closed on missing or conflicting proof after publication failure', async context => {
+  let hits = 0;
+  const value = await correctiveWorkflow(context, { configure(c) {
+    c.db.function('publication_fault', () => ++hits === 1 ? 1 : 0);
+    c.db.exec(`CREATE TEMP TRIGGER publication_fault_trigger BEFORE INSERT ON tasks
+      WHEN json_extract(NEW.value,'$.publication.phase')='prepared' AND publication_fault()
+      BEGIN SELECT RAISE(ABORT, 'Injected publication failure'); END;`);
+  } });
+  const { c, id, child } = value; c.db.exec('DROP TRIGGER publication_fault_trigger'); assert(hits > 0);
+  await historicalStatus(c, id, child.id, 'PASS', true);
+  const evidence = await retainedReviewEvidence(c, id, child.id), calls = [...value.localCalls];
+  for (const fault of ['missing review', 'result hash', 'reviewed tree', 'lineage', 'contract binding', 'reviewer identity', 'validation']) {
+    await context.test(fault, async () => {
+      const task = c.task(fault === 'contract binding' ? id : child.id), original = JSON.stringify(task);
+      if (fault === 'missing review') task.reviewer.review_result = null;
+      if (fault === 'result hash') task.reviewer.findings_sha256 = '0'.repeat(64);
+      if (fault === 'reviewed tree') task.reviewer.reviewed_git_state.tree_sha = '0'.repeat(40);
+      if (fault === 'lineage') task.correction.findings_sha256 = '0'.repeat(64);
+      if (fault === 'contract binding') task.automatic.contract_binding.contract.goal = 'Changed original authority';
+      if (fault === 'reviewer identity') task.reviewer.local.thread_id = task.implementer.local.thread_id;
+      if (fault === 'validation') task.local_validation.results = [];
+      c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+      try { await historicalStatus(c, id, child.id, null, true); }
+      finally { c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(original, task.id); }
+    });
+  }
+  for (const taskId of [id, child.id]) await context.test(taskId === id ? 'original packet' : 'fourth packet', async () => {
+    const task = c.task(taskId), file = path.join(c.workspaceRoot, taskId, task.reviewer.packet_directory, 'evidence.json');
+    const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777;
+    await fs.chmod(file, 0o600); await fs.writeFile(file, '{}'); await fs.chmod(file, mode);
+    try { await historicalStatus(c, id, child.id, null, true); }
+    finally { await fs.chmod(file, 0o600); await fs.writeFile(file, bytes); await fs.chmod(file, mode); }
+  });
+  for (const kind of ['review_result', 'review_packet', 'corrective_execution']) await context.test(`missing retained ${kind}`, async () => {
+    const rows = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? AND json_extract(value,\'$.kind\')=?').all(child.id, kind);
+    assert(rows.length > 0);
+    c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=? AND json_extract(value,\'$.kind\')=?').run(child.id, kind);
+    try { await historicalStatus(c, id, child.id, null, true); }
+    finally { for (const row of rows) c.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?)').run(row.task_id, row.attempt_id, row.observation_sha256, row.value); }
+  });
+  await context.test('storage reads unavailable', () => historicalStatus(c, id, child.id, null, true, true));
+  await context.test('missing corrected Git tree', async () => {
+    const tree = child.reviewer.reviewed_git_state.tree_sha, file = path.join(c.workspaceRoot, child.id, 'git-store/objects', tree.slice(0, 2), tree.slice(2));
+    const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777; await fs.rm(file);
+    try { await historicalStatus(c, id, child.id, null, true); await assert.rejects(fs.stat(file), { code: 'ENOENT' }); }
+    finally { await fs.writeFile(file, bytes, { mode }); }
+  });
+  await context.test('later expiry does not erase historical qualification or renew authority', async () => {
+    const now = Date.now; Date.now = () => evidence.deadline + 1;
+    try { await historicalStatus(c, id, child.id, 'PASS', true); }
+    finally { Date.now = now; }
+    assert.equal(c.task(id).deadline, evidence.deadline);
+  });
+  await historicalStatus(c, id, child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(c, id, child.id, evidence.rows), evidence);
+  assert.deepEqual(value.localCalls, calls); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  await c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: c.workspaceRoot, api: value.api,
+    executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Historical verification cannot replay models') }).init();
+  context.after(() => restarted.close());
+  await historicalStatus(restarted, id, child.id, 'PASS', true);
+  await context.test('packet integrity after restart', async () => {
+    const packet = path.join(c.workspaceRoot, child.id, child.reviewer.packet_directory, 'evidence.json'), bytes = await fs.readFile(packet);
+    await fs.chmod(packet, 0o600); await fs.writeFile(packet, '{}'); await fs.chmod(packet, 0o400);
+    try { await historicalStatus(restarted, id, child.id, null, true); }
+    finally { await fs.chmod(packet, 0o600); await fs.writeFile(packet, bytes); await fs.chmod(packet, 0o400); }
+  });
+  await historicalStatus(restarted, id, child.id, 'PASS', true);
+  await context.test('changed corrected worktree after restart', async () => {
+    await fs.writeFile(path.join(c.workspaceRoot, child.id, 'repo/one.txt'), 'Changed after qualified review\n');
+    await historicalStatus(restarted, id, child.id, null, true);
+  });
+  await restarted.start(value.startInput); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.deepEqual(value.localCalls, calls); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+});
+
+test('retained corrective FAIL remains qualified after later attention and Controller restart', async context => {
+  const value = await correctiveWorkflow(context, { correctiveVerdict: 'FAIL' }), { c, id, child } = value;
+  await historicalStatus(c, id, child.id, 'FAIL');
+  c.persistenceFailures.add(id); c.persistenceFailures.add(child.id); c.persistenceAttention(id); c.persistenceAttention(child.id);
+  await historicalStatus(c, id, child.id, 'FAIL', true);
+  await c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: c.workspaceRoot, api: value.api,
+    executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Historical FAIL cannot replay models') }).init();
+  context.after(() => restarted.close());
+  await historicalStatus(restarted, id, child.id, 'FAIL', true);
+  assert.equal(value.localCalls.length, 4); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+});
 
 for (const uncertain of [false, true]) test(`corrective publication parent and child MCP status are observational; uncertain=${uncertain}`, async context => {
   const value = await correctiveWorkflow(context, uncertain ? { publisher(p) { p.losePRResponse = true; } } : {}), { c, parent, child } = value;

@@ -698,7 +698,7 @@ export class Controller {
     return { ...validateLocalActionabilityReview(output, contract, packet, this.bounded.bind(this), context),
       review_output: output, controller_context: context, controller_binding: this.reviewBinding(task) };
   }
-  revalidateVersionedReview(task, packet, result = task.reviewer.review_result, sha = task.reviewer.findings_sha256, pending = false) {
+  verifyVersionedReviewBinding(task, packet, result, sha, pending) {
     const received = task.reviewer.received_review_output;
     if (received && (digest(received) !== task.reviewer.received_output_sha256 || digest(received.output) !== received.output_sha256 ||
         received.output !== result?.review_output)) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
@@ -714,11 +714,79 @@ export class Controller {
       if (!retained.some(row => { const record = JSON.parse(row.value); return digest(record) === row.observation_sha256 &&
         record.findings_sha256 === sha && digest(record.review_result) === sha; })) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
     }
+  }
+  revalidateVersionedReview(task, packet, result = task.reviewer.review_result, sha = task.reviewer.findings_sha256, pending = false) {
+    this.verifyVersionedReviewBinding(task, packet, result, sha, pending);
     const current = this.validateReviewOutput(task, result.review_output, task.automatic.contract_binding.contract, packet);
     for (const key of ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']) {
       if (digest(current[key]) !== digest(result[key])) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
     }
     return current;
+  }
+  async retainedCorrectiveReview(task) {
+    // Historical proof is read-only. It is never used by an execution guard.
+    this.storageAuthority();
+    const parent = this.correctiveReviewAuthority(task);
+    const records = value => this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(value.id).map(row => {
+      const record = JSON.parse(row.value);
+      if (digest(record) !== row.observation_sha256 || record.task_id !== value.id || record.baseline_commit !== value.baseline) throw new BridgeError('AUTOMATIC_RETAINED_EVIDENCE_INVALID');
+      return record;
+    });
+    const history = records(task), original = records(parent);
+    const operation = (id, taskId, fingerprint) => {
+      const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id);
+      if (row?.task_id !== taskId || row.status !== 'accepted' || row.fingerprint !== fingerprint) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+    };
+    operation(parent.request_id, parent.id, parent.automatic.review_authorization.request_fingerprint);
+    operation(task.request_id, task.id, digest({ kind: 'correction', payload: task.correction }));
+    const proof = history.find(record => record.kind === 'corrective_execution' && record.attempt_id === task.request_id &&
+      record.state === 'awaiting_review' && record.review?.phase === 'validation_and_review' && record.review.status === 'progressing' &&
+      record.review.reviewer?.state === 'completed' && record.review.reviewer.evidence_retention?.review === 'retained' &&
+      digest(record.review.reviewer.review_result) === task.reviewer.findings_sha256);
+    if (!proof || digest(proof.correction) !== digest(task.correction) || proof.deadline !== task.deadline ||
+        digest(proof.repository) !== digest(task.repository) || digest(proof.review.authorization) !== digest(task.automatic.review_authorization) ||
+        digest(proof.review.validation) !== digest(task.local_validation)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+    const roleEvidence = role => {
+      const { stopping, local, ...rest } = role;
+      const { human_attention_required, ...execution } = local;
+      return { ...rest, local: execution };
+    };
+    for (const [current, retained] of [[task.implementer, proof.implementer], [task.reviewer, proof.review.reviewer]]) {
+      if (digest(roleEvidence(current)) !== digest(roleEvidence(retained)) || retained.state !== 'completed' || retained.error || retained.stale ||
+          retained.stopping || !localExecutionQualified(retained.local) || retained.local.owner_instance !== task.automatic.owner_instance ||
+          retained.local.human_requests.some(request => request.status !== 'resolved')) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+    }
+    this.correctiveReviewerIdentity(task, { threadId: proof.review.reviewer.local.thread_id, turnId: proof.review.reviewer.local.turn_id, model: proof.review.reviewer.local.model });
+    const assess = (value, retained, packet) => {
+      const ref = value.reviewer, result = ref.review_result, binding = value.automatic.contract_binding;
+      this.verifyVersionedReviewBinding(value, packet, result, ref.findings_sha256, false);
+      operation(ref.request_id, value.id, digest({ kind: 'review', payload: { id: value.id } }));
+      const review = retained.find(record => record.kind === 'review_result' && record.attempt_id === ref.request_id &&
+        record.findings_sha256 === ref.findings_sha256 && digest(record.review_result) === ref.findings_sha256 &&
+        record.received_output_sha256 === ref.received_output_sha256 && digest(record.received_review_output) === ref.received_output_sha256);
+      if (!review || !ref.received_review_output || digest(review.original_contract) !== digest(binding) || digest(review.limits) !== digest(value.automatic.authorization) ||
+          review.deadline !== value.deadline || digest(review.review_authorization) !== digest(value.automatic.review_authorization) ||
+          digest(review.independent_validation) !== digest(value.local_validation) || digest(review.reviewed_git_state) !== digest(ref.reviewed_git_state) ||
+          !retained.some(record => record.attempt_id === ref.request_id && typeof record.packet_utf8 === 'string' &&
+            digest(record.packet_utf8) === ref.packet_hash && Buffer.byteLength(record.packet_utf8) === ref.packet_bytes && digest(JSON.parse(record.packet_utf8)) === digest(packet)) ||
+          !independentValidationPassed(value.local_validation, binding.contract.test_commands, ref.reviewed_git_state, value.id) ||
+          digest(packet.independent_validation) !== digest(value.local_validation) ||
+          Object.keys(result.controller_context || {}).sort().join() !== 'authorityValid,executionQualified,reviewerIndependent,uncertaintyFree' ||
+          !Object.values(result.controller_context).every(confirmed => confirmed === true)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      this.verifyReceivedReview(value, ref.received_review_output, ref.received_output_sha256, packet);
+      const assessed = validateLocalActionabilityReview(result.review_output, binding.contract, packet, this.bounded.bind(this), result.controller_context);
+      for (const key of ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']) {
+        if (digest(assessed[key]) !== digest(result[key])) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
+      }
+      return assessed;
+    };
+    const previous = assess(parent, original, await this.currentReviewPacket(parent));
+    if (previous.overall !== 'FAIL' || !previous.actionability_qualification.potentially_correctable ||
+        task.correction.rejected_tree_sha !== parent.reviewer.reviewed_git_state.tree_sha || task.correction.packet_sha256 !== parent.reviewer.packet_hash ||
+        task.correction.findings_sha256 !== parent.reviewer.findings_sha256 || task.correction.validation_sha256 !== digest(parent.local_validation) ||
+        task.correction.contract_sha256 !== parent.automatic.contract_binding.sha256 || task.correction.authorization_sha256 !== digest(parent.automatic.authorization)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+    const review = assess(task, history, await this.currentReviewPacket(task));
+    return { overall: review.overall };
   }
   async automaticReviewSummary(task) {
     const summary = { protocol: task.automatic.authorization.review_protocol === undefined ? 'pab.local-review.v2' : LOCAL_ACTIONABILITY_REVIEW_VERSION,
@@ -775,20 +843,14 @@ export class Controller {
     try {
       this.storageAuthority();
       const parent = this.correctiveReviewAuthority(task);
-      this.verifyCorrectionEvidence(task);
-      if ((summary.uncertain && !task.automatic.corrective_publication) || this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
       if (!ref?.review_result) {
+        this.verifyCorrectionEvidence(task);
+        if (summary.uncertain || this.persistenceFailures.has(task.id) || this.persistenceFailures.has(parent.id)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
         if (ref?.error || task.automatic.status !== 'progressing' || ref?.pending_review_output || ref?.pending_review_result) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
         return summary;
       }
-      this.verifyAutomaticEvidence(task, { progressing: true });
-      const packet = await this.currentReviewPacket(task);
-      await this.currentReviewPacket(parent);
-      const review = this.revalidateVersionedReview(task, packet);
-      if (ref.state !== 'completed' || !localExecutionQualified(ref.local) || !Object.values(ref.review_result.controller_context || {}).every(value => value === true) ||
-          Object.keys(ref.review_result.controller_context || {}).length !== 4) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
-      summary.validation.qualified = independentValidationPassed(validation, task.automatic.contract_binding.contract.test_commands, ref.reviewed_git_state, task.id);
-      if (!summary.validation.qualified) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      const review = await this.retainedCorrectiveReview(task);
+      summary.validation.qualified = true;
       Object.assign(summary, { state: 'reviewed', overall: review.overall, qualified: true, evidence: 'retained', uncertain: false });
     } catch {
       Object.assign(summary, { state: 'malformed_or_uncertain', overall: null, qualified: false, evidence: 'unavailable', uncertain: true, reason: 'REVIEW_EVIDENCE_UNVERIFIED' });
