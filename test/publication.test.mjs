@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { DatabaseSync, constants as sqlite } from 'node:sqlite';
 import { Controller, digest, contractMarkdown } from '../controller.mjs';
 import { GitHubPublisher, publicationGit, publicationState, githubRepository } from '../publication.mjs';
 import { repoGit, asynchronousRepoGit, repositoryIdentity } from '../repositories.mjs';
@@ -16,13 +17,14 @@ import { validateLocalReview, localScopeQualification, localContractBinding, LOC
 import { createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 class LocalPublisher extends GitHubPublisher {
-  constructor(remote) { super(); this.remote = remote; this.pushes = 0; this.creates = 0; this.base = 'main'; }
+  constructor(remote) { super(); this.remote = remote; this.pushes = 0; this.creates = 0; this.base = 'main'; this.calls = []; }
   api() { throw Error('REAL GITHUB CALL FORBIDDEN IN TESTS'); }
-  async target() { return { repository: 'fixture/isolated-publication', base: this.base, remote: this.remote }; }
-  async push(...args) { this.pushes++; await this.beforePush?.(...args); return super.push(...args); }
-  async findPR() { return this.pr || null; }
+  async target() { this.calls.push('target'); return { repository: 'fixture/isolated-publication', base: this.base, remote: this.remote }; }
+  async remoteHead(...args) { this.calls.push('remoteHead'); return super.remoteHead(...args); }
+  async push(...args) { this.calls.push('push'); this.pushes++; await this.beforePush?.(...args); return super.push(...args); }
+  async findPR() { this.calls.push('findPR'); return this.pr || null; }
   async createPR(target, branch, input) {
-    this.creates++; assert.equal(input.draft, true);
+    this.calls.push('createPR'); this.creates++; this.input = structuredClone(input); assert.equal(input.draft, true);
     this.pr = { number: 7, html_url: `https://github.com/${target.repository}/pull/7`, state: 'open', draft: true, merged_at: null,
       head: { ref: branch, sha: repoGit(this.remote, 'rev-parse', `refs/heads/${branch}`).trim(), repo: { full_name: target.repository } },
       base: { ref: target.base, repo: { full_name: target.repository } } };
@@ -35,40 +37,46 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   const normal = path.join(root, 'normal'), remote = path.join(root, 'remote.git');
   await fs.mkdir(normal); await fs.mkdir(remote);
   repoGit(normal, 'init', '--initial-branch=main'); repoGit(remote, 'init', '--bare', '--initial-branch=main');
-  for (const name of ['keep.txt', 'delete.txt', 'rename.txt', 'run.sh']) await fs.writeFile(path.join(normal, name), `${name}\n`);
+  for (const name of automaticMode?.corrective ? ['one.txt'] : ['keep.txt', 'delete.txt', 'rename.txt', 'run.sh']) await fs.writeFile(path.join(normal, name), `${name}\n`);
   repoGit(normal, 'add', '.'); repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
   repoGit(normal, 'remote', 'add', 'origin', remote); repoGit(normal, 'push', 'origin', 'HEAD:refs/heads/main');
   const baseline = repoGit(normal, 'rev-parse', 'HEAD').trim();
   const api = new FakeAPI(), executor = new FakeExecutor(), publisher = new LocalPublisher(remote), localCalls = [], localPrompts = [];
+  let implementations = 0, reviews = 0;
   if (automaticMode?.publisher) automaticMode.publisher(publisher);
   const c = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'tasks'), api, executor, publisher, secrets: [],
     ...(local ? { localBackendFactory: options => ({
       async run(input) {
-        localCalls.push(options.reviewOnly ? 'reviewer' : 'implementer');
+        const corrective = !options.reviewOnly && implementations++ > 0, correctiveReview = options.reviewOnly && reviews++ > 0;
+        localCalls.push(correctiveReview ? 'corrective-reviewer' : options.reviewOnly ? 'reviewer' : corrective ? 'corrector' : 'implementer');
         if (options.reviewOnly) localPrompts.push(input.prompt);
-        const identity = { model: 'fixture-model', threadId: options.reviewOnly ? 'independent-reviewer' : 'implementer-thread', turnId: 'fixture-turn',
+        const identity = { model: 'fixture-model', threadId: correctiveReview ? 'corrective-reviewer' : options.reviewOnly ? 'independent-reviewer' : corrective ? 'corrective-implementer' : 'implementer-thread', turnId: automaticMode?.corrective ? `turn-${localCalls.length}` : 'fixture-turn',
           turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
+        if (automaticMode?.corrective) {
+          options.onLifecycle({ ...identity, phase: 'thread_acknowledged', turnSubmissionAttempted: false, turnSubmissionAcknowledged: false, terminalObserved: false });
+          options.onLifecycle({ ...identity, phase: 'turn_submitting', turnSubmissionAcknowledged: false, terminalObserved: false });
+        }
         options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
         if (automaticMode) {
           automaticMode.onOptions?.(options);
           if (!options.reviewOnly) {
             const item = { id: 'automatic-write', type: 'commandExecution', command: "printf 'exact\\n' > one.txt", cwd: options.cwd };
             options.onProgress({ method: 'item/started', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'inProgress' } } });
-            await fs.writeFile(path.join(options.cwd, 'one.txt'), 'exact\n');
+            await fs.writeFile(path.join(options.cwd, 'one.txt'), corrective ? 'corrected\n' : 'exact\n');
             options.onProgress({ method: 'item/completed', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'completed', exitCode: 0 } } });
             await automaticMode.implementation?.(options, identity, input);
           } else await automaticMode.review?.(options, identity, input);
         }
         options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
-        const overall = automaticMode?.verdict || 'PASS';
+        const overall = automaticMode?.corrective ? correctiveReview ? automaticMode.correctiveVerdict || 'PASS' : automaticMode.originalPass ? 'PASS' : 'FAIL' : automaticMode?.verdict || 'PASS';
         const findings = ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: automaticMode?.versioned && id !== 'R1' ? 'PASS' : overall,
           evidence: 'Synthetic independent reviewer assessment.' }));
         const output = automaticMode?.versioned ? { format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall, findings: findings.map(finding => ({ ...finding,
           classification: finding.status === 'PASS' ? null : { kind: 'implementation_defect', target_files: ['one.txt'],
             remedy: { kind: 'edit_files', description: 'Correct the content of one.txt.', requires_human_approval: false } } })) } : { overall, findings };
-        return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: [], commands: [],
+        return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: correctiveReview && automaticMode?.correctiveUncertain ? ['UNKNOWN_REVIEW_EXECUTION'] : [], commands: [],
           ...(!options.reviewOnly ? automaticMode?.result : {}),
-          messages: options.reviewOnly ? [{ provenance: 'model', text: automaticMode?.reviewOutput || JSON.stringify(output) }] : [] };
+          messages: options.reviewOnly ? [{ provenance: 'model', text: correctiveReview && automaticMode?.correctiveOutput !== undefined ? automaticMode.correctiveOutput : automaticMode?.reviewOutput || JSON.stringify(output) }] : [] };
       }, async cancel() {}, async close() { return !(automaticMode?.closeFailure === (options.reviewOnly ? 'reviewer' : 'implementer')); },
     }) } : {}) }).init();
   t.after(async () => { await c.close(); await fs.rm(root, { recursive: true, force: true }); });
@@ -76,6 +84,8 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   const contract = { goal: 'Local publication fixture', allowed_files: allowed, requirements: [{ id: 'R1', text: 'Make the exact fixture change.' }], invariants: [], test_commands: commands, initial_files: {} };
   const automatic = { publish: { title: 'Automatic isolated fixture', body: 'Explicit test authorization', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 };
   if (automaticMode?.versioned) automatic.review_protocol = LOCAL_ACTIONABILITY_REVIEW_VERSION;
+  if (automaticMode?.corrective) Object.assign(automatic, { max_codex_turns: 4, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION });
+  if (automaticMode?.publishCorrection) automatic.publish_after_correction = true;
   const startInput = { request_id: 'start_publication', repository_id: 'fixture', contract, ...(local ? { execution_backend: 'local_codex' } : {}), ...(automaticMode ? { automatic } : {}) };
   automaticMode?.configure?.(c, startInput);
   const started = await c.start(startInput); await Promise.all([...c.jobs.values()]);
@@ -95,6 +105,438 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   const input = { task_id: id, title: 'Publish isolated fixture' };
   return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls, localPrompts };
 }
+
+test('authorized corrective publication uses the exact fourth-reviewed tree and original baseline once', async context => {
+  const value = await setup(context, ['one.txt'], true, ['cat one.txt'], { versioned: true, corrective: true, publishCorrection: true });
+  const parent = await automaticSettled(value), child = value.c.task(parent.automatic.correction.task_id);
+  assert.equal(parent.automatic.status, 'succeeded', JSON.stringify({ parent: parent.automatic, child: child.automatic, error: child.publication_error }));
+  assert.equal(child.automatic.status, 'succeeded');
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer', 'corrector', 'corrective-reviewer']);
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1);
+  const p = child.publication;
+  assert.equal(repoGit(value.remote, 'rev-parse', `${p.commit_sha}^{tree}`).trim(), child.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(repoGit(value.remote, 'rev-parse', `${p.commit_sha}^`).trim(), value.baseline);
+  assert.equal(repoGit(value.remote, 'show', `${p.commit_sha}:one.txt`), 'corrected\n');
+  assert.notEqual(p.reviewed_tree_sha, parent.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(parent.reviewer.review_result.overall, 'FAIL'); assert.equal(child.reviewer.review_result.overall, 'PASS');
+  assert.equal(child.local_validation.results[0].stdout.text, 'corrected\n');
+  assert.equal(child.deadline, parent.deadline);
+  assert.equal(await fs.readFile(path.join(value.work, 'one.txt'), 'utf8'), 'exact\n');
+  const originalPacket = await fs.readFile(path.join(value.c.workspaceRoot, parent.id, parent.reviewer.packet_directory, 'evidence.json'), 'utf8');
+  assert(value.c.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=?').all(parent.id).some(row => JSON.parse(row.value).packet_utf8 === originalPacket));
+  assert.equal(value.publisher.input.title, parent.automatic.authorization.publish.title);
+  assert.equal(value.publisher.input.body, parent.automatic.authorization.publish.body);
+  for (const id of [parent.id, child.id]) {
+    const status = await value.c.get(id);
+    assert.equal(status.publication.pr_url, p.pr_url);
+    assert.equal(status.correction.publication.confirmed, true);
+    assert.equal(status.correction.review.qualified, true); assert.equal(status.correction.review.overall, 'PASS');
+    assert.equal(status.correction.codex_turns_attempted, 4);
+  }
+  await assert.rejects(value.c.publish({ task_id: child.id, title: 'Public denial' }), /CORRECTIVE_PUBLICATION_NOT_AUTHORIZED/);
+  await value.c.start(value.startInput); value.c.scheduleAutomatic(parent.id); await Promise.all([...value.c.automaticJobs.values()]);
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1); assert.equal(value.localCalls.length, 4);
+});
+
+async function correctiveWorkflow(context, mode = {}) {
+  const value = await setup(context, ['one.txt'], true, ['cat one.txt'], { versioned: true, corrective: true, publishCorrection: true, ...mode,
+    configure(c, input) {
+      if (mode.beforePublication) {
+        const run = c.runCorrectivePublication.bind(c);
+        c.runCorrectivePublication = async (parent, child) => { await mode.beforePublication(c, parent, child); return run(parent, child); };
+      }
+      mode.configure?.(c, input);
+    } });
+  const parent = await automaticSettled(value);
+  return { ...value, parent, child: parent.automatic.correction ? value.c.task(parent.automatic.correction.task_id) : null };
+}
+
+for (const mode of [{ label: 'omitted opt-in', publishCorrection: false }, { label: 'corrective FAIL', correctiveVerdict: 'FAIL' },
+  { label: 'malformed', correctiveOutput: '{}' }, { label: 'wrong version', correctiveOutput: '{"overall":"PASS","findings":[]}' },
+  { label: 'contradictory PASS', correctiveOutput: JSON.stringify({ format: LOCAL_ACTIONABILITY_REVIEW_VERSION, overall: 'PASS', findings: [
+    { id: 'R1', status: 'FAIL', evidence: 'Concrete file defect.', classification: { kind: 'implementation_defect', target_files: ['one.txt'], remedy: { kind: 'edit_files', description: 'Restore the required content.', requires_human_approval: false } } },
+    ...['SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Qualified evidence.', classification: null })) ] }) },
+  { label: 'missing output', correctiveOutput: '' }, { label: 'uncertain', correctiveUncertain: true }])
+test(`corrective publication denies ${mode.label} without a push or another native turn`, async context => {
+  const value = await correctiveWorkflow(context, mode);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0); assert.equal(value.localCalls.length, 4);
+  assert.notEqual(value.parent.automatic.status, 'succeeded');
+  if (mode.correctiveVerdict === 'FAIL') assert.equal(value.child.reviewer.review_result.overall, 'FAIL');
+  if (mode.publishCorrection === false) assert.equal(value.parent.automatic.reason, 'CORRECTIVE_REVIEW_RETAINED');
+});
+
+test('corrective publication opt-in preserves original PASS publication with no corrective task', async context => {
+  const value = await correctiveWorkflow(context, { originalPass: true });
+  assert.equal(value.parent.automatic.status, 'succeeded'); assert.equal(value.child, null);
+  assert.deepEqual(value.localCalls, ['implementer', 'reviewer']); assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1);
+  assert.equal(repoGit(value.remote, 'rev-parse', `${value.parent.publication.commit_sha}^{tree}`).trim(), value.parent.reviewer.reviewed_git_state.tree_sha);
+});
+
+for (const mutation of ['authorization', 'contract', 'original contract', 'deadline', 'original deadline', 'original packet', 'corrected packet',
+  'original tree object', 'corrected tree object', 'corrected worktree', 'normal checkout', 'registry', 'reviewer identity', 'validation'])
+test(`corrective publication revalidates ${mutation} before any publisher operation`, async context => {
+  let targets = 0, restore;
+  const value = await correctiveWorkflow(context, { publisher(p) { const target = p.target.bind(p); p.target = (...args) => { targets++; return target(...args); }; },
+    async beforePublication(c, parentId, childId) {
+      const parent = c.task(parentId), child = c.task(childId), root = path.join(c.workspaceRoot, childId);
+      if (mutation === 'contract') await fs.writeFile(path.join(root, 'contract.json'), '{}');
+      else if (mutation === 'original contract') await fs.writeFile(path.join(c.workspaceRoot, parent.id, 'contract.json'), '{}');
+      else if (mutation.endsWith('packet')) {
+        const task = mutation === 'original packet' ? parent : child, file = path.join(c.workspaceRoot, task.id, task.reviewer.packet_directory, 'evidence.json');
+        await fs.chmod(file, 0o600); await fs.appendFile(file, '\n');
+      } else if (mutation.endsWith('tree object')) {
+        const task = mutation === 'original tree object' ? parent : child, tree = task.reviewer.reviewed_git_state.tree_sha;
+        await fs.rm(path.join(c.workspaceRoot, task.id, 'git-store/objects', tree.slice(0, 2), tree.slice(2)));
+      } else if (mutation === 'corrected worktree') await fs.writeFile(path.join(root, 'repo/one.txt'), 'changed\n');
+      else if (mutation === 'normal checkout') await fs.writeFile(path.join(child.repository.canonical_path, 'one.txt'), 'owner change\n');
+      else if (mutation === 'registry') await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: {} }));
+      else {
+        const task = ['authorization', 'original deadline'].includes(mutation) ? parent : child;
+        const original = JSON.stringify(task); restore = () => c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(original, task.id);
+        if (mutation === 'authorization') task.automatic.authorization.publish_after_correction = false;
+        if (mutation.endsWith('deadline')) task.deadline += 1;
+        if (mutation === 'reviewer identity') task.reviewer.local.thread_id = parent.reviewer.local.thread_id;
+        if (mutation === 'validation') task.local_validation.results[0].completion_observed = false;
+        c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+      }
+    } });
+  try {
+    assert.equal(targets, 0); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+    assert.equal(value.localCalls.length, 4); assert.notEqual(value.parent.automatic.status, 'succeeded');
+  } finally { restore?.(); }
+});
+
+for (const lost of ['push', 'PR']) test(`corrective publication lost ${lost} acknowledgment remains uncertain without repeated GitHub writes across restart`, async context => {
+  const value = await correctiveWorkflow(context, { publisher(p) {
+    if (lost === 'push') { const push = p.push.bind(p); p.push = async (...args) => { await push(...args); throw Error('Lost push acknowledgment'); }; }
+    else p.losePRResponse = true;
+  } });
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, lost === 'PR' ? 1 : 0);
+  assert.equal(value.parent.automatic.status, 'uncertain');
+  const status = await value.c.get(value.id);
+  assert.equal(status.correction.publication.confirmed, false); assert.equal(status.correction.publication.uncertain, true);
+  assert.equal(status.correction.publication.push_attempted, true); assert.equal(status.correction.review.overall, 'PASS');
+  assert.equal(repoGit(value.remote, 'rev-parse', `${value.child.publication.commit_sha}^{tree}`).trim(), value.child.reviewer.reviewed_git_state.tree_sha);
+  await value.c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: path.join(value.root, 'tasks'),
+    api: value.api, executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Model replay forbidden') }).init();
+  context.after(() => restarted.close());
+  await restarted.start(value.startInput); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.equal((await restarted.get(value.id)).correction.publication.confirmed, false);
+  await assert.rejects(restarted.runCorrectivePublication(value.id, value.child.id));
+  await assert.rejects(restarted.publish({ task_id: value.child.id, title: 'Public retry' }), /CORRECTIVE_PUBLICATION_NOT_AUTHORIZED/);
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, lost === 'PR' ? 1 : 0); assert.equal(value.localCalls.length, 4);
+});
+
+for (const point of ['before reservation', 'after push']) test(`corrective publication expiry ${point} preserves the deadline and stops continuation`, async context => {
+  const now = Date.now; let c, deadline;
+  try {
+    const value = await correctiveWorkflow(context, { configure(controller) { c = controller; },
+      beforePublication(controller, parentId) { deadline = controller.task(parentId).deadline; if (point === 'before reservation') Date.now = () => deadline + 1; },
+      publisher(p) { const push = p.push.bind(p); p.push = async (...args) => { await push(...args); if (point === 'after push') Date.now = () => deadline + 1; }; } });
+    assert.equal(value.publisher.pushes, point === 'after push' ? 1 : 0); assert.equal(value.publisher.creates, 0);
+    assert.equal(c.task(value.id).deadline, deadline); assert.equal(value.localCalls.length, 4);
+    assert.notEqual(value.parent.automatic.status, 'succeeded');
+    if (point === 'after push') assert.equal((await c.get(value.id)).correction.publication.uncertain, true);
+  } finally { Date.now = now; }
+});
+
+for (const effect of ['ABORT', 'IGNORE']) for (const boundary of ['operation', 'parent reservation', 'child reservation', 'history', 'prepared', 'push intent', 'PR intent', 'completion', 'acceptance', 'parent result'])
+test(`corrective publication SQLite ${effect} at ${boundary} cannot fabricate authority or completion`, async context => {
+  let hits = 0, evidence;
+  const value = await correctiveWorkflow(context, { async beforePublication(c, parentId, childId) {
+    await historicalStatus(c, parentId, childId, 'PASS');
+    evidence = await retainedReviewEvidence(c, parentId, childId);
+  }, configure(c) {
+    c.db.function('publication_fault', () => ++hits === 1 ? 1 : 0);
+    let table = 'tasks', event = 'INSERT', condition = "json_extract(NEW.value,'$.automatic.corrective_publication.operation_id') IS NOT NULL";
+    if (boundary === 'operation' || boundary === 'acceptance') {
+      table = 'operations'; event = boundary === 'operation' ? 'INSERT' : 'UPDATE';
+      condition = "NEW.id GLOB 'automatic_publish_*'" + (boundary === 'acceptance' ? " AND NEW.status='accepted'" : '');
+    } else if (boundary === 'history') {
+      table = 'automatic_attempts'; condition = "json_extract(NEW.value,'$.publication.authorization.operation_id') IS NOT NULL AND json_extract(NEW.value,'$.kind')='corrective_execution'";
+    } else {
+      const predicates = { 'parent reservation': "json_extract(NEW.value,'$.correction') IS NULL AND json_extract(NEW.value,'$.automatic.status')='progressing'",
+        'child reservation': "json_extract(NEW.value,'$.correction') IS NOT NULL AND json_extract(NEW.value,'$.publication') IS NULL",
+        prepared: "json_extract(NEW.value,'$.publication.phase')='prepared' AND json_extract(NEW.value,'$.publication.push_attempted')=0",
+        'push intent': "json_extract(NEW.value,'$.publication.push_attempted')=1", 'PR intent': "json_extract(NEW.value,'$.publication.pr_attempted')=1",
+        completion: "json_extract(NEW.value,'$.publication.phase')='complete'",
+        'parent result': "json_extract(NEW.value,'$.automatic.corrective_publication_result.pr_number') IS NOT NULL" };
+      condition += ` AND (${predicates[boundary]})`;
+    }
+    c.db.exec(`CREATE TEMP TRIGGER publication_fault_trigger BEFORE ${event} ON ${table} WHEN (${condition}) AND publication_fault() BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'Injected publication failure'" : ''}); END;`);
+  } });
+  assert(hits > 0); value.c.db.exec('DROP TRIGGER publication_fault_trigger');
+  assert.notEqual(value.parent.automatic.status, 'succeeded'); assert.equal(value.localCalls.length, 4);
+  assert(value.publisher.pushes <= 1); assert(value.publisher.creates <= 1);
+  if (['operation', 'parent reservation', 'child reservation', 'history', 'prepared', 'push intent'].includes(boundary)) assert.equal(value.publisher.pushes, 0);
+  assert.notEqual((await value.c.get(value.id)).correction.publication?.confirmed, true);
+  assert.equal(value.parent.reviewer.review_result.overall, 'FAIL'); assert(value.child.reviewer.review_result);
+  await historicalStatus(value.c, value.id, value.child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(value.c, value.id, value.child.id, evidence.rows), evidence);
+  const counts = [value.publisher.pushes, value.publisher.creates];
+  await value.c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: path.join(value.root, 'tasks'), api: value.api,
+    executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Publication failure must not replay models') }).init();
+  context.after(() => restarted.close());
+  await restarted.start(value.startInput); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.notEqual((await restarted.get(value.id)).correction.publication?.confirmed, true);
+  assert.deepEqual([value.publisher.pushes, value.publisher.creates], counts);
+  await historicalStatus(restarted, value.id, value.child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(restarted, value.id, value.child.id, evidence.rows), evidence);
+  assert.equal(value.localCalls.length, 4); assert.equal(restarted.task(value.id).deadline, evidence.deadline);
+});
+
+test('corrective publication duplicate dispatch cannot reserve or publish another draft', async context => {
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; }), held = new Promise(resolve => { release = resolve; });
+  const value = await setup(context, ['one.txt'], true, ['cat one.txt'], { versioned: true, corrective: true, publishCorrection: true,
+    publisher(p) { const target = p.target.bind(p); p.target = async (...args) => { entered(); await held; return target(...args); }; } });
+  await ready;
+  const parent = value.c.task(value.id), child = value.c.task(parent.automatic.correction.task_id);
+  try { await assert.rejects(value.c.runCorrectivePublication(parent.id, child.id), /AUTOMATIC_PUBLICATION_REPLAY_FORBIDDEN/); }
+  finally { release(); }
+  await automaticSettled(value);
+  await assert.rejects(value.c.runCorrectivePublication(parent.id, child.id));
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1); assert.equal(value.localCalls.length, 4);
+});
+
+test('corrective publication restart after a committed reservation requires attention without writes or replay', async context => {
+  let snapshot;
+  const value = await correctiveWorkflow(context, { configure(c) {
+    const save = c.save.bind(c);
+    c.save = (task, options) => {
+      save(task, options);
+      if (!snapshot && task.correction && task.automatic?.corrective_publication && !task.publication) {
+        snapshot = { child: structuredClone(task), parent: c.task(task.correction.parent_task_id) };
+        throw Error('Simulated process interruption after committed reservation');
+      }
+    };
+  } });
+  assert(snapshot); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  await value.c.close();
+  const db = new DatabaseSync(path.join(value.root, 'state/controller.sqlite'));
+  for (const task of [snapshot.parent, snapshot.child]) db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+  db.prepare('UPDATE operations SET status=? WHERE id=?').run('reserved', snapshot.child.automatic.publish_request_id); db.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: path.join(value.root, 'tasks'),
+    api: value.api, executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Reserved publication cannot replay models') }).init();
+  context.after(() => restarted.close());
+  await restarted.start(value.startInput); restarted.scheduleAutomatic(value.id); await Promise.all([...restarted.automaticJobs.values()]);
+  const status = await restarted.get(value.id);
+  assert.equal(status.correction.publication.confirmed, false); assert.equal(status.correction.publication.uncertain, true);
+  assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0); assert.equal(value.localCalls.length, 4);
+});
+
+async function publicationFiles(root) {
+  const files = [];
+  async function visit(directory) {
+    for (const name of (await fs.readdir(directory)).sort()) {
+      const file = path.join(directory, name), stat = await fs.lstat(file);
+      files.push([path.relative(root, file), stat.mode, stat.mtimeMs, stat.ctimeMs,
+        stat.isFile() ? digest((await fs.readFile(file)).toString('base64')) : stat.isSymbolicLink() ? await fs.readlink(file) : null]);
+      if (stat.isDirectory()) await visit(file);
+    }
+  }
+  await visit(root); return digest(files);
+}
+
+async function retainedReviewEvidence(c, parentId, childId, originalRows) {
+  const parent = c.task(parentId), child = c.task(childId);
+  const rows = c.db.prepare('SELECT task_id,attempt_id,observation_sha256,value FROM automatic_attempts WHERE task_id=? OR task_id=?').all(parentId, childId);
+  const selected = originalRows ? originalRows.map(prior => {
+    assert(rows.some(row => JSON.stringify(row) === JSON.stringify(prior)), 'A prior evidence observation disappeared'); return prior;
+  }) : rows;
+  return { deadline: parent.deadline, lineage: child.correction, tree: child.reviewer.reviewed_git_state.tree_sha,
+    original_packet: await fs.readFile(path.join(c.workspaceRoot, parentId, parent.reviewer.packet_directory, 'evidence.json'), 'utf8'),
+    packet: await fs.readFile(path.join(c.workspaceRoot, childId, child.reviewer.packet_directory, 'evidence.json'), 'utf8'),
+    findings: JSON.stringify(child.reviewer.review_result), validation: JSON.stringify(child.local_validation), rows: selected };
+}
+
+async function historicalStatus(c, parentId, childId, overall, publicationUncertain = false, readUnavailable = false) {
+  clearInterval(c.sweeper);
+  let authorizations = 0, writes = 0, readFailures = 0;
+  const server = createServer(c, async () => { authorizations++; }), client = new Client({ name: 'retained-review-status', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  const ledger = () => JSON.stringify(['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const before = ledger(), files = await publicationFiles(c.workspaceRoot), source = await publicationFiles(c.task(childId).repository.canonical_path);
+  const calls = [...c.publisher.calls], mutations = new Set([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE]);
+  c.db.setAuthorizer((action, table) => {
+    if (mutations.has(action)) { writes++; return sqlite.SQLITE_DENY; }
+    if (readUnavailable && action === sqlite.SQLITE_READ && table === 'automatic_attempts') { readFailures++; return sqlite.SQLITE_DENY; }
+    return sqlite.SQLITE_OK;
+  });
+  try {
+    for (const id of [parentId, childId]) {
+      const result = await client.callTool({ name: 'get_task', arguments: { task_id: id } });
+      if (readUnavailable && result.isError) { assert.equal(result.structuredContent, undefined); continue; }
+      assert.notEqual(result.isError, true);
+      const view = result.structuredContent, review = view.correction.review;
+      assert.equal(review.overall, overall, `Historical review for ${id}: ${JSON.stringify(review)}`);
+      assert.equal(review.qualified, overall !== null); assert.equal(review.evidence, overall === null ? 'unavailable' : 'retained');
+      assert.equal(review.execution_authorized, false); assert.equal(review.publication_authorized, false);
+      assert.equal(view.correction.execution_authorized, false);
+      if (!readUnavailable) assert.equal(view.correction.codex_turns_attempted, 4);
+      if (publicationUncertain) {
+        assert.notEqual(view.correction.publication?.confirmed, true);
+        if (view.correction.publication) { assert.equal(view.correction.publication.uncertain, true); assert.equal(view.correction.publication.execution_authorized, false); }
+        assert.equal(view.automatic.status, 'uncertain');
+      }
+    }
+    assert.equal(authorizations, 2); assert.equal(writes, 0); c.db.setAuthorizer(null); assert.equal(ledger(), before);
+    if (readUnavailable) assert(readFailures > 0);
+    assert.equal(await publicationFiles(c.workspaceRoot), files); assert.equal(await publicationFiles(c.task(childId).repository.canonical_path), source);
+    assert.deepEqual(c.publisher.calls, calls);
+  } finally { c.db.setAuthorizer(null); await client.close(); await server.close(); }
+}
+
+test('historical corrective review remains fail closed on missing or conflicting proof after publication failure', async context => {
+  let hits = 0;
+  const value = await correctiveWorkflow(context, { configure(c) {
+    c.db.function('publication_fault', () => ++hits === 1 ? 1 : 0);
+    c.db.exec(`CREATE TEMP TRIGGER publication_fault_trigger BEFORE INSERT ON tasks
+      WHEN json_extract(NEW.value,'$.publication.phase')='prepared' AND publication_fault()
+      BEGIN SELECT RAISE(ABORT, 'Injected publication failure'); END;`);
+  } });
+  const { c, id, child } = value; c.db.exec('DROP TRIGGER publication_fault_trigger'); assert(hits > 0);
+  await historicalStatus(c, id, child.id, 'PASS', true);
+  const evidence = await retainedReviewEvidence(c, id, child.id), calls = [...value.localCalls];
+  for (const fault of ['missing review', 'result hash', 'reviewed tree', 'lineage', 'contract binding', 'reviewer identity', 'validation']) {
+    await context.test(fault, async () => {
+      const task = c.task(fault === 'contract binding' ? id : child.id), original = JSON.stringify(task);
+      if (fault === 'missing review') task.reviewer.review_result = null;
+      if (fault === 'result hash') task.reviewer.findings_sha256 = '0'.repeat(64);
+      if (fault === 'reviewed tree') task.reviewer.reviewed_git_state.tree_sha = '0'.repeat(40);
+      if (fault === 'lineage') task.correction.findings_sha256 = '0'.repeat(64);
+      if (fault === 'contract binding') task.automatic.contract_binding.contract.goal = 'Changed original authority';
+      if (fault === 'reviewer identity') task.reviewer.local.thread_id = task.implementer.local.thread_id;
+      if (fault === 'validation') task.local_validation.results = [];
+      c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+      try { await historicalStatus(c, id, child.id, null, true); }
+      finally { c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(original, task.id); }
+    });
+  }
+  for (const taskId of [id, child.id]) await context.test(taskId === id ? 'original packet' : 'fourth packet', async () => {
+    const task = c.task(taskId), file = path.join(c.workspaceRoot, taskId, task.reviewer.packet_directory, 'evidence.json');
+    const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777;
+    await fs.chmod(file, 0o600); await fs.writeFile(file, '{}'); await fs.chmod(file, mode);
+    try { await historicalStatus(c, id, child.id, null, true); }
+    finally { await fs.chmod(file, 0o600); await fs.writeFile(file, bytes); await fs.chmod(file, mode); }
+  });
+  for (const kind of ['review_result', 'review_packet', 'corrective_execution']) await context.test(`missing retained ${kind}`, async () => {
+    const rows = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? AND json_extract(value,\'$.kind\')=?').all(child.id, kind);
+    assert(rows.length > 0);
+    c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=? AND json_extract(value,\'$.kind\')=?').run(child.id, kind);
+    try { await historicalStatus(c, id, child.id, null, true); }
+    finally { for (const row of rows) c.db.prepare('INSERT INTO automatic_attempts VALUES (?,?,?,?)').run(row.task_id, row.attempt_id, row.observation_sha256, row.value); }
+  });
+  await context.test('storage reads unavailable', () => historicalStatus(c, id, child.id, null, true, true));
+  await context.test('missing corrected Git tree', async () => {
+    const tree = child.reviewer.reviewed_git_state.tree_sha, file = path.join(c.workspaceRoot, child.id, 'git-store/objects', tree.slice(0, 2), tree.slice(2));
+    const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777; await fs.rm(file);
+    try { await historicalStatus(c, id, child.id, null, true); await assert.rejects(fs.stat(file), { code: 'ENOENT' }); }
+    finally { await fs.writeFile(file, bytes, { mode }); }
+  });
+  await context.test('later expiry does not erase historical qualification or renew authority', async () => {
+    const now = Date.now; Date.now = () => evidence.deadline + 1;
+    try { await historicalStatus(c, id, child.id, 'PASS', true); }
+    finally { Date.now = now; }
+    assert.equal(c.task(id).deadline, evidence.deadline);
+  });
+  await historicalStatus(c, id, child.id, 'PASS', true);
+  assert.deepEqual(await retainedReviewEvidence(c, id, child.id, evidence.rows), evidence);
+  assert.deepEqual(value.localCalls, calls); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+  await c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: c.workspaceRoot, api: value.api,
+    executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Historical verification cannot replay models') }).init();
+  context.after(() => restarted.close());
+  await historicalStatus(restarted, id, child.id, 'PASS', true);
+  await context.test('packet integrity after restart', async () => {
+    const packet = path.join(c.workspaceRoot, child.id, child.reviewer.packet_directory, 'evidence.json'), bytes = await fs.readFile(packet);
+    await fs.chmod(packet, 0o600); await fs.writeFile(packet, '{}'); await fs.chmod(packet, 0o400);
+    try { await historicalStatus(restarted, id, child.id, null, true); }
+    finally { await fs.chmod(packet, 0o600); await fs.writeFile(packet, bytes); await fs.chmod(packet, 0o400); }
+  });
+  await historicalStatus(restarted, id, child.id, 'PASS', true);
+  await context.test('changed corrected worktree after restart', async () => {
+    await fs.writeFile(path.join(c.workspaceRoot, child.id, 'repo/one.txt'), 'Changed after qualified review\n');
+    await historicalStatus(restarted, id, child.id, null, true);
+  });
+  await restarted.start(value.startInput); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
+  assert.deepEqual(value.localCalls, calls); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+});
+
+test('retained corrective FAIL remains qualified after later attention and Controller restart', async context => {
+  const value = await correctiveWorkflow(context, { correctiveVerdict: 'FAIL' }), { c, id, child } = value;
+  await historicalStatus(c, id, child.id, 'FAIL');
+  c.persistenceFailures.add(id); c.persistenceFailures.add(child.id); c.persistenceAttention(id); c.persistenceAttention(child.id);
+  await historicalStatus(c, id, child.id, 'FAIL', true);
+  await c.close();
+  const restarted = await new Controller({ stateRoot: path.join(value.root, 'state'), workspaceRoot: c.workspaceRoot, api: value.api,
+    executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Historical FAIL cannot replay models') }).init();
+  context.after(() => restarted.close());
+  await historicalStatus(restarted, id, child.id, 'FAIL', true);
+  assert.equal(value.localCalls.length, 4); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);
+});
+
+for (const uncertain of [false, true]) test(`corrective publication parent and child MCP status are observational; uncertain=${uncertain}`, async context => {
+  const value = await correctiveWorkflow(context, uncertain ? { publisher(p) { p.losePRResponse = true; } } : {}), { c, parent, child } = value;
+  assert.equal(parent.automatic.status, uncertain ? 'uncertain' : 'succeeded');
+  // Periodic pruning is separate from the request under observation.
+  clearInterval(c.sweeper);
+  const server = createServer(c, async () => { authorizations++; }), client = new Client({ name: 'corrective-publication-status', version: '1' });
+  let authorizations = 0;
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  const ledger = () => JSON.stringify(['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const rows = ledger(), source = await publicationFiles(value.normal), workspaces = await publicationFiles(c.workspaceRoot);
+  const publisherCalls = [...value.publisher.calls];
+  let writes = 0;
+  const mutations = new Set([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE]);
+  c.db.setAuthorizer(action => { if (mutations.has(action)) { writes++; return sqlite.SQLITE_DENY; } return sqlite.SQLITE_OK; });
+  try {
+    await assert.rejects(c.expire()); assert.equal(writes, 1); writes = 0;
+    for (const id of [parent.id, child.id, parent.id, child.id]) {
+      const response = await client.callTool({ name: 'get_task', arguments: { task_id: id } }); assert.notEqual(response.isError, true);
+      assert.equal(response.structuredContent.correction.publication.confirmed, !uncertain);
+      assert.equal(response.structuredContent.correction.review.overall, 'PASS'); assert.equal(response.structuredContent.correction.review.qualified, true);
+      assert.equal(response.structuredContent.correction.codex_turns_attempted, 4);
+    }
+    assert.equal(writes, 0); assert.equal(authorizations, 4); assert.equal(ledger(), rows);
+    assert.equal(await publicationFiles(value.normal), source); assert.equal(await publicationFiles(c.workspaceRoot), workspaces);
+    assert.deepEqual(value.publisher.calls, publisherCalls);
+    if (!uncertain) {
+      const tree = child.reviewer.reviewed_git_state.tree_sha, object = path.join(c.workspaceRoot, child.id, 'git-store/objects', tree.slice(0, 2), tree.slice(2));
+      await fs.rm(object);
+      const missing = await publicationFiles(c.workspaceRoot);
+      for (const id of [parent.id, child.id]) {
+        const response = await client.callTool({ name: 'get_task', arguments: { task_id: id } }); assert.notEqual(response.isError, true);
+        assert.equal(response.structuredContent.correction.review.qualified, false);
+        assert.equal(response.structuredContent.correction.review.overall, null);
+        assert.equal(response.structuredContent.correction.publication.execution_authorized, false);
+      }
+      await assert.rejects(fs.stat(object), { code: 'ENOENT' });
+      assert.equal(writes, 0); assert.equal(ledger(), rows); assert.equal(await publicationFiles(c.workspaceRoot), missing);
+      assert.equal(await publicationFiles(value.normal), source); assert.deepEqual(value.publisher.calls, publisherCalls);
+    }
+  } finally { c.db.setAuthorizer(null); }
+  assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1); assert.equal(value.localCalls.length, 4);
+});
+
+for (const corrupt of ['child publication', 'parent linkage']) test(`corrective publication status rejects conflicting ${corrupt} without repairing evidence`, async context => {
+  const value = await correctiveWorkflow(context), { c, parent, child } = value;
+  const task = structuredClone(corrupt === 'child publication' ? child : parent), original = JSON.stringify(task);
+  if (corrupt === 'child publication') task.publication.commit_sha = '0'.repeat(40);
+  else task.automatic.corrective_publication_result.commit_sha = '0'.repeat(40);
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+  try {
+    for (const id of [parent.id, child.id]) {
+      const status = await c.get(id); assert.equal(status.correction.publication.confirmed, false);
+      assert.equal(status.correction.publication.uncertain, true); assert.equal(status.automatic.status, 'uncertain');
+    }
+    assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value, JSON.stringify(task));
+    assert.equal(value.publisher.pushes, 1); assert.equal(value.publisher.creates, 1);
+  } finally { c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(original, task.id); }
+});
 
 test('snapshot and publication state await the selected Git runner without changing the captured state', async context => {
   const { normal } = await setup(context), safeGit = asynchronousRepoGit(AbortSignal.timeout(10000));

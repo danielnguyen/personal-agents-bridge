@@ -221,6 +221,30 @@ test('four-turn authorization accepts only explicit versioned local repository 4
     assert.throws(() => c.automaticAuthorization({ ...input, ...change }), /INVALID_AUTOMATIC_AUTHORIZATION/);
 });
 
+test('corrective draft publication authority accepts only an original literal true on versioned local 4/1', async t => {
+  const { c, api } = await setup(t), input = { execution_backend: 'local_codex', repository_id: 'fixture', automatic: {
+    publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 4, max_corrections: 1,
+    review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION, publish_after_correction: true } };
+  assert.equal(c.automaticAuthorization(input).publish_after_correction, true);
+  for (const value of [false, null, 0, 1, 'true', {}, []]) assert.throws(() => c.automaticAuthorization({ ...input,
+    automatic: { ...input.automatic, publish_after_correction: value } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  for (const change of [{ max_codex_turns: 2, max_corrections: 0 }, { max_codex_turns: 3 }, { review_protocol: undefined },
+    { review_protocol: 'legacy' }, { max_corrections: 0 }, { publish: { title: 'Fixture', draft: false } }])
+    assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...change } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  for (const change of [{ execution_backend: 'agents_api' }, { execution_backend: undefined }, { repository_id: undefined }])
+    assert.throws(() => c.automaticAuthorization({ ...input, ...change }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  assert.equal(api.created.length, 0);
+});
+
+test('a completed review-only authorization cannot acquire corrective publication through task mutation or duplicate input', async t => {
+  const value = await automaticAttempt(t, { versioned: true, postReview: true }), { c, id } = value;
+  const original = c.task(id); original.automatic.authorization.publish_after_correction = true;
+  assert.throws(() => c.save(original), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(c.task(id).automatic.authorization.publish_after_correction, undefined);
+  await assert.rejects(c.start({ ...value.input, automatic: { ...value.input.automatic, publish_after_correction: true } }), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+  assert.deepEqual(value.publisherCalls, []); assert.equal(value.calls.length, 4);
+});
+
 test('four-turn authority rejects reused original reviewer turn identity before correction', async t => {
   const value = await automaticAttempt(t, { versioned: true, postReview: true, originalReviewTurn: 'implement-turn' });
   assert.deepEqual(value.calls, ['implementer', 'reviewer']); assert.deepEqual(value.publisherCalls, []);
