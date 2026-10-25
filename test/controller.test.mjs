@@ -102,7 +102,7 @@ async function automaticAttempt(t, mode = {}) {
         classification: finding.status === 'PASS' ? null : mode.cause && mode.cause !== 'implementation_defect' ? { kind: mode.cause } :
           { kind: 'implementation_defect', target_files: ['greeting.txt'], remedy: { kind: 'edit_files', description: mode.remedy || 'Replace the incorrect greeting.', requires_human_approval: !!mode.humanApproval } } })) } : { overall: 'FAIL', findings };
       if (options.reviewOnly) { mode.output?.(output); await mode.beforeResult?.(c, options); }
-      if ((correctiveReview && !mode.correctiveReviewFail) || (!correctiveReview && mode.originalPass)) { output.overall = 'PASS'; for (const finding of output.findings) { finding.status = 'PASS'; finding.classification = null; } }
+      if ((correctiveReview && !mode.correctiveReviewFail) || (!correctiveReview && mode.originalPass)) { output.overall = 'PASS'; for (const finding of output.findings) { finding.status = 'PASS'; if (mode.versioned) finding.classification = null; } }
       if (correctiveReview) mode.correctiveOutput?.(output);
       const text = (mode.incomplete || (correctiveReview && mode.correctiveReviewMalformed)) ? '{"overall":"FAIL","findings":[]}' : JSON.stringify(output);
       if (options.reviewOnly) mode.returnedOutput?.(text);
@@ -1088,7 +1088,7 @@ test('MCP versioned status never repairs a conflicting backend or synthesizes a 
   }
 });
 
-test('MCP versioned status exemption preserves mutation audit and legacy/manual observation behavior', async t => {
+test('MCP automatic status exemption preserves mutation audit and manual observation behavior', async t => {
   const { c, api } = await setup(t), { client, get } = await statusClient(t, c);
   const started = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_mutation_start' } });
   assert.notEqual(started.isError, true); const id = started.structuredContent.task_id;
@@ -1100,8 +1100,10 @@ test('MCP versioned status exemption preserves mutation audit and legacy/manual 
   assert.notEqual((await client.callTool({ name: 'cleanup_task', arguments: { task_id: id, delete_workspace: false } })).isError, true);
   assert(c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'cleanup_task' && row.task_id === id));
   const legacy = await automaticAttempt(t), status = await statusClient(t, legacy.c);
+  const before = statusLedger(legacy.c.db);
   assert.notEqual((await status.get(legacy.id)).isError, true);
-  assert(legacy.c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'get_task'));
+  assert.equal(statusLedger(legacy.c.db), before);
+  assert(!legacy.c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'get_task'));
   assert.equal(legacy.c.task(legacy.id).automatic.authorization.max_codex_turns, 2);
   assert.equal(legacy.c.task(legacy.id).automatic.authorization.max_corrections, 0);
 });
@@ -2089,4 +2091,286 @@ test('cleanup reports blocked workspace deletion when executor stop is unconfirm
   assert.match(result.cleanup.cleanup_diagnostic, /EXECUTOR_STOP_UNCONFIRMED/);
   assert.match(result.cleanup.cleanup_diagnostic, /WORKSPACE_DELETE_SKIPPED_RESOURCES_NOT_CLEANED/);
   assert((await fs.lstat(result.cleanup.workspace_path)).isDirectory());
+});
+
+
+// Status-only fixtures use the real SQLite store, with no execution backend.
+function progressTask(c) {
+  const created = Date.now(), local = name => ({ adapter_contract: 'pab.local-codex-backend.v1', owner_instance: c.instanceId,
+    phase: 'finished', execution_state: 'completed', thread_id: `${name}-thread`, turn_id: `${name}-turn`, model: 'fixture-model',
+    authentication: 'chatgpt', turn_submission_attempted: true, turn_submission_acknowledged: true,
+    terminal_observed: true, result_received: true, instance_started: true, server_closed: true,
+    human_attention_required: false, human_requests: [], diagnostics: [] });
+  return { id: 'task_00000000-0000-0000-0000-000000000004', execution_backend: 'local_codex', created, deadline: created + 120000,
+    baseline: 'a'.repeat(40), request_id: 'progress-start', implementer: { state: 'completed', local: local('implementation') },
+    automatic: { authorization: { publish: { title: 'Fixture draft', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 },
+      status: 'progressing', phase: 'validation_and_review', reason: null, human_attention_required: false, owner_instance: c.instanceId,
+      review_request_id: 'progress-review', publish_request_id: 'progress-publish', deadline: created + 120000,
+      contract_binding: { sha256: digest(contract()), contract: contract() } },
+    reviewer: { state: 'completed', request_id: 'progress-review', local: local('review'), reviewed_git_state: { tree_sha: 'b'.repeat(40) } },
+    local_validation: { version: 'pab.controller-local-validation.v1', provenance: 'controller_process_observation', attempt_id: 'progress-validation',
+      request_id: 'progress-review', task_id: 'task_00000000-0000-0000-0000-000000000004', reviewed_git_state: { tree_sha: 'b'.repeat(40) },
+      status: 'completed', original_unchanged: true, termination_confirmed: true, results: [] } };
+}
+
+for (const phase of ['implementation', 'validation', 'review', 'publication'])
+test(`durable progress preserves interrupted ${phase} identities across three restarts`, async t => {
+  const { c, root } = await setup(t), task = progressTask(c), id = task.id;
+  if (phase === 'implementation') { delete task.reviewer; delete task.local_validation; task.implementer.state = 'running';
+    Object.assign(task.implementer.local, { result_received: false, terminal_observed: false, server_closed: false }); }
+  if (phase === 'validation' || phase === 'review') {
+    task.reviewer.state = 'running'; Object.assign(task.reviewer.local, { result_received: false, terminal_observed: false, server_closed: false });
+    if (phase === 'validation') { task.reviewer.local.instance_started = false; task.reviewer.local.turn_submission_attempted = false;
+      task.reviewer.local.thread_id = null; task.reviewer.local.turn_id = null; task.local_validation.status = 'running'; }
+  }
+  if (phase === 'publication') { task.automatic.phase = 'publication'; task.publication = { phase: 'prepared', push_attempted: true }; }
+  c.save(task); interruptProgressController(c);
+  let stable, status;
+  for (let restart = 0; restart < 3; restart++) {
+    const next = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'), executor: new FakeExecutor(),
+      localBackendFactory() { assert.fail('Unexpected model replay'); }, localValidationFactory() { assert.fail('Unexpected validation replay'); },
+      publisher: new Proxy({}, { get() { assert.fail('Unexpected publisher operation'); } }) }).init();
+    try {
+      const { get } = await statusClient(t, next), before = statusLedger(next.db);
+      for (let read = 0; read < 3; read++) {
+        status = JSON.parse((await get(id)).content[0].text);
+        assert.equal(status.automatic.status, 'uncertain'); assert.equal(status.automatic.human_attention_required, true);
+        assert.equal(status.automatic.progress.resume_authorized, false);
+        assert(!['starting', 'running', 'finishing'].includes(status.implementer.state));
+        if (status.reviewer) assert(!['starting', 'running', 'finishing'].includes(status.reviewer.state));
+        assert.equal(status.automatic.progress.attempts.implementation.request_id, task.request_id);
+        if (task.local_validation) assert.equal(status.automatic.progress.attempts.validation.attempt_id, task.local_validation.attempt_id);
+        if (phase === 'review') assert.equal(status.automatic.progress.attempts.review.status, 'attempted_unconfirmed');
+        if (phase === 'validation') assert.equal(status.automatic.progress.attempts.review.status, 'not_attempted');
+        if (phase === 'publication') assert.equal(status.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+      }
+      assert.equal(statusLedger(next.db), before);
+      if (stable) assert.equal(before, stable); else stable = before;
+      const saved = next.task(id);
+      assert.equal(saved.deadline, task.deadline); assert.equal(saved.automatic.deadline, task.automatic.deadline);
+      assert.deepEqual(saved.automatic.authorization, task.automatic.authorization);
+      assert.deepEqual(saved.automatic.contract_binding, task.automatic.contract_binding);
+      assert.equal(saved.automatic.owner_instance, task.automatic.owner_instance);
+      assert.equal(saved.automatic.review_request_id, task.automatic.review_request_id);
+      assert.equal(saved.automatic.publish_request_id, task.automatic.publish_request_id);
+      assert.equal(next.automaticJobs.size + next.localRuns.size + next.validationRuns.size, 0);
+    } finally { interruptProgressController(next); }
+  }
+});
+function interruptProgressController(c) {
+  clearInterval(c.sweeper); for (const timer of c.automaticTimers.values()) clearTimeout(timer);
+  c.closed = true; c.dbClosed = true; c.db.close();
+}
+
+for (const outcome of ['not attempted', 'unknown', 'unconfirmed', 'completed', 'failed'])
+test(`durable progress classifies execution ${outcome} without inventing usage`, async t => {
+  const { c } = await setup(t), task = progressTask(c);
+  delete task.reviewer; delete task.local_validation;
+  const local = task.implementer.local;
+  if (outcome === 'not attempted') local.turn_submission_attempted = false;
+  if (outcome === 'unknown') delete local.turn_submission_attempted;
+  if (outcome === 'unconfirmed') local.terminal_observed = false;
+  if (outcome === 'failed') local.execution_state = 'failed';
+  c.save(task);
+  const view = await c.get(task.id), expected = { 'not attempted': 'not_attempted', unknown: 'unknown', unconfirmed: 'attempted_unconfirmed', completed: 'confirmed_completed', failed: 'confirmed_failed' }[outcome];
+  assert.equal(view.automatic.progress.attempts.implementation.status, expected);
+  assert.equal(view.automatic.usage.implementer_turn_submissions_attempted, outcome === 'unknown' ? null : outcome === 'not attempted' ? 0 : 1);
+  assert.equal(view.automatic.progress.last_confirmed_stage, outcome === 'completed' ? 'implementation' : null);
+  assert.equal(view.automatic.usage.token_usage, null);
+});
+
+for (const action of ['IGNORE', 'ABORT'])
+test(`durable progress rejects silent or failed SQLite ${action} transition before dispatch`, async t => {
+  const { c } = await setup(t), task = progressTask(c); c.save(task);
+  const before = statusLedger(c.db);
+  c.db.exec(`CREATE TEMP TRIGGER progress_loss BEFORE INSERT ON tasks BEGIN SELECT RAISE(${action}${action === 'ABORT' ? ", 'synthetic write failure'" : ''}); END;`);
+  task.automatic.phase = 'publication';
+  assert.throws(() => c.save(task), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(statusLedger(c.db), before);
+  const view = await c.get(task.id);
+  assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.progress.last_confirmed_stage, null);
+  assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  c.db.exec('DROP TRIGGER progress_loss');
+});
+
+for (const field of ['request_id', 'deadline', 'baseline', 'review_request_id', 'publish_request_id', 'owner_instance', 'contract_binding'])
+test(`durable progress preserves original ${field} binding`, async t => {
+  const { c } = await setup(t), task = progressTask(c); c.save(task); const before = statusLedger(c.db);
+  if (['request_id', 'deadline', 'baseline'].includes(field)) task[field] = field === 'deadline' ? task.deadline + 1000 : 'replacement';
+  else task.automatic[field] = field === 'contract_binding' ? { sha256: 'replacement' } : 'replacement';
+  assert.throws(() => c.save(task), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('durable progress legacy automatic MCP status is bounded sanitized and strictly observational', async t => {
+  const { c, root } = await setup(t), task = progressTask(c), sensitive = 'RAW_PRIVATE_EVIDENCE_';
+  task.cleaned = true; task.workspace_deleted = true; task.cleanup = { workspace_deleted: true, workspace_path: path.join(root, 'private') };
+  task.automatic.status = 'stopped'; task.automatic.reason = 'AUTOMATIC_VALIDATION_FAILED';
+  task.implementer.local.latest_model_output = sensitive.repeat(20000);
+  task.implementer.local.diagnostics = [path.join(root, 'private')];
+  task.local_validation.results = Array.from({ length: 100 }, (_, command_index) => ({ command_index, attempt_id: `command-${command_index}`,
+    command: sensitive, stdout: { text: sensitive }, cwd: path.join(root, 'private'), completion_observed: false }));
+  task.reviewer.received_review_output = { output: sensitive.repeat(20000) }; task.reviewer.received_output_sha256 = digest(task.reviewer.received_review_output);
+  c.save(task);
+  const { get } = await statusClient(t, c), before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  c.scheduleAutomatic = () => assert.fail('Status scheduled execution'); c.repositoryEvidence = () => assert.fail('Status wrote evidence');
+  for (let repeat = 0; repeat < 3; repeat++) {
+    const text = (await get(task.id)).content[0].text, view = JSON.parse(text);
+    assert(text.length < 12000); assert(!text.includes(root)); assert(!text.includes(sensitive));
+    assert.equal(view.automatic.progress.attempts.validation.commands.length, 10);
+    assert.equal(view.automatic.progress.attempts.validation.commands_truncated, true);
+    assert.equal(view.automatic.progress.attempts.validation.status, 'unknown');
+    assert.equal(view.automatic.usage.token_usage, null); assert.equal(view.implementer.latest_output, null);
+    assert.equal(view.state, 'cleaned');
+  }
+  assert.equal(statusLedger(c.db), before);
+  assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+});
+
+test('durable progress pending completed-publication evidence is never confirmed by status', async t => {
+  const { c } = await setup(t), task = progressTask(c);
+  task.publication = { phase: 'complete', push_attempted: true, pr_attempted: true, commit_tree_matches_reviewed_tree: true };
+  c.save(task); c.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(task.automatic.publish_request_id, 'fixture', task.id, 'pending');
+  const before = statusLedger(c.db), view = await c.get(task.id);
+  assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+  assert.equal(view.automatic.progress.last_confirmed_stage, 'independent_validation');
+  assert.equal(statusLedger(c.db), before);
+});
+
+
+for (const versioned of [false, true])
+test(`durable progress real lifecycle preserves PR27 recovery with observational reads; versioned=${versioned}`, async t => {
+  const effects = { pushes: 0, creates: 0, reads: 0 }; let publisher;
+  const value = await automaticAttempt(t, { versioned, postReview: true, originalPass: true, async configure(c, input) {
+    if (!versioned) Object.assign(input.automatic, { max_codex_turns: 2, max_corrections: 0 });
+    const normal = path.join(path.dirname(c.stateRoot), 'normal');
+    repoGit(normal, 'remote', 'add', 'origin', 'https://github.com/fixture/progress.git');
+    publisher = { async target() { effects.reads++; return { repository: 'fixture/progress', base: 'main', remote: 'https://github.com/fixture/progress.git' }; },
+      async remoteHead() { effects.reads++; return this.remote || null; },
+      async push(repo, target, branch, commit) { effects.pushes++; this.remote = commit; },
+      async findPR() { effects.reads++; return this.pr || null; },
+      async createPR(target, branch) { effects.creates++; return this.pr = { number: 1, html_url: 'https://github.com/fixture/progress/pull/1',
+        draft: true, state: 'open', merged_at: null, head: { ref: branch, sha: this.remote, repo: { full_name: target.repository } },
+        base: { ref: target.base, repo: { full_name: target.repository } } }; } };
+    c.publisher = publisher;
+    const finish = c.finishAutomatic.bind(c), done = c.opDone.bind(c);
+    c.finishAutomatic = (id, status, reason) => { if (status !== 'succeeded') finish(id, status, reason); };
+    c.opDone = (id, status) => { if (!id.startsWith('automatic_publish_')) done(id, status); };
+  } });
+  const original = value.c.task(value.id), attempts = attemptRows(value.c, value.id);
+  assert.equal(original.publication.phase, 'complete'); assert.equal(original.automatic.status, 'progressing');
+  assert.equal((await value.c.get(value.id)).automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+  interruptProgressController(value.c);
+  let previous, progress;
+  for (let restart = 0; restart < 3; restart++) {
+    const c = await new Controller({ stateRoot: value.c.stateRoot, workspaceRoot: value.c.workspaceRoot, executor: value.executor, publisher,
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+    try {
+      const ledger = statusLedger(c.db), before = { ...effects };
+      for (let read = 0; read < 3; read++) {
+        const view = await c.invoke('get_task', { task_id: value.id }, {}, () => c.get(value.id));
+        assert.equal(view.automatic.status, 'succeeded'); assert.equal(view.automatic.reconciliation.confirmed, true);
+        assert.equal(view.automatic.progress.last_confirmed_stage, 'publication');
+        assert.equal(view.automatic.progress.attempts.review.result, 'PASS');
+        assert.equal(view.automatic.progress.attempts.publication.status, 'confirmed_completed');
+        if (progress) assert.deepEqual(view.automatic.progress, progress); else progress = view.automatic.progress;
+      }
+      assert.equal(statusLedger(c.db), ledger); assert.deepEqual(effects, before);
+      if (previous) assert.equal(ledger, previous); else previous = ledger;
+      assert.equal(c.task(value.id).deadline, original.deadline); assert.equal(c.task(value.id).automatic.owner_instance, original.automatic.owner_instance);
+      const retained = attemptRows(c, value.id);
+      for (const row of attempts) assert(retained.some(next => next.value === row.value && next.observation_sha256 === row.observation_sha256));
+      assert.equal(retained.filter(row => JSON.parse(row.value).outcome === 'succeeded').length, 1);
+    } finally { interruptProgressController(c); }
+  }
+  assert.deepEqual(value.calls, ['implementer', 'reviewer']); assert.equal(effects.pushes, 1); assert.equal(effects.creates, 1);
+});
+
+test('durable progress real stopped review history remains confirmed after cleanup and restart', async t => {
+  const value = await automaticAttempt(t), { c, id } = value;
+  const progress = (await c.get(id)).automatic.progress;
+  assert.equal(progress.last_confirmed_stage, 'independent_review'); assert.equal(progress.attempts.review.result, 'FAIL');
+  const cleanup = await c.cleanup({ task_id: id, delete_workspace: true }); assert.equal(cleanup.cleanup.workspace_deleted, true);
+  assert.deepEqual(cleanup.automatic.progress, progress);
+  const ledger = statusLedger(c.db); interruptProgressController(c);
+  for (let restart = 0; restart < 3; restart++) {
+    const recovered = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, executor: value.executor,
+      localBackendFactory() { assert.fail('Model replay after cleanup'); }, localValidationFactory() { assert.fail('Validation replay after cleanup'); } }).init();
+    try {
+      for (let read = 0; read < 3; read++) assert.deepEqual((await recovered.get(id)).automatic.progress, progress);
+      assert.equal(statusLedger(recovered.db), ledger);
+    } finally { interruptProgressController(recovered); }
+  }
+  assert.deepEqual(value.calls, ['implementer', 'reviewer']); assert.deepEqual(value.publisherCalls, []);
+});
+
+
+test('durable progress masks orphaned activity even when startup classification could not commit', async t => {
+  const { c } = await setup(t), task = progressTask(c);
+  task.automatic.owner_instance = 'previous-controller'; task.reviewer.state = 'running';
+  Object.assign(task.reviewer.local, { result_received: false, server_closed: false });
+  task.local_validation.status = 'running'; c.save(task); c.persistenceFailures.add(task.id);
+  const before = statusLedger(c.db), view = await c.get(task.id);
+  assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+  assert.equal(view.reviewer.state, 'needs_attention'); assert.equal(view.reviewer.local.execution_state, 'uncertain');
+  assert.equal(view.reviewer.independent_validation.status, 'uncertain');
+  assert.equal(view.automatic.progress.last_confirmed_stage, null); assert.equal(statusLedger(c.db), before);
+});
+
+
+for (const postReview of [false, true])
+test(`durable progress follows authorized corrective attempts without relabeling originals; reviewed=${postReview}`, async t => {
+  const value = await automaticAttempt(t, { versioned: true, correction: !postReview, postReview });
+  const { c, id } = value, parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  const before = statusLedger(c.db), view = await c.get(id), progress = view.automatic.progress;
+  assert.equal(progress.stage, postReview ? 'independent_review' : 'correction');
+  assert.equal(progress.last_confirmed_stage, postReview ? 'independent_review' : 'correction');
+  assert.equal(progress.attempts.implementation.thread_id, parent.implementer.local.thread_id);
+  assert.equal(view.correction.attempt_id, child.request_id); assert.equal(view.correction.execution.thread_id, child.implementer.local.thread_id);
+  assert.equal(view.correction.execution_authorized, false);
+  assert.notEqual(view.correction.execution.thread_id, progress.attempts.implementation.thread_id);
+  if (postReview) assert.equal(view.correction.review.validation.attempt_id, child.local_validation.attempt_id);
+  assert.equal(statusLedger(c.db), before);
+  const restarted = await restartEvidenceController(t, value), stable = statusLedger(restarted.db);
+  for (let read = 0; read < 3; read++) {
+    const status = await restarted.get(id);
+    assert.equal(status.automatic.progress.attempts.implementation.thread_id, parent.implementer.local.thread_id);
+    assert.equal(status.correction.attempt_id, child.request_id); assert.equal(status.correction.execution.thread_id, child.implementer.local.thread_id);
+  }
+  assert.equal(statusLedger(restarted.db), stable); assert.equal(value.calls.length, postReview ? 4 : 3);
+});
+
+test('durable progress missing reviewer with a pending operation keeps usage unknown', async t => {
+  const { c } = await setup(t), task = progressTask(c); delete task.reviewer; delete task.local_validation;
+  c.save(task); c.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(task.automatic.review_request_id, 'fixture', task.id, 'pending');
+  const view = await c.get(task.id);
+  assert.equal(view.automatic.usage.reviewer_turn_submissions_attempted, null);
+  assert.equal(view.automatic.progress.attempts.review.status, 'unknown');
+});
+
+
+for (const mode of ['passed', 'failed', 'unconfirmed', 'wrong tree', 'missing evidence', 'reserved'])
+test(`durable progress validation completion requires bound evidence: ${mode}`, async t => {
+  const { c } = await setup(t), task = progressTask(c), validation = task.local_validation;
+  const required = { ...contract(), test_commands: ['true'] };
+  task.automatic.contract_binding = { sha256: digest(required), contract: required };
+  const output = { available: true, truncated: false, redacted: false, encoding_error: false, text: '' };
+  const record = { attempt_id: 'validation-command-original', validation_attempt_id: validation.attempt_id, command_index: 0,
+    command: 'true', candidate_tree: task.reviewer.reviewed_git_state.tree_sha, cwd: '/synthetic/validator',
+    cwd_identity: { realpath: '/synthetic/validator', device: 1, inode: 1 }, materialization: { source: 'git_tree_blobs', filters_applied: false },
+    status: mode === 'failed' || mode === 'wrong tree' ? 'failed' : 'passed', start_attempted: true, start_observed: true,
+    completion_observed: mode !== 'unconfirmed', independently_observed: true, termination_confirmed: true,
+    exit_code: mode === 'failed' || mode === 'wrong tree' ? 1 : 0, signal: null, timeout: false, cancelled: false,
+    background_processes_observed: false, stdout: output, stderr: output };
+  validation.results = [record];
+  if (mode === 'wrong tree') record.candidate_tree = 'c'.repeat(40);
+  if (mode === 'missing evidence') { validation.status = 'completed'; validation.results = []; }
+  if (mode === 'reserved') { validation.status = 'pending'; validation.results = []; }
+  c.save(task); const before = statusLedger(c.db), view = await c.get(task.id);
+  const actual = view.automatic.progress.attempts.validation;
+  assert.equal(actual.status, { passed: 'confirmed_completed', failed: 'confirmed_failed', unconfirmed: 'attempted_unconfirmed',
+    'wrong tree': 'attempted_unconfirmed', 'missing evidence': 'unknown', reserved: 'not_attempted' }[mode]);
+  assert.equal(actual.attempt_id, validation.attempt_id);
+  assert.equal(actual.commands[0]?.completion_confirmed ?? false, ['passed', 'failed'].includes(mode));
+  assert.equal(statusLedger(c.db), before);
 });

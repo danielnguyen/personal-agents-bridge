@@ -1524,7 +1524,7 @@ for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real
 
 // Complete the real Controller's implementation/review/publication path using
 // fake sessions and a memory-only GitHub remote; interrupt only final status.
-async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false } = {}) {
+async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false, testCommands = ['test "$(cat greeting.txt)" = candidate'] } = {}) {
   let validations = 0;
   const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, {
     noApi: true, localValidationFactory: options => {
@@ -1548,7 +1548,7 @@ async function completedPublication(context, { turns = 2, versioned = false, pen
   };
   value.controller.publisher = publisher; value.config.publisher = publisher;
   repoGit(value.normal, 'remote', 'add', 'origin', 'https://github.com/fixture/reconciliation.git');
-  value.input.contract.test_commands = ['test "$(cat greeting.txt)" = candidate'];
+  value.input.contract.test_commands = testCommands;
   value.input.automatic = { ...automaticAuthority(), max_codex_turns: turns, max_corrections: turns > 2 ? 1 : 0,
     ...(versioned || turns > 2 ? { review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } : {}),
     ...(turns === 4 ? { publish_after_correction: true } : {}) };
@@ -1980,4 +1980,65 @@ test('cleaned stopped review history survives workspace deletion, repeated start
     } finally { await recovered.close(); }
   }
   assert.equal(value.instances.length, 2); assert.deepEqual(effects, []);
+});
+
+
+// Portable counterparts exercise the existing full publication/recovery gates
+// with an empty required-command list. Native command containment remains SSH C.
+for (const mode of [{}, { versioned: true }, { pendingOperation: true }, { beforeCompletion: true }, { afterPush: true }])
+test(`durable progress portable publication recovery and no replay: ${JSON.stringify(mode)}`, async context => {
+  const value = await completedPublication(context, { ...mode, testCommands: [] }), { task } = value;
+  const unresolved = mode.beforeCompletion || mode.afterPush;
+  interruptController(value.controller);
+  let previous, progress;
+  for (let restart = 0; restart < 3; restart++) {
+    const c = await new Controller({ ...value.config,
+      localBackendFactory() { assert.fail('Unexpected model replay'); }, localValidationFactory() { assert.fail('Unexpected validation replay'); } }).init();
+    try {
+      const ledger = recoveryLedger(c), calls = { ...value.counts };
+      for (let read = 0; read < 3; read++) {
+        const view = await c.invoke('get_task', { task_id: task.id }, {}, () => c.get(task.id));
+        assert.equal(view.automatic.status, unresolved ? 'uncertain' : 'succeeded');
+        const next = view.automatic.progress;
+        assert.equal(next.stage, 'publication'); assert.equal(next.resume_authorized, false);
+        assert.equal(next.last_confirmed_stage, unresolved ? 'independent_review' : 'publication');
+        assert.equal(next.attempts.publication.status, unresolved ? 'attempted_unconfirmed' : 'confirmed_completed');
+        assert.equal(next.attempts.implementation.thread_id, task.implementer.local.thread_id);
+        assert.equal(next.attempts.review.turn_id, task.reviewer.local.turn_id);
+        assert.equal(next.attempts.review.result, 'PASS');
+        assert.equal(next.attempts.validation.attempt_id, task.local_validation.attempt_id);
+        if (progress) assert.deepEqual(next, progress); else progress = next;
+      }
+      assert.equal(recoveryLedger(c), ledger); assert.deepEqual(value.counts, calls);
+      if (previous) assert.equal(ledger, previous); else previous = ledger;
+      assert.equal(c.task(task.id).deadline, task.deadline); assert.equal(c.task(task.id).automatic.owner_instance, task.automatic.owner_instance);
+      const outcomes = c.db.prepare("SELECT value FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").all(task.id);
+      assert.equal(outcomes.length, unresolved ? 0 : 1);
+    } finally { interruptController(c); }
+  }
+  assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+  assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, mode.afterPush ? 0 : 1);
+});
+
+test('durable progress portable confirmed history survives actual cleanup and repeated restart', async context => {
+  const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, { noApi: true });
+  const started = await value.controller.start({ ...value.input, automatic: automaticAuthority() });
+  (await value.running()).finish(); await value.drain();
+  const reviewer = await value.running(1), raw = JSON.parse(reviewOutput()); raw.overall = 'FAIL'; raw.findings[0].status = 'FAIL';
+  reviewer.finish('completed', true, JSON.stringify(raw)); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const c = value.controller, id = started.task_id;
+  const progress = (await c.get(id)).automatic.progress;
+  assert.equal(progress.last_confirmed_stage, 'independent_review'); assert.equal(progress.attempts.review.result, 'FAIL');
+  const cleanup = await c.cleanup({ task_id: id, delete_workspace: true }); assert.equal(cleanup.cleanup.workspace_deleted, true);
+  assert.deepEqual(cleanup.automatic.progress, progress);
+  const ledger = recoveryLedger(c); interruptController(c);
+  for (let restart = 0; restart < 3; restart++) {
+    const recovered = await new Controller({ ...value.config,
+      localBackendFactory() { assert.fail('Model replay after cleanup'); }, localValidationFactory() { assert.fail('Validation replay after cleanup'); } }).init();
+    try {
+      for (let read = 0; read < 3; read++) assert.deepEqual((await recovered.get(id)).automatic.progress, progress);
+      assert.equal(recoveryLedger(recovered), ledger);
+    } finally { interruptController(recovered); }
+  }
+  assert.equal(value.instances.length, 2); assert.equal(value.api.created.length, 0);
 });
