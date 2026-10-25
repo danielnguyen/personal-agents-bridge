@@ -2061,7 +2061,7 @@ test(`safe restart integrated publication keeps original authority: ${effect}, e
   if (confirmed) assert.equal(publicationOperation.status, 'pending');
   // Historical confirmation may acknowledge only the original publication
   // operation. Every identity field and every unrelated operation must survive.
-  const expectedOperations = operations.map(row => confirmed && row.id === publicationOperation.id ? { ...row, status: 'accepted' } : row);
+  const expectedOperations = operations.map(row => confirmed && row.id === publicationOperation.id ? Object.assign(Object.create(null), row, { status: 'accepted' }) : row);
   const history = value.controller.db.prepare('SELECT * FROM automatic_attempts ORDER BY rowid').all();
   interruptController(value.controller);
   if (expired) context.mock.method(Date, 'now', () => task.deadline + 1000);
