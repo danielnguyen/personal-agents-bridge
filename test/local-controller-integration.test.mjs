@@ -2049,3 +2049,76 @@ test('durable progress portable confirmed history survives actual cleanup and re
   }
   assert.equal(value.instances.length, 2); assert.equal(value.api.created.length, 0);
 });
+
+
+for (const expired of [false, true]) for (const effect of ['complete', 'push response lost', 'PR response lost'])
+test(`safe restart integrated publication keeps original authority: ${effect}, expired=${expired}`, async context => {
+  const value = await completedPublication(context, { testCommands: [], afterPush: effect === 'push response lost', beforeCompletion: effect === 'PR response lost' });
+  const { task } = value, id = task.id, confirmed = effect === 'complete';
+  const operations = value.controller.db.prepare('SELECT * FROM operations ORDER BY id').all();
+  const publicationOperation = operations.find(row => row.id === task.automatic.publish_request_id);
+  assert(publicationOperation);
+  if (confirmed) assert.equal(publicationOperation.status, 'pending');
+  // Historical confirmation may acknowledge only the original publication
+  // operation. Every identity field and every unrelated operation must survive.
+  const expectedOperations = operations.map(row => confirmed && row.id === publicationOperation.id ? Object.assign(Object.create(null), row, { status: 'accepted' }) : row);
+  const history = value.controller.db.prepare('SELECT * FROM automatic_attempts ORDER BY rowid').all();
+  interruptController(value.controller);
+  if (expired) context.mock.method(Date, 'now', () => task.deadline + 1000);
+  let stable;
+  for (let restart = 0; restart < 3; restart++) {
+    const c = await new Controller({ ...value.config,
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+    try {
+      const ledger = recoveryLedger(c), calls = { ...value.counts };
+      assert.deepEqual(c.db.prepare('SELECT * FROM operations ORDER BY id').all(), expectedOperations);
+      for (let duplicate = 0; duplicate < 3; duplicate++) {
+        const view = await c.start(value.input);
+        assert.equal(view.task_id, id); assert.equal(view.automatic.status, confirmed ? 'succeeded' : 'uncertain');
+        assert.equal(view.automatic.progress.resume_authorized, false);
+        assert.equal(view.automatic.progress.attempts.publication.status, confirmed ? 'confirmed_completed' : 'attempted_unconfirmed');
+        c.scheduleAutomatic(id); await c.expire(); await c.get(id);
+      }
+      assert.equal(recoveryLedger(c), ledger); assert.deepEqual(value.counts, calls);
+      if (stable) assert.equal(ledger, stable); else stable = ledger;
+      assert.equal(c.task(id).deadline, task.deadline); assert.equal(c.task(id).automatic.owner_instance, task.automatic.owner_instance);
+      assert.deepEqual(c.task(id).automatic.authorization, task.automatic.authorization);
+      assert.deepEqual(c.task(id).automatic.contract_binding, task.automatic.contract_binding);
+      assert.deepEqual(c.task(id).implementer, task.implementer);
+      assert.deepEqual(c.task(id).reviewer, task.reviewer);
+      assert.deepEqual(c.task(id).publication, task.publication);
+      assert.deepEqual(c.db.prepare('SELECT * FROM operations ORDER BY id').all(), expectedOperations);
+      const retained = c.db.prepare('SELECT * FROM automatic_attempts ORDER BY rowid').all();
+      assert.equal(retained.filter(row => row.task_id === id && JSON.parse(row.value).outcome === 'succeeded').length, confirmed ? 1 : 0);
+      for (const row of history) assert(retained.some(current => JSON.stringify(current) === JSON.stringify(row)));
+      assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+    } finally { interruptController(c); }
+  }
+  assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+  assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, effect === 'push response lost' ? 0 : 1);
+});
+
+test('safe restart integrated timely publication recovery wins concurrent expiry cancellation', async context => {
+  const value = await completedPublication(context, { testCommands: [], pendingOperation: true }), { task, controller: c } = value;
+  context.mock.method(Date, 'now', () => task.deadline + 1000);
+  let recovered, committed, stops = 0;
+  c.stopLocalWithoutStorage = async () => {
+    stops++;
+    recovered = await new Controller({ ...value.config,
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+    assert.equal(recovered.task(task.id).automatic.status, 'succeeded');
+    committed = recoveryLedger(recovered);
+    return { confirmed: true, diagnostics: [] };
+  };
+  try {
+    await c.expireAutomatic(task.id);
+    assert.equal(stops, 1); assert(recovered);
+    assert.equal(recoveryLedger(recovered), committed);
+    assert.equal(recovered.task(task.id).cleanup, undefined);
+    assert.equal(recovered.task(task.id).automatic.expiry_stop, undefined);
+    assert.equal(recovered.task(task.id).deadline, task.deadline);
+    assert.equal(recovered.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'accepted');
+    assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+    assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+  } finally { if (recovered) interruptController(recovered); interruptController(c); }
+});
