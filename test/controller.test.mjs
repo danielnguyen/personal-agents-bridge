@@ -2238,8 +2238,8 @@ test('durable progress pending completed-publication evidence is never confirmed
 });
 
 
-for (const versioned of [false, true])
-test(`durable progress real lifecycle preserves PR27 recovery with observational reads; versioned=${versioned}`, async t => {
+for (const versioned of [false, true]) for (const expiry of [false, 'before restart', 'during cancellation'])
+test(`durable progress real lifecycle preserves PR27 recovery with observational reads; versioned=${versioned}; expiry=${expiry}`, async t => {
   const effects = { pushes: 0, creates: 0, reads: 0 }; let publisher;
   const value = await automaticAttempt(t, { versioned, postReview: true, originalPass: true, async configure(c, input) {
     if (!versioned) Object.assign(input.automatic, { max_codex_turns: 2, max_corrections: 0 });
@@ -2260,6 +2260,22 @@ test(`durable progress real lifecycle preserves PR27 recovery with observational
   const original = value.c.task(value.id), attempts = attemptRows(value.c, value.id);
   assert.equal(original.publication.phase, 'complete'); assert.equal(original.automatic.status, 'progressing');
   assert.equal((await value.c.get(value.id)).automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+  if (expiry) t.mock.method(Date, 'now', () => original.deadline + 1000);
+  if (expiry === 'during cancellation') {
+    let committed;
+    value.c.stopLocalWithoutStorage = async () => {
+      const recovered = await new Controller({ stateRoot: value.c.stateRoot, workspaceRoot: value.c.workspaceRoot, executor: value.executor, publisher,
+        localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+      try {
+        assert.equal(recovered.task(value.id).automatic.status, 'succeeded');
+        committed = statusLedger(recovered.db);
+      } finally { interruptProgressController(recovered); }
+      return { confirmed: true, diagnostics: [] };
+    };
+    await value.c.expireAutomatic(value.id);
+    assert(committed); assert.equal(statusLedger(value.c.db), committed);
+    assert.equal(value.c.task(value.id).cleanup, undefined); assert.equal(value.c.task(value.id).automatic.expiry_stop, undefined);
+  }
   interruptProgressController(value.c);
   let previous, progress;
   for (let restart = 0; restart < 3; restart++) {
@@ -2826,4 +2842,92 @@ test(`automatic concurrent writes ${timing} ${path} rejects unproven terminal ${
     const view = await c.get(input.taskId); assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
     assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
   } finally { interruptProgressController(second); }
+});
+
+
+for (const boundary of ['implementation', 'validation', 'review'])
+test(`safe restart classification preserves concurrent SQLite completion at ${boundary}`, async t => {
+  const { c, root } = await setup(t), task = progressTask(c), id = task.id;
+  if (boundary === 'implementation') { task.implementer.state = 'running'; task.implementer.local.result_received = false; }
+  if (boundary === 'validation') task.local_validation.status = 'running';
+  if (boundary === 'review') task.reviewer.state = 'running';
+  c.save(task); interruptProgressController(c);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  const next = new Controller({ stateRoot: `${root}/state`, workspaceRoot: `${root}/work`, executor: new FakeExecutor(),
+    localBackendFactory() { assert.fail('Restart model replay'); }, localValidationFactory() { assert.fail('Restart validation replay'); } });
+  // Let normal startup reconcile first; interleave only when it next tries
+  // to classify the interrupted execution using a stale persisted predecessor.
+  const save = next.save.bind(next); let committed, interleaved = false;
+  next.save = (value, options) => {
+    const classified = boundary === 'implementation' ? value.implementer.state === 'needs_attention' :
+      boundary === 'validation' ? value.local_validation.status === 'uncertain' : value.reviewer.state === 'needs_attention';
+    if (!interleaved && classified) {
+      interleaved = true;
+      const current = second.task(id);
+      current.implementer = progressTask(second).implementer;
+      current.reviewer.state = 'completed'; current.local_validation.status = 'completed';
+      current.automatic.status = 'stopped'; current.automatic.reason = 'AUTOMATIC_VALIDATION_FAILED';
+      second.save(current); committed = statusLedger(second.db);
+    }
+    return save(value, options);
+  };
+  try {
+    await next.init();
+    assert.equal(interleaved, true);
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(next.persistenceFailures.has(id), true);
+    const before = statusLedger(next.db), view = await next.get(id);
+    assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.progress.resume_authorized, false);
+    assert.equal(statusLedger(next.db), before);
+    assert.equal(next.automaticJobs.size + next.localRuns.size + next.validationRuns.size, 0);
+  } finally { interruptProgressController(next); interruptProgressController(second); }
+});
+
+for (const timing of ['before expiry', 'during cancellation', 'during bookkeeping'])
+test(`safe restart expiry preserves committed publication ${timing}`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c), id = input.taskId;
+  c.operation(input.id, input.kind, input.payload, id);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  let committed, stops = 0, cleanups = 0;
+  const complete = () => {
+    // Model the existing recovery transaction, including its atomic operation
+    // acknowledgment. Full historical proof is exercised in integration tests.
+    const current = second.task(id); current.automatic.status = 'succeeded'; current.automatic.reason = null;
+    current.automatic.human_attention_required = false;
+    second.save(current, { operation: { id: input.id, status: 'accepted' } }); committed = statusLedger(second.db);
+  };
+  if (timing === 'before expiry') complete();
+  c.stopLocalWithoutStorage = async () => { stops++; if (timing === 'during cancellation') complete(); return { confirmed: true, diagnostics: [] }; };
+  const save = c.save.bind(c);
+  c.save = (value, options) => { if (timing === 'during bookkeeping' && value.automatic.expiry_stop) complete(); return save(value, options); };
+  c.cleanup = async () => { cleanups++; };
+  try {
+    await c.expireAutomatic(id);
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(stops, timing === 'before expiry' ? 0 : 1); assert.equal(cleanups, 0);
+    assert.equal(second.task(id).automatic.status, 'succeeded');
+    assert.equal(second.task(id).deadline, input.task.deadline);
+    assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
+  } finally { interruptProgressController(second); }
+});
+
+
+for (const fault of ['read failure', 'unproven success', 'prior latch', 'unresolved transaction'])
+test(`safe restart expiry still cancels owned resources with ${fault}`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c), id = input.taskId;
+  c.operation(input.id, input.kind, input.payload, id);
+  c.finishAutomatic(id, 'succeeded', null);
+  if (fault === 'unproven success') c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=?').run(id);
+  if (fault === 'prior latch') c.persistenceFailures.add(id);
+  if (fault === 'unresolved transaction') c.transactionUnresolved = true;
+  const read = c.task.bind(c);
+  if (fault === 'read failure') c.task = () => { throw Error('Synthetic storage unavailable'); };
+  let stops = 0;
+  c.stopLocalWithoutStorage = async () => { stops++; return { confirmed: true, diagnostics: [] }; };
+  try {
+    await c.expireAutomatic(id);
+    assert.equal(stops, 1); assert.equal(c.persistenceFailures.has(id), true);
+    assert.equal(read(id).automatic.status, 'succeeded');
+    assert.equal(read(id).cleanup, undefined);
+  } finally { c.task = read; c.transactionUnresolved = false; }
 });

@@ -272,29 +272,38 @@ export class Controller {
         t = this.task(t.id);
         if (this.persistenceFailures.has(t.id)) continue;
       }
+      const expectedTask = JSON.stringify(t);
       if (t.automatic?.status === 'progressing') {
         Object.assign(t.automatic, { status: 'uncertain', reason: 'AUTOMATIC_RESTART_NO_REPLAY', human_attention_required: true });
-        this.save(t);
       }
       if (t.execution_backend === 'local_codex') {
         if (t.correction && t.correction_state !== 'awaiting_review' && !t.cleaned) {
-          t.correction_state = 'needs_attention'; t.correction_reason ||= 'CORRECTION_RESTART_NO_REPLAY'; this.save(t);
+          t.correction_state = 'needs_attention'; t.correction_reason ||= 'CORRECTION_RESTART_NO_REPLAY';
         }
         if (t.local_validation && !['completed', 'unavailable', 'interrupted', 'uncertain'].includes(t.local_validation.status)) {
           t.local_validation.status = 'uncertain'; t.local_validation.diagnostic = 'VALIDATION_RESTART_NO_REPLAY';
-          t.local_validation.termination_confirmed = false; this.save(t);
+          t.local_validation.termination_confirmed = false;
         }
         if (!t.cleaned && !t.implementer.local.result_received) {
           t.implementer.state = 'needs_attention';
           Object.assign(t.implementer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true });
           this.invalidateLocalRequests(t, 'LOCAL_RESTART_CALLBACK_UNAVAILABLE');
-          t.implementer.local.diagnostics = ['LOCAL_RESTART_UNRESOLVED_NO_REPLAY']; this.save(t);
+          t.implementer.local.diagnostics = ['LOCAL_RESTART_UNRESOLVED_NO_REPLAY'];
         }
         if (t.reviewer && !this.localPacketRetryEligible(t) && (!t.reviewer.local.result_received || !t.reviewer.local.server_closed || ['starting', 'running', 'finishing'].includes(t.reviewer.state))) {
           t.reviewer.state = 'needs_attention'; t.reviewer.review_result = null;
           Object.assign(t.reviewer.local, { phase: 'restart_attention', execution_state: 'uncertain', human_attention_required: true,
             diagnostics: ['LOCAL_REVIEW_RESTART_NO_REPLAY'] });
-          this.save(t);
+        }
+        // Classify one persisted predecessor atomically. A competing Controller
+        // may have retained completion while startup was examining this task.
+        // A stale classifier cannot replace those facts or acquire authority.
+        if (JSON.stringify(t) !== expectedTask) {
+          try { this.save(t, { expectedTask }); }
+          catch (error) {
+            if (!t.automatic && !t.correction) throw error;
+            this.persistenceFailures.add(t.id);
+          }
         }
         continue;
       }
@@ -3335,6 +3344,9 @@ export class Controller {
     return { confirmed: diagnostics.size === 0, diagnostics: [...diagnostics] };
   }
   async expireAutomatic(id) {
+    // A delayed timer has no authority over a committed terminal publication.
+    // Storage failure must still reach the cancellation path below.
+    try { if (this.preserveAutomaticSuccess(this.task(id)) && !this.persistenceFailures.has(id)) return; } catch { /* Stop owned resources even without storage. */ }
     // The stop latch and owned-resource shutdown do not depend on any SQLite
     // read/write. Timer callbacks must never escape before cancellation runs.
     this.expiryStops.set(id, { confirmed: false, diagnostics: ['AUTOMATIC_EXPIRY_STOP_PENDING'] });
@@ -3349,9 +3361,11 @@ export class Controller {
     try {
       if (this.persistenceFailures.has(id)) { this.persistenceAttention(id); return; }
       const task = this.task(id), stop = this.expiryStops.get(id);
+      if (this.preserveAutomaticSuccess(task)) return;
+      const expectedTask = JSON.stringify(task);
       task.automatic.expiry_stop = stop;
       if (!stop.confirmed) Object.assign(task.automatic, { status: 'uncertain', human_attention_required: true });
-      this.save(task);
+      this.save(task, { expectedTask });
       await this.cleanup({ task_id: id }, automaticTransition);
     } catch {
       this.persistenceFailures.add(id); this.persistenceAttention(id);
