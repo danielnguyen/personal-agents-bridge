@@ -265,7 +265,12 @@ export class Controller {
     this.pruneDiagnostics();
     // No automatic replay of potentially accepted mutations after restart.
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
-      const t = JSON.parse(row.value);
+      let t = JSON.parse(row.value);
+      if (t.automatic) {
+        await this.reconcileAutomaticPublication(t.id);
+        t = this.task(t.id);
+        if (this.persistenceFailures.has(t.id)) continue;
+      }
       if (t.automatic?.status === 'progressing') {
         Object.assign(t.automatic, { status: 'uncertain', reason: 'AUTOMATIC_RESTART_NO_REPLAY', human_attention_required: true });
         this.save(t);
@@ -296,6 +301,118 @@ export class Controller {
     }
     this.sweeper = setInterval(() => this.expire().catch(() => {}), 30000); this.sweeper.unref();
     return this;
+  }
+  async verifyCompletedAutomaticPublication(task) {
+    this.storageAuthority();
+    const a = task.automatic, p = task.publication, ref = task.reviewer, binding = a.contract_binding;
+    if (task.execution_backend !== 'local_codex' || task.correction || a.correction || a.corrective_publication ||
+        task.cleaned || task.workspace_deleted || task.cleanup || a.expiry_stop || task.previous_reviewers?.length || task.publication_error ||
+        a.phase !== 'publication' || task.publication_frozen !== true || p?.phase !== 'complete' ||
+        p.push_attempted !== true || p.pr_attempted !== true || p.commit_tree_matches_reviewed_tree !== true ||
+        p.input_sha256 !== digest({ title: a.authorization.publish.title, body: a.authorization.publish.body, draft: true }) ||
+        !binding || digest(binding.contract) !== binding.sha256 || task.baseline !== task.repository?.baseline_commit ||
+        task.deadline !== a.deadline || !Number.isSafeInteger(task.deadline) || !Number.isSafeInteger(task.created) || task.created >= task.deadline ||
+        task.deadline > task.created + a.authorization.max_duration_seconds * 1000 ||
+        digest(this.automaticAuthorization({ execution_backend: task.execution_backend, repository_id: task.repository.repository_id, automatic: a.authorization })) !== digest(a.authorization)) {
+      throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
+    }
+    const completed = Date.parse(p.completed_at), prepared = Date.parse(p.prepared_at);
+    if (!Number.isFinite(completed) || !Number.isFinite(prepared) || prepared < task.created || completed < prepared || completed > Date.now()) throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
+    if (completed >= task.deadline) throw new BridgeError('AUTOMATIC_PUBLICATION_AFTER_DEADLINE');
+    const startPayload = { execution_backend: 'local_codex', input: { contract: binding.contract, repository_id: task.repository.repository_id,
+      base_ref: task.repository.base_ref, automatic: a.authorization } };
+    const expected = [[task.request_id, digest({ kind: 'start', payload: startPayload }), ['accepted']],
+      [a.review_request_id, digest({ kind: 'review', payload: { id: task.id } }), ['accepted']],
+      [a.publish_request_id, digest({ kind: 'automatic_publish', payload: { task_id: task.id, ...a.authorization.publish } }), ['pending', 'accepted']]];
+    const operations = this.db.prepare('SELECT * FROM operations WHERE task_id=? ORDER BY id').all(task.id);
+    if (new Set(expected.map(([id]) => id)).size !== 3 || operations.length !== 3 || expected.some(([id, fingerprint, statuses]) =>
+      !operations.some(row => row.id === id && row.task_id === task.id && row.fingerprint === fingerprint && statuses.includes(row.status)))) throw new BridgeError('AUTOMATIC_RECOVERY_OPERATION_INVALID');
+    this.verifyAutomaticEvidence(task, { progressing: true });
+    if (ref?.evidence_retention?.packet !== 'retained' || ref.evidence_retention.review !== 'retained' ||
+        [task.implementer, ref].some(role => role.local.owner_instance !== a.owner_instance) || !a.owner_instance ||
+        ref.request_id !== a.review_request_id || task.implementer.local.thread_id === ref.local.thread_id ||
+        task.implementer.local.turn_id === ref.local.turn_id) throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
+    const records = this.db.prepare('SELECT value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => JSON.parse(row.value));
+    const review = records.find(record => record.kind === 'review_result' && record.findings_sha256 === ref.findings_sha256 &&
+      record.received_output_sha256 === ref.received_output_sha256 && digest(record.review_result) === ref.findings_sha256);
+    if (!review || digest(review.original_contract) !== digest(binding) || digest(review.limits) !== digest(a.authorization) ||
+        review.deadline !== task.deadline || digest(review.independent_validation) !== digest(task.local_validation) ||
+        digest(review.reviewed_git_state) !== digest(ref.reviewed_git_state) ||
+        !records.some(record => record.packet_utf8 !== undefined && digest(record.packet_utf8) === ref.packet_hash) ||
+        records.some(record => record.kind === 'outcome' && !['progressing', 'uncertain'].includes(record.outcome) || record.correction || record.corrective_publication)) throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
+    const packet = await this.qualifyLocalPublication(task, { historical: true });
+    this.verifyReceivedReview(task, ref.received_review_output, ref.received_output_sha256, packet);
+    const assessed = this.reviewProtocol(task) === LOCAL_ACTIONABILITY_REVIEW_VERSION ? null :
+      validateLocalReview(ref.received_review_output.output, binding.contract, packet, this.bounded.bind(this));
+    if (assessed && ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']
+      .some(key => digest(assessed[key]) !== digest(ref.review_result[key]))) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
+    const readGit = asynchronousRepoGit(AbortSignal.timeout(10000)), repo = path.join(this.workspaceRoot, task.id, 'repo');
+    if (!/^[a-f0-9]{40,64}$/.test(p.commit_sha) || p.pushed_branch !== `bridge/${task.id}`) throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
+    const commit = await readGit(repo, 'cat-file', '-p', p.commit_sha);
+    const headers = commit.split('\n\n')[0].split('\n');
+    if (headers[0] !== `tree ${ref.reviewed_git_state.tree_sha}` || headers.filter(line => line.startsWith('parent ')).join() !== `parent ${task.baseline}`) throw new BridgeError('PUBLICATION_TREE_MISMATCH');
+    const changes = (await readGit(repo, 'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', task.baseline, p.commit_sha)).split('\0').filter(Boolean);
+    if (changes.some(name => !binding.contract.allowed_files.includes(name))) throw new BridgeError('PUBLICATION_SCOPE_VIOLATION');
+    const target = await this.publisher.target(task.repository);
+    if (digest(target) !== digest(p.target) || target.base === p.pushed_branch) throw new BridgeError('PUBLICATION_TARGET_CHANGED');
+    if (await this.publisher.remoteHead(repo, target, p.pushed_branch) !== p.commit_sha) throw new BridgeError('PUBLICATION_REMOTE_BRANCH_CONFLICT');
+    const pr = await this.publisher.findPR(target, p.pushed_branch);
+    // Same identity requirements as the trusted publisher, plus the exact PR
+    // number/URL retained at completion. No publication method is called here.
+    if (!Number.isSafeInteger(p.pr_number) || p.pr_number <= 0 || pr?.number !== p.pr_number || pr.state !== 'open' || pr.draft !== true || pr.merged_at ||
+        pr.head?.ref !== p.pushed_branch || pr.head?.sha !== p.commit_sha || pr.head?.repo?.full_name !== target.repository ||
+        pr.base?.ref !== target.base || pr.base?.repo?.full_name !== target.repository || pr.html_url !== p.pr_url ||
+        p.pr_url !== `https://github.com/${target.repository}/pull/${p.pr_number}`) throw new BridgeError('PUBLICATION_PR_CONFLICT');
+    // Recheck local proof after network waits. This never calls reviewContext or
+    // automaticGuard with a substituted owner or a renewed deadline.
+    if (await this.publisher.remoteHead(repo, target, p.pushed_branch) !== p.commit_sha) throw new BridgeError('PUBLICATION_REMOTE_BRANCH_CONFLICT');
+    await this.qualifyLocalPublication(task, { historical: true });
+    this.verifyAutomaticEvidence(task, { progressing: true });
+    return JSON.stringify(operations);
+  }
+  async reconcileAutomaticPublication(id) {
+    return this.locked(id, async () => {
+      const task = this.task(id), a = task.automatic;
+      if (!a || a.status === 'succeeded') return;
+      const snapshot = JSON.stringify(task);
+      let outcome = 'external_effects_uncertain', reason = /^[A-Z_]{1,100}$/.test(a.reason || '') ? a.reason : 'AUTOMATIC_RESTART_NO_REPLAY', operations;
+      const interrupted = ['progressing', 'uncertain'].includes(a.status);
+      if (!interrupted) {
+        outcome = a.status === 'stopped' ? a.reason === 'TASK_EXPIRED' ? 'expired' : 'stopped' : 'evidence_unconfirmed';
+        if (a.status !== 'stopped') { a.status = 'uncertain'; a.reason = reason = 'AUTOMATIC_RECOVERY_PROOF_UNCONFIRMED'; }
+        a.human_attention_required = true;
+      }
+      else if (task.correction || a.correction || a.corrective_publication) reason = 'AUTOMATIC_CORRECTION_RECOVERY_UNSUPPORTED';
+      else if (task.publication?.phase === 'complete') {
+        try {
+          operations = await this.verifyCompletedAutomaticPublication(task);
+          outcome = 'publication_confirmed'; reason = null;
+        } catch (error) {
+          outcome = error.code === 'AUTOMATIC_PUBLICATION_AFTER_DEADLINE' ? 'expired' : 'evidence_unconfirmed';
+          // Never expose provider messages, paths or evidence packets in status.
+          reason = ['PUBLICATION_REMOTE_BRANCH_CONFLICT', 'PUBLICATION_PR_CONFLICT', 'PUBLICATION_TARGET_CHANGED',
+            'PUBLICATION_TREE_MISMATCH', 'AUTOMATIC_PUBLICATION_AFTER_DEADLINE'].includes(error.code) ? error.code : 'AUTOMATIC_RECOVERY_PROOF_UNCONFIRMED';
+        }
+      } else if (Date.now() >= task.deadline) { outcome = 'expired'; reason = 'TASK_EXPIRED'; }
+      const confirmed = outcome === 'publication_confirmed';
+      a.reconciliation = { outcome, confirmed, attempt_id: a.review_request_id, publication_id: a.publish_request_id, reason };
+      if (interrupted) Object.assign(a, { status: confirmed ? 'succeeded' : 'uncertain', reason: confirmed ? null : reason, human_attention_required: !confirmed });
+      try {
+        this.save(task, { expectedTask: snapshot, expectedOperations: operations,
+          ...(confirmed ? { operation: { id: a.publish_request_id, status: 'accepted' } } : {}) });
+      } catch {
+        this.persistenceFailures.add(id);
+        // Best effort only. A silent/failed write remains visible through the
+        // connection's attention latch even when this diagnostic cannot commit.
+        try {
+          const current = this.task(id);
+          Object.assign(current.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true,
+            reconciliation: { outcome: 'evidence_unconfirmed', confirmed: false, attempt_id: a.review_request_id,
+              publication_id: a.publish_request_id, reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED' } });
+          this.save(current);
+        } catch { /* No authority can be inferred from missing bookkeeping. */ }
+      }
+    });
   }
   storageAuthority(allowOwned = false) {
     // An unknown transaction is a connection-wide boundary. Even returning to
@@ -340,11 +457,11 @@ export class Controller {
       throw error;
     } finally { if (!nested) this.transactionOwner = null; }
   }
-  save(task, { packetText, operation, relatedTask } = {}) {
+  save(task, { packetText, operation, relatedTask, expectedTask, expectedOperations } = {}) {
     // SAVEPOINT composes with the existing human-response transaction. No await
     // may separate these writes: acceptance, evidence and task state commit together.
     const writes = relatedTask ? [relatedTask, task] : [task];
-    const protectedWrite = writes.some(t => t.correction || t.automatic?.correction);
+    const protectedWrite = writes.some(t => t.correction || t.automatic?.correction || t.automatic?.reconciliation);
     const intended = new Map(), operationStates = new Map(), reviewStates = new Map(), retained = [];
     const verify = () => {
       if (!protectedWrite) return;
@@ -362,6 +479,10 @@ export class Controller {
     try {
       for (const t of writes) intended.set(t.id, JSON.stringify(t));
       this.transaction(() => {
+        if ((expectedTask !== undefined && this.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id)?.value !== expectedTask) ||
+            (expectedOperations !== undefined && JSON.stringify(this.db.prepare('SELECT * FROM operations WHERE task_id=? ORDER BY id').all(task.id)) !== expectedOperations)) {
+          throw new BridgeError('AUTOMATIC_RECONCILIATION_STATE_CHANGED');
+        }
         for (const t of writes) {
           if (t.correction) operationStates.set(t.id, operation?.id === t.request_id ? operation.status :
             this.db.prepare('SELECT status FROM operations WHERE id=?').get(t.request_id)?.status);
@@ -388,7 +509,7 @@ export class Controller {
             const record = this.retainAutomaticAttempt(t, packetText); if (t.correction && t.automatic) retained.push(record);
           }
           if (t.automatic && (t.reviewer?.review_result || t.reviewer?.received_review_output || t.automatic.status !== 'progressing')) {
-            const record = this.retainAutomaticAttempt(t); if (t.correction || t.automatic.corrective_publication) retained.push(record);
+            const record = this.retainAutomaticAttempt(t); if (t.correction || t.automatic.corrective_publication || t.automatic.reconciliation) retained.push(record);
           }
           if (t.correction) {
             const observation = this.correctiveObservation(t);
@@ -451,7 +572,7 @@ export class Controller {
   async invoke(name, input, extra, handler) {
     if (name === 'get_task') {
       const task = this.task(input.task_id);
-      if (task.correction || (task.automatic && (task.automatic.authorization.review_protocol !== undefined || task.automatic.review_authorization))) {
+      if (task.correction || (task.automatic && (task.automatic.reconciliation || task.automatic.authorization?.review_protocol !== undefined || task.automatic.review_authorization))) {
         // Server authorization still precedes invoke. This status contract also
         // excludes audit inserts/final task saves, including inherited audit context.
         return this.context.run(undefined, () => handler(input));
@@ -789,8 +910,9 @@ export class Controller {
     return { overall: review.overall };
   }
   async automaticReviewSummary(task) {
-    const summary = { protocol: task.automatic.authorization.review_protocol === undefined ? 'pab.local-review.v2' : LOCAL_ACTIONABILITY_REVIEW_VERSION,
+    const summary = { protocol: task.automatic.authorization?.review_protocol === undefined ? 'pab.local-review.v2' : LOCAL_ACTIONABILITY_REVIEW_VERSION,
       state: 'not_started', potentially_correctable: false, execution_authorized: false, blockers: ['CORRECTION_EXECUTION_DISABLED'] };
+    if (task.automatic.reconciliation?.confirmed === true) return { ...summary, state: 'pass' };
     try {
       const protocol = this.reviewProtocol(task), ref = task.reviewer;
       if (protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION) {
@@ -1765,7 +1887,7 @@ export class Controller {
   }
   localView(t, role = 'implementer') {
     const ref = t[role], local = ref.local;
-    const versioned = !!t.correction || (!!t.automatic && (t.automatic.authorization.review_protocol !== undefined || t.automatic.review_authorization));
+    const versioned = !!t.correction || (!!t.automatic && (t.automatic.authorization?.review_protocol !== undefined || t.automatic.review_authorization));
     const visibleLocal = versioned ? Object.fromEntries(['phase', 'execution_state', 'thread_id', 'turn_id', 'model', 'authentication',
       'turn_submission_attempted', 'turn_submission_acknowledged', 'terminal_observed', 'result_received', 'server_closed', 'human_attention_required']
       .map(key => [key, local[key]])) : local;
@@ -1902,9 +2024,9 @@ export class Controller {
     try { this.storageAuthority(); }
     catch (error) { refresh = false; storageDiagnostic = error instanceof BridgeError ? error.code : 'STORAGE_UNAVAILABLE'; }
     let t = this.task(id);
-    const versioned = !!t.correction || (!!t.automatic && (t.automatic.authorization.review_protocol !== undefined || t.automatic.review_authorization));
+    const versioned = !!t.correction || (!!t.automatic && (t.automatic.authorization?.review_protocol !== undefined || t.automatic.review_authorization));
     if (t.automatic || t.correction) refresh = false;
-    const result = { ...(t.review_packet_diagnostic ? { review_packet_diagnostic: t.review_packet_diagnostic } : {}), task_id: id, state: t.cleaned ? 'cleaned' : t.implementer.state, implementer: null, reviewer: null, cleanup: t.cleanup || null, expires_at: new Date(t.deadline).toISOString() };
+    const result = { ...(t.review_packet_diagnostic ? { review_packet_diagnostic: t.review_packet_diagnostic } : {}), task_id: id, state: t.cleaned ? 'cleaned' : t.implementer.state, implementer: null, reviewer: null, cleanup: t.cleanup || null, expires_at: Number.isFinite(new Date(t.deadline).valueOf()) ? new Date(t.deadline).toISOString() : null };
     result.execution_backend = t.execution_backend || 'agents_api';
     for (const role of ['implementer', 'reviewer']) {
       if (!t[role]) continue;
@@ -1952,9 +2074,16 @@ export class Controller {
           reviewer_turn_submissions_attempted: Number(t.reviewer?.local.turn_submission_attempted === true), correction_turns: t.automatic.correction ? null : 0,
           token_usage: null, subscription_billing_attribution: 'unverified' } };
       result.automatic.review = await this.automaticReviewSummary(t);
-      if (versioned && this.persistenceFailures.has(id)) {
+      if (t.automatic.reconciliation) result.automatic.reconciliation = {
+        outcome: this.bounded(t.automatic.reconciliation.outcome, 64), confirmed: t.automatic.reconciliation.confirmed === true,
+        attempt_id: this.bounded(t.automatic.reconciliation.attempt_id, 100), publication_id: this.bounded(t.automatic.reconciliation.publication_id, 100),
+        reason: this.bounded(t.automatic.reconciliation.reason, 100) };
+      if (this.persistenceFailures.has(id)) {
         result.automatic.status = 'uncertain'; result.automatic.human_attention_required = true;
         result.automatic.runtime_diagnostic = 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED';
+        if (t.automatic.reconciliation || t.automatic.owner_instance !== this.instanceId) result.automatic.reconciliation = {
+          outcome: 'evidence_unconfirmed', confirmed: false, attempt_id: this.bounded(t.automatic.review_request_id, 100),
+          publication_id: this.bounded(t.automatic.publish_request_id, 100), reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED' };
       }
       if (this.expiryStops.has(id)) {
         result.automatic.expiry_stop = this.expiryStops.get(id);
@@ -1967,10 +2096,12 @@ export class Controller {
           t.reviewer.evidence_retention.packet === 'pending' || t.reviewer.evidence_retention.review === 'awaiting_receipt' };
       const retained = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(id);
       if (retained) {
-        const observation = JSON.parse(retained.value);
-        result.automatic.attempt_evidence = { attempt_id: observation.attempt_id,
-          latest_observation_sha256: retained.observation_sha256, correction_eligibility: versioned ?
-            { eligible: false, execution_authorized: false, blockers: ['CORRECTION_EXECUTION_DISABLED'] } : observation.correction_eligibility };
+        try {
+          const observation = JSON.parse(retained.value);
+          result.automatic.attempt_evidence = { attempt_id: observation.attempt_id,
+            latest_observation_sha256: retained.observation_sha256, correction_eligibility: versioned ?
+              { eligible: false, execution_authorized: false, blockers: ['CORRECTION_EXECUTION_DISABLED'] } : observation.correction_eligibility };
+        } catch { result.automatic.attempt_evidence = { attempt_id: this.bounded(t.automatic.review_request_id, 100), unavailable: true }; }
       }
       if (!t.cleaned) result.state = result.automatic.status;
     }
@@ -2729,7 +2860,7 @@ export class Controller {
     this.save(task, { operation: { id: task.reviewer.request_id, status: task.reviewer.review_result ? 'accepted' : 'uncertain' } });
     this.pendingReviewResults.delete(id);
   }
-  async qualifyLocalPublication(task) {
+  async qualifyLocalPublication(task, { historical = false } = {}) {
     if (!task.reviewer || task.reviewer.stale || task.reviewer.state !== 'completed' || task.reviewer.review_result?.overall !== 'PASS') throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
     for (const role of ['implementer', 'reviewer']) {
       const ref = task[role];
@@ -2738,7 +2869,7 @@ export class Controller {
     }
     if (this.localRuns.has(task.id) || this.localRuns.has(`${task.id}:reviewer`) || this.validationRuns.has(task.id) ||
         task.reviewer.local.thread_id === task.implementer.local.thread_id) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
-    const packet = await this.verifyLocalReviewPacket(task), result = task.reviewer.review_result;
+    const packet = historical ? await this.currentReviewPacket(task) : await this.verifyLocalReviewPacket(task), result = task.reviewer.review_result;
     if (packet.execution?.task_id !== task.id || ['thread_id', 'turn_id', 'model', 'authentication', 'adapter_contract'].some(key =>
       packet.execution?.[key] !== task.implementer.local[key])) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
     const root = path.join(this.workspaceRoot, task.id), contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'));
@@ -2749,7 +2880,19 @@ export class Controller {
     if (!independentValidationPassed(task.local_validation, contract.test_commands, packet.reviewed_git_state, task.id) ||
         JSON.stringify(task.local_validation) !== JSON.stringify(packet.independent_validation)) throw new BridgeError('LOCAL_PUBLICATION_VALIDATION_UNVERIFIED');
     const versioned = this.reviewProtocol(task) === LOCAL_ACTIONABILITY_REVIEW_VERSION;
-    const qualified = versioned ? this.revalidateVersionedReview(task, packet) :
+    let qualified;
+    if (versioned && historical) {
+      // Retained context certifies historical review only; it never restores the
+      // previous instance's execution authority or substitutes a new owner.
+      this.verifyVersionedReviewBinding(task, packet, result, task.reviewer.findings_sha256, false);
+      if (Object.keys(result.controller_context || {}).sort().join() !== 'authorityValid,executionQualified,reviewerIndependent,uncertaintyFree' ||
+          !Object.values(result.controller_context).every(value => value === true)) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
+      qualified = { ...validateLocalActionabilityReview(result.review_output, contract, packet, this.bounded.bind(this), result.controller_context),
+        controller_context: result.controller_context };
+      for (const key of ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']) {
+        if (digest(qualified[key]) !== digest(result[key])) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
+      }
+    } else qualified = versioned ? this.revalidateVersionedReview(task, packet) :
       validateLocalReview(JSON.stringify({ overall: result.overall, findings: result.findings }), contract, packet, this.bounded.bind(this));
     if (versioned && (!qualified.controller_context.reviewerIndependent || !qualified.controller_context.executionQualified ||
         !qualified.controller_context.authorityValid || !qualified.controller_context.uncertaintyFree)) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
@@ -2761,6 +2904,7 @@ export class Controller {
         publication.reviewer_thread_id !== task.reviewer.local.thread_id || publication.reviewer_turn_id !== task.reviewer.local.turn_id ||
         publication.review_overall !== 'PASS')) throw new BridgeError('LOCAL_PUBLICATION_BINDING_CHANGED');
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+    return packet;
   }
   async publish(input, owner) {
     if (!input || Object.keys(input).some(k => !['task_id', 'title', 'body', 'draft'].includes(k)) ||
@@ -3096,7 +3240,10 @@ export class Controller {
     if (this.closed) return;
     this.pruneDiagnostics();
     for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
-      const t = JSON.parse(row.value); if (!t.cleaned && Date.now() > t.deadline) await this.cleanup({ task_id: t.id }, automaticTransition);
+      const t = JSON.parse(row.value);
+      // Restart classification grants no automatic resource-cleanup authority.
+      if (t.automatic?.reconciliation) continue;
+      if (!t.cleaned && Date.now() > t.deadline) await this.cleanup({ task_id: t.id }, automaticTransition);
     }
   }
   async close() {

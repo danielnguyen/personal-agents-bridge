@@ -15,7 +15,8 @@ import { createHash } from 'node:crypto';
 import { PassThrough, Writable } from 'node:stream';
 import { LocalCodexBackend } from '../local-codex-backend.mjs';
 import { compareSnapshots } from '../review-evidence.mjs';
-import { GitHubPublisher } from '../publication.mjs';
+import { GitHubPublisher, publicationState } from '../publication.mjs';
+import { LocalValidation } from '../local-validation.mjs';
 
 class FakeLocal {
   constructor(options, mode = {}) { this.options = options; this.mode = mode; this.calls = []; }
@@ -27,7 +28,7 @@ class FakeLocal {
     this.emit('model_selected');
     this.identity.threadId = this.options.reviewOnly ? this.mode.reviewThread || 'review-thread-fixture' : 'thread-fixture'; this.emit('thread_acknowledged');
     this.identity.turnSubmissionAttempted = true; this.emit('turn_submitting');
-    if (!this.mode.unacknowledged) { this.identity.turnId = 'turn-fixture'; this.identity.turnSubmissionAcknowledged = true; this.emit('turn_acknowledged'); }
+    if (!this.mode.unacknowledged) { this.identity.turnId = this.options.reviewOnly ? this.mode.reviewTurn || 'turn-fixture' : 'turn-fixture'; this.identity.turnSubmissionAcknowledged = true; this.emit('turn_acknowledged'); }
     this.options.onProgress({ method: 'item/agentMessage/delta', params: { delta: 'Model says test-sensitive-value token=private https://private.invalid' } });
     if (this.mode.status) this.finish(this.mode.status, this.mode.terminal !== false);
     return pending;
@@ -35,7 +36,7 @@ class FakeLocal {
   finish(status = 'completed', terminal = true, output) {
     this.identity.terminalObserved = terminal;
     if (terminal) this.emit('terminal_observed', { status });
-    this.resolve({ ...this.identity, status, authentication: 'chatgpt', commands: [{ command: 'untrusted test', exitCode: 0 }], messages: output ? [{ provenance: 'model', text: output }] : [], uncertainties: this.options.reviewOnly ? this.mode.reviewDiagnostics || [] : ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
+    this.resolve({ ...this.identity, status, authentication: 'chatgpt', commands: [{ command: 'untrusted test', exitCode: 0 }], messages: output ? [{ provenance: 'model', text: output }] : [], uncertainties: this.options.reviewOnly ? this.mode.reviewDiagnostics || [] : this.mode.implementationDiagnostics || ['Evidence is incomplete: test-sensitive-value token=private https://private.invalid'] });
   }
   respondToRequest(input) {
     this.mode.onDeliver?.(input);
@@ -1511,4 +1512,237 @@ for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real
   assert.equal(calls.filter(method => method === 'thread/start').length, 1); assert.equal(calls.filter(method => method === 'turn/start').length, 1);
   assert.equal(controller._api, undefined); assert.equal(value.executor.started.length, 0);
   assert.equal(view.implementer.local.server_closed, true);
+});
+
+
+// Complete the real Controller's implementation/review/publication path using
+// fake sessions and a memory-only GitHub remote; interrupt only final status.
+async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false } = {}) {
+  let validations = 0;
+  const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, {
+    noApi: true, localValidationFactory: options => {
+      const runner = new LocalValidation(options), run = runner.run.bind(runner);
+      runner.run = input => { validations++; return run(input); }; return runner;
+    },
+  });
+  const counts = { pushes: 0, creates: 0, reads: 0 };
+  const publisher = {
+    async target() { counts.reads++; return { repository: 'fixture/reconciliation', base: 'main', remote: 'https://github.com/fixture/reconciliation.git' }; },
+    async remoteHead() { counts.reads++; return this.remote || null; },
+    async push(repo, target, branch, commit) { counts.pushes++; this.remote = commit; if (afterPush) throw Error('Lost push acknowledgment'); },
+    async findPR() { counts.reads++; return this.pr || null; },
+    async createPR(target, branch) {
+      counts.creates++;
+      this.pr = { number: 7, html_url: 'https://github.com/fixture/reconciliation/pull/7', state: 'open', draft: true, merged_at: null,
+        head: { ref: branch, sha: this.remote, repo: { full_name: target.repository } }, base: { ref: target.base, repo: { full_name: target.repository } } };
+      if (beforeCompletion) throw Error('Lost PR creation acknowledgment');
+      return this.pr;
+    },
+  };
+  value.controller.publisher = publisher; value.config.publisher = publisher;
+  repoGit(value.normal, 'remote', 'add', 'origin', 'https://github.com/fixture/reconciliation.git');
+  value.input.contract.test_commands = ['test "$(cat greeting.txt)" = candidate'];
+  value.input.automatic = { ...automaticAuthority(), max_codex_turns: turns, max_corrections: turns > 2 ? 1 : 0,
+    ...(versioned || turns > 2 ? { review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } : {}),
+    ...(turns === 4 ? { publish_after_correction: true } : {}) };
+  const finish = value.controller.finishAutomatic.bind(value.controller);
+  value.controller.finishAutomatic = (id, status, reason) => { if (status !== 'succeeded') finish(id, status, reason); };
+  const opDone = value.controller.opDone.bind(value.controller);
+  if (pendingOperation) value.controller.opDone = (id, status) => { if (!id.startsWith('automatic_publish_')) opDone(id, status); };
+  const started = await value.start(), implementer = await value.running();
+  await fs.writeFile(path.join(implementer.options.cwd, 'greeting.txt'), 'candidate\n');
+  implementer.finish(); await value.drain();
+  const reviewer = await value.running(1), raw = JSON.parse(reviewOutput());
+  if (versioned || turns > 2) { raw.format = LOCAL_ACTIONABILITY_REVIEW_VERSION; raw.findings.forEach(finding => { finding.classification = null; }); }
+  reviewer.finish('completed', true, JSON.stringify(raw)); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const task = value.controller.task(started.task_id);
+  assert.equal(task.publication?.phase, afterPush ? 'prepared' : beforeCompletion ? 'pushed' : 'complete', JSON.stringify(task.automatic));
+  assert.equal(task.automatic.status, beforeCompletion || afterPush ? 'uncertain' : 'progressing', JSON.stringify(task.automatic));
+  assert.equal(task.reviewer.review_result.overall, 'PASS');
+  assert.equal(counts.pushes, 1); assert.equal(counts.creates, afterPush ? 0 : 1); assert.equal(validations, 1); assert.equal(value.instances.length, 2);
+  return { ...value, task, publisher, counts, validations: () => validations };
+}
+function interruptController(controller) {
+  // Abrupt connection loss, without graceful shutdown mutating retained facts.
+  clearInterval(controller.sweeper);
+  for (const timer of controller.automaticTimers.values()) clearTimeout(timer);
+  controller.closed = true; controller.dbClosed = true; controller.db.close();
+}
+const recoveryLedger = c => JSON.stringify(['tasks', 'operations', 'automatic_attempts', 'audit', 'failures']
+  .map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+
+for (const mode of [{ turns: 2 }, { turns: 2, versioned: true }, { turns: 3 }, { turns: 4 }, { turns: 2, pendingOperation: true }])
+test(`terminal publication recovery confirms one historical outcome without replay: ${JSON.stringify(mode)}`, async context => {
+  const value = await completedPublication(context, mode), { task } = value;
+  const retained = value.controller.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=?').all(task.id);
+  const repo = path.join(value.controller.workspaceRoot, task.id, 'repo'), before = await publicationState(repo);
+  interruptController(value.controller);
+  let previous;
+  for (let restart = 0; restart < 2; restart++) {
+    const c = await new Controller(value.config).init();
+    try {
+      const saved = c.task(task.id), ledger = recoveryLedger(c), reads = value.counts.reads;
+      assert.equal(saved.automatic.status, 'succeeded', JSON.stringify(saved.automatic));
+      assert.equal(saved.automatic.reconciliation.outcome, 'publication_confirmed');
+      assert.equal(saved.automatic.reconciliation.confirmed, true);
+      assert.equal(saved.automatic.owner_instance, task.automatic.owner_instance); assert.notEqual(c.instanceId, task.automatic.owner_instance);
+      assert.equal(saved.deadline, task.deadline); assert.deepEqual(saved.publication, task.publication);
+      assert.deepEqual(saved.reviewer, task.reviewer); assert.deepEqual(saved.implementer, task.implementer);
+      assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'accepted');
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await c.reconcileAutomaticPublication(task.id);
+        const status = await c.invoke('get_task', { task_id: task.id }, {}, () => c.get(task.id));
+        assert.equal(status.automatic.status, 'succeeded'); assert.equal(status.automatic.human_attention_required, false);
+        assert.equal(status.automatic.reconciliation.attempt_id, task.automatic.review_request_id);
+        assert.equal(status.automatic.reconciliation.publication_id, task.automatic.publish_request_id);
+        assert.equal(status.automatic.review.state, 'pass');
+        assert.equal(status.automatic.usage.implementer_turn_submissions_attempted, 1);
+        assert.equal(status.automatic.usage.reviewer_turn_submissions_attempted, 1);
+        assert(!JSON.stringify(status.automatic.reconciliation).includes(value.root));
+      }
+      assert.equal(recoveryLedger(c), ledger); assert.equal(value.counts.reads, reads);
+      if (previous) assert.equal(ledger, previous); previous = ledger;
+      assert.deepEqual(await publicationState(repo), before);
+      const current = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=?').all(task.id);
+      for (const row of retained) assert(current.some(now => now.value === row.value && now.observation_sha256 === row.observation_sha256));
+      assert.equal(current.filter(row => JSON.parse(row.value).outcome === 'succeeded').length, 1);
+      c.scheduleAutomatic(task.id); await Promise.all([...c.automaticJobs.values()]);
+      assert.equal(c.automaticJobs.size, 0); assert.equal(c.automaticTimers.size, 0);
+      await assert.rejects(c.publish({ task_id: task.id, title: 'Another publication' }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+    } finally { interruptController(c); }
+  }
+  assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+  assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1); assert.equal(value.controller._api, undefined);
+});
+
+for (const fault of ['lookup failure', 'absent PR', 'branch', 'commit', 'repository', 'base', 'draft', 'PR number', 'merged', 'target', 'remote branch',
+  'tree', 'workspace', 'review packet', 'review result', 'review receipt', 'review history', 'corrupt history', 'operation', 'missing operation',
+  'uncertain operation', 'extra operation', 'authorization', 'missing authorization', 'input binding', 'deadline', 'owner', 'validation', 'correction', 'after deadline', 'unconfirmed publication', 'unconfirmed push'])
+test(`terminal publication recovery requires attention and never replays: ${fault}`, async context => {
+  const value = await completedPublication(context, { beforeCompletion: fault === 'unconfirmed publication', afterPush: fault === 'unconfirmed push' });
+  const { task, controller: original, publisher } = value;
+  const file = path.join(original.workspaceRoot, task.id, task.reviewer.packet_directory, 'evidence.json');
+  if (fault === 'lookup failure') publisher.findPR = async () => { throw Error('private token=secret /private/path'); };
+  if (fault === 'absent PR') publisher.pr = null;
+  if (fault === 'branch') publisher.pr.head.ref = 'other';
+  if (fault === 'commit') publisher.pr.head.sha = value.baseline;
+  if (fault === 'repository') publisher.pr.head.repo.full_name = 'fixture/other';
+  if (fault === 'base') publisher.pr.base.ref = 'other';
+  if (fault === 'draft') publisher.pr.draft = false;
+  if (fault === 'PR number') publisher.pr.number++;
+  if (fault === 'merged') publisher.pr.merged_at = new Date().toISOString();
+  if (fault === 'target') publisher.target = async () => ({ ...task.publication.target, base: 'other' });
+  if (fault === 'remote branch') publisher.remote = value.baseline;
+  if (fault === 'tree') task.publication.commit_sha = value.baseline;
+  if (fault === 'workspace') await fs.writeFile(path.join(original.workspaceRoot, task.id, 'repo/greeting.txt'), 'changed\n');
+  if (fault === 'review packet') { await fs.chmod(file, 0o600); await fs.writeFile(file, '{}'); }
+  if (fault === 'review result') task.reviewer.review_result.findings[0].evidence = 'corrupted';
+  if (fault === 'review receipt') delete task.reviewer.received_review_output;
+  if (fault === 'review history') original.db.prepare("DELETE FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.kind')='review_result'").run(task.id);
+  if (fault === 'corrupt history') original.db.prepare("UPDATE automatic_attempts SET value='{}' WHERE task_id=?").run(task.id);
+  if (fault === 'operation') original.db.prepare("UPDATE operations SET fingerprint='corrupted' WHERE id=?").run(task.automatic.publish_request_id);
+  if (fault === 'missing operation') original.db.prepare('DELETE FROM operations WHERE id=?').run(task.automatic.review_request_id);
+  if (fault === 'uncertain operation') original.opDone(task.automatic.publish_request_id, 'uncertain');
+  if (fault === 'extra operation') original.operation('unexpected_operation', 'continue', {}, task.id);
+  if (fault === 'authorization') task.automatic.authorization.publish.draft = false;
+  if (fault === 'missing authorization') delete task.automatic.authorization;
+  if (fault === 'input binding') task.publication.input_sha256 = 'corrupted';
+  if (fault === 'deadline') { task.deadline += 1000; task.automatic.deadline = task.deadline; }
+  if (fault === 'owner') task.automatic.owner_instance = 'another-owner';
+  if (fault === 'validation') { task.local_validation.status = 'running'; task.local_validation.termination_confirmed = false; }
+  if (fault === 'correction') task.automatic.corrective_publication = {};
+  if (fault === 'after deadline') {
+    task.publication.completed_at = new Date(task.deadline + 1).toISOString();
+    context.mock.method(Date, 'now', () => task.deadline + 1000);
+  }
+  original.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id);
+  interruptController(original);
+  for (let restart = 0; restart < 2; restart++) {
+    const c = await new Controller(value.config).init();
+    try {
+      const view = await c.get(task.id), ledger = recoveryLedger(c);
+      assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+      assert.equal(view.automatic.reconciliation.confirmed, false);
+      assert(!JSON.stringify(view.automatic.reconciliation).includes('/private/path'));
+      assert.equal(c.task(task.id).deadline, task.deadline);
+      await c.get(task.id); assert.equal(recoveryLedger(c), ledger);
+      await assert.rejects(c.continue({ task_id: task.id, request_id: 'no_replay', instruction: 'Retry' }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+      assert.equal(c.automaticJobs.size, 0); assert.equal(c.validationRuns.size, 0); assert.equal(c.localRuns.size, 0);
+    } finally { interruptController(c); }
+  }
+  assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+  assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, fault === 'unconfirmed push' ? 0 : 1);
+});
+
+for (const effect of ['ABORT', 'IGNORE']) for (const boundary of ['task', 'operation', 'outcome'])
+test(`terminal publication recovery detects SQLite ${effect} at final ${boundary} bookkeeping`, async context => {
+  const value = await completedPublication(context, { pendingOperation: true }), { task } = value;
+  interruptController(value.controller);
+  const c = new Controller(value.config), db = new DatabaseSync(path.join(c.stateRoot, 'controller.sqlite'));
+  const [table, event, condition] = boundary === 'task' ? ['tasks', 'INSERT', "json_extract(NEW.value,'$.automatic.status')='succeeded'"] :
+    boundary === 'operation' ? ['operations', 'UPDATE', "NEW.id LIKE 'automatic_publish_%' AND NEW.status='accepted'"] :
+    ['automatic_attempts', 'INSERT', "json_extract(NEW.value,'$.outcome')='succeeded'"];
+  db.exec(`CREATE TRIGGER terminal_recovery_fault BEFORE ${event} ON ${table} WHEN ${condition} BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'synthetic storage failure'" : ''}); END;`);
+  db.close();
+  await c.init();
+  try {
+    const status = await c.get(task.id);
+    assert.equal(status.automatic.status, 'uncertain'); assert.equal(status.automatic.human_attention_required, true);
+    assert.equal(status.automatic.reconciliation.confirmed, false);
+    assert.equal(c.task(task.id).automatic.status, 'uncertain');
+    assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'pending');
+    assert.equal(c.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").get(task.id).n, 0);
+    assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1); assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+    c.db.exec('DROP TRIGGER terminal_recovery_fault');
+  } finally { interruptController(c); }
+});
+
+test('terminal publication recovery may record completion after expiry only with proof of timely publication', async context => {
+  const value = await completedPublication(context), { task } = value;
+  interruptController(value.controller);
+  context.mock.method(Date, 'now', () => task.deadline + 1000);
+  const c = await new Controller(value.config).init();
+  try {
+    assert.equal(c.task(task.id).automatic.status, 'succeeded'); assert.equal(c.task(task.id).deadline, task.deadline);
+    await c.expire(); assert.equal(c.task(task.id).cleanup, undefined);
+    assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1); assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+  } finally { interruptController(c); }
+});
+
+// Pure SQLite classification checks also run where filesystem integration is
+// unavailable. They do not replace the real packet/Git/session tests above.
+for (const state of ['pending', 'expired', 'stopped', 'missing proof', 'write loss', 'manual', 'agents api'])
+test(`durable recovery classification persists without execution: ${state}`, async context => {
+  const effects = [], c = new Controller({ executor: new FakeExecutor(), localBackendFactory() { effects.push('model'); },
+    localValidationFactory() { effects.push('validation'); }, publisher: Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR']
+      .map(name => [name, () => { effects.push(name); throw Error('External operation forbidden'); }])) });
+  c.db = new DatabaseSync(':memory:');
+  c.db.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY,value TEXT); CREATE TABLE operations (id TEXT PRIMARY KEY,fingerprint TEXT,task_id TEXT,status TEXT); CREATE TABLE automatic_attempts (task_id TEXT,attempt_id TEXT,observation_sha256 TEXT,value TEXT,PRIMARY KEY(task_id,attempt_id,observation_sha256)); CREATE TABLE audit (id TEXT,created INTEGER,value TEXT);');
+  context.after(() => { c.dbClosed = true; c.db.close(); });
+  const created = Date.now(), id = 'task_00000000-0000-0000-0000-000000000001', authorization = automaticAuthority();
+  const t = { id, execution_backend: 'local_codex', created, deadline: created + 120000, baseline: 'a'.repeat(40), request_id: 'original',
+    implementer: { state: 'completed', local: { turn_submission_attempted: true, human_requests: [] } },
+    automatic: { status: state === 'stopped' ? 'stopped' : 'progressing', reason: state === 'stopped' ? 'AUTOMATIC_CANCELLED' : null,
+      phase: 'implementation', authorization, contract_binding: { sha256: digest(contract()), contract: contract() },
+      owner_instance: 'previous-owner', deadline: created + 120000, review_request_id: 'review-original', publish_request_id: 'publish-original' } };
+  if (state === 'expired') t.deadline = t.automatic.deadline = created - 1;
+  if (state === 'missing proof') { t.automatic.phase = 'publication'; t.publication = { phase: 'complete' }; }
+  if (['manual', 'agents api'].includes(state)) { delete t.automatic; if (state === 'agents api') t.execution_backend = 'agents_api'; }
+  c.db.prepare('INSERT INTO tasks VALUES (?,?)').run(id, JSON.stringify(t));
+  if (state === 'write loss') c.db.exec('CREATE TEMP TRIGGER lost_recovery BEFORE INSERT ON tasks BEGIN SELECT RAISE(IGNORE); END;');
+  await c.reconcileAutomaticPublication(id);
+  const saved = c.task(id);
+  if (['manual', 'agents api'].includes(state)) { assert.deepEqual(saved, t); assert.deepEqual(effects, []); return; }
+  if (state === 'write loss') { assert(c.persistenceFailures.has(id)); assert.equal(saved.automatic.status, 'progressing'); }
+  else {
+    assert.equal(saved.automatic.reconciliation.outcome, { pending: 'external_effects_uncertain', expired: 'expired', stopped: 'stopped', 'missing proof': 'evidence_unconfirmed' }[state]);
+    assert.equal(saved.automatic.reconciliation.confirmed, false);
+    assert.equal(saved.automatic.status, state === 'stopped' ? 'stopped' : 'uncertain');
+    assert.equal(saved.deadline, t.deadline); assert.equal(saved.automatic.owner_instance, 'previous-owner');
+  }
+  const status = await c.get(id);
+  assert.equal(status.automatic.status, state === 'stopped' ? 'stopped' : 'uncertain');
+  assert.equal(status.automatic.reconciliation.confirmed, false);
+  assert.equal(status.automatic.human_attention_required, state === 'stopped' ? saved.automatic.human_attention_required : true);
+  assert.deepEqual(effects, []); assert.equal(c.localRuns.size, 0); assert.equal(c.validationRuns.size, 0); assert.equal(c.automaticJobs.size, 0);
 });
