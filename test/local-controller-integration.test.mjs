@@ -1770,3 +1770,103 @@ test(`durable recovery classification persists without execution: ${state}`, asy
   assert.equal(status.automatic.human_attention_required, state === 'stopped' ? saved.automatic.human_attention_required : true);
   assert.deepEqual(effects, []); assert.equal(c.localRuns.size, 0); assert.equal(c.validationRuns.size, 0); assert.equal(c.automaticJobs.size, 0);
 });
+
+
+// Exercise the persistence boundary without Controller.init or task execution.
+// Qualification is stubbed here only to isolate the two-connection write race;
+// the real qualified-workflow counterpart below retains every publication gate.
+for (const conflict of ['confirmed', 'unresolved', 'operation mismatch', 'missing outcome'])
+test(`recovery fallback snapshot race preserves durable ${conflict}`, async context => {
+  const root = await fs.mkdtemp('/tmp/pab-recovery-sqlite-'), file = path.join(root, 'controller.sqlite'), effects = [];
+  const config = { executor: new FakeExecutor(), localBackendFactory() { effects.push('model'); }, localValidationFactory() { effects.push('validation'); },
+    publisher: Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR'].map(name => [name, () => { effects.push(name); throw Error('Unexpected external effect'); }])) };
+  const first = new Controller(config), second = new Controller(config);
+  first.db = new DatabaseSync(file);
+  first.db.exec('PRAGMA journal_mode=WAL; CREATE TABLE tasks (id TEXT PRIMARY KEY,value TEXT); CREATE TABLE operations (id TEXT PRIMARY KEY,fingerprint TEXT,task_id TEXT,status TEXT); CREATE TABLE automatic_attempts (task_id TEXT,attempt_id TEXT,observation_sha256 TEXT,value TEXT,PRIMARY KEY(task_id,attempt_id,observation_sha256)); CREATE TABLE audit (id TEXT,created INTEGER,value TEXT);');
+  second.db = new DatabaseSync(file);
+  context.after(async () => { for (const c of [first, second]) { c.dbClosed = true; c.db.close(); } await fs.rm(root, { recursive: true, force: true }); });
+  const created = Date.now(), id = 'task_00000000-0000-0000-0000-000000000002';
+  const task = { id, execution_backend: 'local_codex', created, deadline: created + 120000, baseline: 'a'.repeat(40), request_id: 'start-original',
+    publication: { phase: 'complete' }, implementer: { state: 'completed', local: { human_requests: [], turn_submission_attempted: true } },
+    automatic: { status: 'progressing', phase: 'publication', reason: null, human_attention_required: false,
+      authorization: automaticAuthority(), contract_binding: { sha256: digest(contract()), contract: contract() },
+      deadline: created + 120000, owner_instance: 'original-owner', review_request_id: 'review-original', publish_request_id: 'publish-original' } };
+  first.db.prepare('INSERT INTO tasks VALUES (?,?)').run(id, JSON.stringify(task));
+  for (const [operation, status] of [[task.request_id, 'accepted'], [task.automatic.review_request_id, 'accepted'], [task.automatic.publish_request_id, 'pending']]) {
+    first.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(operation, digest(operation), id, status);
+  }
+  const ledger = c => JSON.stringify(c.db.prepare('SELECT * FROM operations WHERE task_id=? ORDER BY id').all(id));
+  for (const c of [first, second]) c.verifyCompletedAutomaticPublication = async current => {
+    if (current.publication_error) throw Error('Unresolved proof');
+    return ledger(c);
+  };
+  const qualifiedOperations = await second.verifyCompletedAutomaticPublication(second.task(id));
+  const save = first.save.bind(first); let failed = false, interleaved = false, candidate, committed;
+  first.save = (value, options) => {
+    if (!failed && value.automatic.reconciliation?.confirmed) { failed = true; candidate = structuredClone(value); throw Error('Synthetic initial persistence failure'); }
+    if (!interleaved && value.automatic.reason === 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED') {
+      interleaved = true;
+      assert.equal(second.task(id).automatic.status, 'progressing'); // A has already read its nonterminal fallback snapshot.
+      const replacement = structuredClone(candidate);
+      if (conflict === 'unresolved') {
+        replacement.publication_error = 'CONCURRENT_PROOF_UNCONFIRMED';
+        Object.assign(replacement.automatic, { status: 'uncertain', reason: 'CONCURRENT_PROOF_UNCONFIRMED', human_attention_required: true });
+        Object.assign(replacement.automatic.reconciliation, { outcome: 'evidence_unconfirmed', confirmed: false, reason: 'CONCURRENT_PROOF_UNCONFIRMED' });
+      }
+      second.save(replacement, { expectedTask: JSON.stringify(task), expectedOperations: qualifiedOperations,
+        ...(conflict === 'operation mismatch' ? {} : { operation: { id: task.automatic.publish_request_id, status: conflict === 'unresolved' ? 'uncertain' : 'accepted' } }) });
+      if (conflict === 'missing outcome') second.db.prepare("DELETE FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").run(id);
+      committed = second.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value;
+    }
+    return save(value, options);
+  };
+  await first.reconcileAutomaticPublication(id);
+  assert(failed); assert(interleaved);
+  assert.equal(first.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, committed);
+  assert.equal(first.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status,
+    conflict === 'unresolved' ? 'uncertain' : conflict === 'operation mismatch' ? 'pending' : 'accepted');
+  assert.equal(first.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").get(id).n,
+    ['unresolved', 'missing outcome'].includes(conflict) ? 0 : 1);
+  const status = await first.get(id);
+  assert.equal(status.automatic.status, conflict === 'confirmed' ? 'succeeded' : 'uncertain');
+  assert.equal(status.automatic.reconciliation.confirmed, conflict === 'confirmed');
+  assert.equal(first.persistenceFailures.has(id), conflict !== 'confirmed');
+  const snapshot = () => JSON.stringify(['tasks', 'operations', 'automatic_attempts', 'audit'].map(table => first.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const before = snapshot();
+  for (let repeat = 0; repeat < 2; repeat++) await first.reconcileAutomaticPublication(id);
+  if (conflict === 'confirmed') assert.equal(snapshot(), before);
+  assert.equal((await first.get(id)).automatic.status, conflict === 'confirmed' ? 'succeeded' : 'uncertain');
+  assert.deepEqual(effects, []); assert.equal(first.automaticJobs.size, 0); assert.equal(second.automaticJobs.size, 0);
+});
+
+test('qualified recovery fallback snapshot race preserves second Controller terminal success', async context => {
+  const value = await completedPublication(context, { pendingOperation: true }), { task } = value;
+  interruptController(value.controller);
+  const first = new Controller(value.config), second = new Controller(value.config);
+  second.db = new DatabaseSync(path.join(second.stateRoot, 'controller.sqlite'));
+  const qualifiedOperations = await second.verifyCompletedAutomaticPublication(second.task(task.id));
+  const save = first.save.bind(first); let failed = false, interleaved = false, candidate;
+  first.save = (current, options) => {
+    if (!failed && current.automatic.reconciliation?.confirmed) { failed = true; candidate = structuredClone(current); throw Error('Synthetic initial persistence failure'); }
+    if (!interleaved && current.automatic.reason === 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED') {
+      interleaved = true;
+      assert.equal(second.task(task.id).automatic.status, 'progressing');
+      second.save(candidate, { expectedTask: JSON.stringify(task), expectedOperations: qualifiedOperations,
+        operation: { id: task.automatic.publish_request_id, status: 'accepted' } });
+    }
+    return save(current, options);
+  };
+  try {
+    await first.init(); assert(failed); assert(interleaved);
+    const before = recoveryLedger(first);
+    for (const c of [first, second]) {
+      assert.equal(c.task(task.id).automatic.status, 'succeeded');
+      assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'accepted');
+      assert.equal(c.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").get(task.id).n, 1);
+      await c.reconcileAutomaticPublication(task.id); await c.reconcileAutomaticPublication(task.id);
+      assert.equal((await c.get(task.id)).automatic.reconciliation.confirmed, true);
+    }
+    assert.equal(recoveryLedger(first), before);
+    assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1); assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+  } finally { for (const c of [first, second]) if (c.db && !c.dbClosed) interruptController(c); }
+});

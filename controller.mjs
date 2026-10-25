@@ -405,8 +405,8 @@ export class Controller {
         // Best effort only. A silent/failed write remains visible through the
         // connection's attention latch even when this diagnostic cannot commit.
         try {
-          const current = this.task(id);
-          if (current.automatic.status === 'succeeded') {
+          const terminal = current => {
+            if (current.automatic.status !== 'succeeded') return false;
             // Another instance may have committed this exact verified result
             // while our read-only checks were in flight. Never downgrade it.
             const accepted = operations && JSON.parse(operations).map(row => row.id === a.publish_request_id ? { ...row, status: 'accepted' } : row);
@@ -417,12 +417,24 @@ export class Controller {
               try { this.verifyAutomaticEvidence(current); }
               catch { this.persistenceFailures.add(id); }
             }
-            return;
-          }
+            return true;
+          };
+          const current = this.task(id);
+          if (terminal(current)) return;
+          const expectedTask = JSON.stringify(current);
           Object.assign(current.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true,
             reconciliation: { outcome: 'evidence_unconfirmed', confirmed: false, attempt_id: a.review_request_id,
               publication_id: a.publish_request_id, reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED' } });
-          this.save(current);
+          try {
+            // The snapshot check and write share save()'s SQLite transaction.
+            // A terminal result committed after our read cannot be overwritten.
+            this.save(current, { expectedTask });
+          } catch {
+            // Reread once after a conflicting or unconfirmed write. Only the
+            // identical qualified outcome with a consistent ledger clears the
+            // attention latch; a nonterminal conflict grants no new authority.
+            terminal(this.task(id));
+          }
         } catch { /* No authority can be inferred from missing bookkeeping. */ }
       }
     });
