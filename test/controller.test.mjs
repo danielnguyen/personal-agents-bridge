@@ -2374,3 +2374,285 @@ test(`durable progress validation completion requires bound evidence: ${mode}`, 
   assert.equal(actual.commands[0]?.completion_confirmed ?? false, ['passed', 'failed'].includes(mode));
   assert.equal(statusLedger(c.db), before);
 });
+
+
+// Reproduce the independently reported SQLite IGNORE defects with the real store.
+test('automatic operation durability rejects an ignored reservation and its repeated dispatch', async t => {
+  const { c } = await setup(t), task = progressTask(c); c.save(task);
+  c.db.exec("CREATE TEMP TRIGGER ignored_reservation BEFORE INSERT ON operations BEGIN SELECT RAISE(IGNORE); END;");
+  let dispatched = 0, rejected = 0;
+  try {
+    for (let repeat = 0; repeat < 2; repeat++) {
+      try { if (!c.operation(task.automatic.publish_request_id, 'automatic_publish', { task_id: task.id, ...task.automatic.authorization.publish }, task.id)) dispatched++; }
+      catch (error) { assert.equal(error.code, 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED'); rejected++; }
+    }
+    assert.equal(c.db.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+    assert.deepEqual({ dispatched, rejected }, { dispatched: 0, rejected: 2 });
+  } finally { c.db.exec('DROP TRIGGER ignored_reservation'); }
+});
+
+test('automatic operation durability ignored publication acknowledgment cannot become success', async t => {
+  const { c } = await setup(t), task = progressTask(c);
+  task.automatic.phase = 'publication'; task.publication = { phase: 'complete', push_attempted: true, pr_attempted: true, commit_tree_matches_reviewed_tree: true };
+  c.save(task);
+  c.operation(task.automatic.publish_request_id, 'automatic_publish', { task_id: task.id, ...task.automatic.authorization.publish }, task.id);
+  c.db.exec("CREATE TEMP TRIGGER ignored_ack BEFORE UPDATE ON operations WHEN NEW.status='accepted' BEGIN SELECT RAISE(IGNORE); END;");
+  try {
+    try { c.opDone(task.automatic.publish_request_id); c.finishAutomatic(task.id, 'succeeded', null); }
+    catch (error) { assert.equal(error.code, 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED'); }
+    const view = await c.get(task.id);
+    assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'pending');
+    assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+    assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+  } finally { c.db.exec('DROP TRIGGER ignored_ack'); }
+});
+
+
+function automaticOperationFixture(c, kind = 'automatic_publish') {
+  const task = progressTask(c); task.repository = { repository_id: 'fixture', base_ref: 'HEAD', baseline_commit: task.baseline };
+  task.automatic.phase = 'publication'; task.publication = { phase: 'complete', push_attempted: true, pr_attempted: true, commit_tree_matches_reviewed_tree: true };
+  c.save(task);
+  const request = kind === 'start' ? { id: task.request_id, payload: { execution_backend: 'local_codex', input: {
+    contract: task.automatic.contract_binding.contract, repository_id: 'fixture', base_ref: 'HEAD', automatic: task.automatic.authorization } } } :
+    kind === 'review' ? { id: task.automatic.review_request_id, payload: { id: task.id } } :
+    kind === 'correction' ? { id: 'correction-reservation', payload: { parent_task_id: task.id, task_id: 'corrective-child' } } :
+    { id: task.automatic.publish_request_id, payload: { task_id: task.id, ...task.automatic.authorization.publish } };
+  return { task, ...request, kind, taskId: kind === 'correction' ? 'corrective-child' : task.id };
+}
+
+for (const effect of ['IGNORE', 'ABORT']) for (const kind of ['start', 'review', 'automatic_publish', 'correction'])
+test(`automatic operation durability ${effect} reservation prevents dispatch: ${kind}`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c, kind);
+  c.db.exec(`CREATE TEMP TRIGGER operation_fault BEFORE INSERT ON operations BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'synthetic reservation failure'" : ''}); END;`);
+  try {
+    for (let repeat = 0; repeat < 2; repeat++) assert.throws(() => c.operation(input.id, kind, input.payload, input.taskId), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    assert.equal(c.db.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  } finally { c.db.exec('DROP TRIGGER operation_fault'); }
+});
+
+for (const kind of ['start', 'review', 'automatic_publish'])
+test(`automatic operation durability confirms bindings and idempotent duplicate ${kind}`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c, kind);
+  assert.equal(c.operation(input.id, kind, input.payload, input.taskId), null);
+  c.opDone(input.id);
+  const before = statusLedger(c.db);
+  const duplicate = c.operation(input.id, kind, input.payload, kind === 'start' ? 'new-start-task-id' : input.taskId);
+  assert.deepEqual({ ...duplicate }, { id: input.id, fingerprint: digest({ kind, payload: input.payload }), task_id: input.taskId, status: 'accepted' });
+  assert.equal(statusLedger(c.db), before);
+  assert.throws(() => c.operation(input.id, kind, { ...input.payload, changed: true }, input.taskId), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+  assert.equal(statusLedger(c.db), before);
+});
+
+for (const field of ['id', 'fingerprint', 'task_id', 'status'])
+test(`automatic operation durability rejects reservation rewritten by SQLite trigger: ${field}`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c);
+  c.db.exec(`CREATE TEMP TRIGGER operation_fault AFTER INSERT ON operations BEGIN UPDATE operations SET ${field}='conflicting' WHERE id=NEW.id; END;`);
+  try {
+    assert.throws(() => c.operation(input.id, input.kind, input.payload, input.taskId), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    assert.equal(c.db.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+  } finally { c.db.exec('DROP TRIGGER operation_fault'); }
+});
+
+for (const effect of ['IGNORE', 'ABORT']) for (const boundary of ['operation', 'task', 'outcome'])
+test(`automatic operation durability atomically rejects ${effect} at completion ${boundary}`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const [table, event, predicate] = boundary === 'operation' ? ['operations', 'UPDATE', "NEW.status='accepted'"] :
+    boundary === 'task' ? ['tasks', 'INSERT', "json_extract(NEW.value,'$.automatic.status')='succeeded'"] :
+    ['automatic_attempts', 'INSERT', "json_extract(NEW.value,'$.outcome')='succeeded'"];
+  c.db.exec(`CREATE TEMP TRIGGER operation_fault BEFORE ${event} ON ${table} WHEN ${predicate} BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'synthetic completion failure'" : ''}); END;`);
+  try {
+    assert.throws(() => c.finishAutomatic(input.taskId, 'succeeded', null), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    assert.equal(c.task(input.taskId).automatic.status, 'progressing');
+    assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'pending');
+    assert.equal(c.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE json_extract(value,'$.outcome')='succeeded'").get().n, 0);
+    const view = await c.get(input.taskId); assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+  } finally { c.db.exec('DROP TRIGGER operation_fault'); }
+});
+
+for (const fault of ['missing', 'fingerprint', 'task_id', 'status'])
+test(`automatic operation durability rejects ${fault} acknowledgment binding`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  if (fault === 'missing') c.db.prepare('DELETE FROM operations WHERE id=?').run(input.id);
+  else c.db.prepare(`UPDATE operations SET ${fault}='conflicting' WHERE id=?`).run(input.id);
+  const before = statusLedger(c.db);
+  assert.throws(() => c.opDone(input.id), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+  assert.equal(statusLedger(c.db), before);
+  assert.equal((await c.get(input.taskId)).automatic.status, 'uncertain');
+});
+
+for (const fault of ['missing', 'pending', 'fingerprint', 'task_id'])
+test(`automatic operation durability observationally rejects historical success with ${fault} publication proof`, async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId); c.finishAutomatic(input.taskId, 'succeeded', null);
+  if (fault === 'missing') c.db.prepare('DELETE FROM operations WHERE id=?').run(input.id);
+  else if (fault === 'pending') c.db.prepare("UPDATE operations SET status='pending' WHERE id=?").run(input.id);
+  else c.db.prepare(`UPDATE operations SET ${fault}='conflicting' WHERE id=?`).run(input.id);
+  const before = statusLedger(c.db);
+  for (let read = 0; read < 3; read++) {
+    const view = await c.invoke('get_task', { task_id: input.taskId }, {}, () => c.get(input.taskId));
+    assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+    assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+  }
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('automatic operation durability success and accepted acknowledgment survive repeated restart', async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId); c.finishAutomatic(input.taskId, 'succeeded', null);
+  assert.equal(c.task(input.taskId).automatic.status, 'succeeded');
+  const ledger = statusLedger(c.db); interruptProgressController(c);
+  for (let restart = 0; restart < 3; restart++) {
+    const recovered = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'), executor: new FakeExecutor(),
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+    try {
+      const view = await recovered.get(input.taskId);
+      assert.equal(view.automatic.status, 'succeeded'); assert.equal(view.automatic.human_attention_required, false);
+      assert.equal(view.automatic.progress.attempts.publication.status, 'confirmed_completed');
+      assert.equal(recovered.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
+      assert.equal(statusLedger(recovered.db), ledger);
+    } finally { interruptProgressController(recovered); }
+  }
+});
+
+for (const boundary of ['release', 'rollback'])
+test(`automatic operation durability uncertain ${boundary} cannot authorize dispatch`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  const reader = new DatabaseSync(path.join(root, 'state/controller.sqlite'), { readOnly: true });
+  if (boundary === 'rollback') c.db.exec("CREATE TEMP TRIGGER operation_fault BEFORE INSERT ON operations BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;");
+  c.db.setAuthorizer((action, name) => action === sqlite.SQLITE_SAVEPOINT && name === boundary.toUpperCase() ? sqlite.SQLITE_DENY : sqlite.SQLITE_OK);
+  try {
+    assert.throws(() => c.operation(input.id, input.kind, input.payload, input.taskId), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    assert.equal(c.transactionUnresolved, true);
+    assert.equal(reader.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  } finally {
+    c.db.setAuthorizer(null); if (c.db.isTransaction) c.db.exec('ROLLBACK'); reader.close();
+    assert.throws(() => c.storageAuthority(), /STORAGE_TRANSACTION_UNRESOLVED/);
+    interruptProgressController(c);
+  }
+});
+
+test('automatic operation durability preserves a concurrent committed terminal outcome', async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(path.join(root, 'state/controller.sqlite'));
+  const save = c.save.bind(c); let interleaved = false;
+  c.save = (task, options) => {
+    if (!interleaved && task.automatic.status === 'succeeded') { interleaved = true; second.finishAutomatic(input.taskId, 'succeeded', null); }
+    return save(task, options);
+  };
+  try {
+    assert.throws(() => c.finishAutomatic(input.taskId, 'succeeded', null), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    const committed = statusLedger(second.db); c.persistenceAttention(input.taskId);
+    assert.equal(statusLedger(second.db), committed); assert.equal(second.task(input.taskId).automatic.status, 'succeeded');
+    assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
+    assert.equal((await c.get(input.taskId)).automatic.status, 'uncertain'); assert.equal((await second.get(input.taskId)).automatic.status, 'succeeded');
+  } finally { interruptProgressController(second); }
+});
+
+
+for (const versioned of [false, true]) for (const fault of ['reserve_start', 'reserve_review', 'reserve_publish', 'ack_implementation', 'ack_review', 'ack_publication', 'none'])
+test(`automatic operation durability real lifecycle; versioned=${versioned}; fault=${fault}`, async t => {
+  const effects = { pushes: 0, creates: 0 }, controllers = []; let publisher, executions = 0;
+  const run = automaticAttempt(t, { versioned, postReview: true, originalPass: true, async configure(c, input) {
+    controllers.push(c);
+    if (!versioned) Object.assign(input.automatic, { max_codex_turns: 2, max_corrections: 0 });
+    repoGit(path.join(path.dirname(c.stateRoot), 'normal'), 'remote', 'add', 'origin', 'https://github.com/fixture/operation-proof.git');
+    const factory = c.localBackendFactory; c.localBackendFactory = options => { executions++; return factory(options); };
+    publisher = { async target() { return { repository: 'fixture/operation-proof', base: 'main', remote: 'https://github.com/fixture/operation-proof.git' }; },
+      async remoteHead() { return this.remote || null; }, async push(repo, target, branch, commit) { effects.pushes++; this.remote = commit; },
+      async findPR() { return this.pr || null; }, async createPR(target, branch) { effects.creates++; return this.pr = {
+        number: 1, html_url: 'https://github.com/fixture/operation-proof/pull/1', draft: true, state: 'open', merged_at: null,
+        head: { ref: branch, sha: this.remote, repo: { full_name: target.repository } }, base: { ref: target.base, repo: { full_name: target.repository } } }; } };
+    c.publisher = publisher;
+    if (fault !== 'none') {
+      const reservation = fault.startsWith('reserve'), which = fault.split('_')[1];
+      const predicate = which === 'start' || which === 'implementation' ? "NEW.id='automatic_evidence'" :
+        which === 'review' ? "NEW.id LIKE 'automatic_review_%'" : "NEW.id LIKE 'automatic_publish_%'";
+      c.db.exec(`CREATE TEMP TRIGGER lifecycle_operation_fault BEFORE ${reservation ? 'INSERT' : 'UPDATE'} ON operations WHEN ${predicate}${reservation ? '' : " AND NEW.status='accepted'"} BEGIN SELECT RAISE(IGNORE); END;`);
+    }
+  } });
+  if (fault === 'reserve_start') {
+    try { await assert.rejects(run, /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/); assert.equal(executions, 0); assert.deepEqual(effects, { pushes: 0, creates: 0 }); }
+    finally { controllers[0]?.db.exec('DROP TRIGGER lifecycle_operation_fault'); }
+    return;
+  }
+  const value = await run, { c, id } = value;
+  try {
+    const view = await c.get(id), original = c.task(id);
+    assert.equal(view.automatic.status, fault === 'none' ? 'succeeded' : 'uncertain');
+    assert.equal(view.automatic.human_attention_required, fault !== 'none');
+    assert.equal(executions, ['reserve_review', 'ack_implementation'].includes(fault) ? 1 : 2);
+    assert.deepEqual(effects, fault === 'ack_publication' || fault === 'none' ? { pushes: 1, creates: 1 } : { pushes: 0, creates: 0 });
+    if (fault === 'ack_publication') {
+      assert.equal(original.automatic.status, 'uncertain');
+      assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(original.automatic.publish_request_id).status, 'pending');
+      assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+    }
+    if (fault === 'none') {
+      assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(original.automatic.publish_request_id).status, 'accepted');
+      assert.equal((await c.start(value.input)).task_id, id); assert.equal(executions, 2);
+    }
+    if (fault !== 'none') c.db.exec('DROP TRIGGER lifecycle_operation_fault');
+    interruptProgressController(c);
+    const recovered = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, executor: value.executor, publisher,
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
+    try {
+      const status = await recovered.get(id), ledger = statusLedger(recovered.db);
+      if (status.automatic.status === 'succeeded') assert.equal(recovered.db.prepare('SELECT status FROM operations WHERE id=?').get(original.automatic.publish_request_id).status, 'accepted');
+      else assert.equal(status.automatic.human_attention_required, true);
+      for (let read = 0; read < 2; read++) await recovered.get(id);
+      assert.equal(statusLedger(recovered.db), ledger); assert.equal(recovered.task(id).deadline, original.deadline);
+      assert.equal(executions, value.calls.length); assert.deepEqual(effects, fault === 'ack_publication' || fault === 'none' ? { pushes: 1, creates: 1 } : { pushes: 0, creates: 0 });
+    } finally { interruptProgressController(recovered); }
+  } finally { if (!c.dbClosed && fault !== 'none') c.db.exec('DROP TRIGGER IF EXISTS lifecycle_operation_fault'); }
+});
+
+
+for (const fault of ['none', 'reserve_publish', 'ack_publication'])
+test(`automatic operation durability preserves authorized corrective publication: ${fault}`, async t => {
+  const effects = { pushes: 0, creates: 0 };
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, async configure(c, input) {
+    input.automatic.publish_after_correction = true;
+    repoGit(path.join(path.dirname(c.stateRoot), 'normal'), 'remote', 'add', 'origin', 'https://github.com/fixture/corrective-operation.git');
+    c.publisher = { async target() { return { repository: 'fixture/corrective-operation', base: 'main', remote: 'https://github.com/fixture/corrective-operation.git' }; },
+      async remoteHead() { return this.remote || null; }, async push(repo, target, branch, commit) { effects.pushes++; this.remote = commit; },
+      async findPR() { return this.pr || null; }, async createPR(target, branch) { effects.creates++; return this.pr = {
+        number: 1, html_url: 'https://github.com/fixture/corrective-operation/pull/1', draft: true, state: 'open', merged_at: null,
+        head: { ref: branch, sha: this.remote, repo: { full_name: target.repository } }, base: { ref: target.base, repo: { full_name: target.repository } } }; } };
+    if (fault !== 'none') c.db.exec(`CREATE TEMP TRIGGER corrective_operation_fault BEFORE ${fault === 'reserve_publish' ? 'INSERT' : 'UPDATE'} ON operations WHEN NEW.id LIKE 'automatic_publish_%'${fault === 'reserve_publish' ? '' : " AND NEW.status='accepted'"} BEGIN SELECT RAISE(IGNORE); END;`);
+  } });
+  const { c, id } = value;
+  try {
+    const parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+    assert.equal(parent.automatic.status, fault === 'none' ? 'succeeded' : 'uncertain');
+    assert.equal(child.automatic.status, fault === 'none' ? 'succeeded' : 'uncertain');
+    assert.equal(value.calls.length, 4);
+    assert.deepEqual(effects, fault === 'reserve_publish' ? { pushes: 0, creates: 0 } : { pushes: 1, creates: 1 });
+    const operation = c.db.prepare('SELECT * FROM operations WHERE id=?').get(parent.automatic.publish_request_id);
+    if (fault === 'none') {
+      assert.equal(operation.task_id, child.id); assert.equal(operation.status, 'accepted');
+      assert.equal(operation.fingerprint, digest({ kind: 'automatic_publish', payload: child.automatic.corrective_publication.input }));
+    } else assert.notEqual(operation?.status, 'accepted');
+  } finally { if (fault !== 'none') c.db.exec('DROP TRIGGER corrective_operation_fault'); }
+});
+
+
+test('automatic operation durability late failure cannot downgrade another Controller success', async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(path.join(root, 'state/controller.sqlite'));
+  let committed;
+  c.runAutomatic = async () => { second.finishAutomatic(input.taskId, 'succeeded', null); committed = statusLedger(second.db); throw Error('Late callback after concurrent completion'); };
+  try {
+    c.scheduleAutomatic(input.taskId); await Promise.all([...c.automaticJobs.values()]);
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
+    assert.equal((await c.get(input.taskId)).automatic.status, 'succeeded');
+    assert.throws(() => c.opDone(input.id, 'uncertain'), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    assert.equal(statusLedger(second.db), committed);
+  } finally { interruptProgressController(second); }
+});

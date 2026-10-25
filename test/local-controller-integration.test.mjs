@@ -1815,7 +1815,8 @@ test(`recovery fallback snapshot race preserves durable ${conflict}`, async cont
       deadline: created + 120000, owner_instance: 'original-owner', review_request_id: 'review-original', publish_request_id: 'publish-original' } };
   first.db.prepare('INSERT INTO tasks VALUES (?,?)').run(id, JSON.stringify(task));
   for (const [operation, status] of [[task.request_id, 'accepted'], [task.automatic.review_request_id, 'accepted'], [task.automatic.publish_request_id, 'pending']]) {
-    first.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(operation, digest(operation), id, status);
+    const fingerprint = operation === task.automatic.publish_request_id ? digest({ kind: 'automatic_publish', payload: { task_id: id, ...task.automatic.authorization.publish } }) : digest(operation);
+    first.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(operation, fingerprint, id, status);
   }
   const ledger = c => JSON.stringify(c.db.prepare('SELECT * FROM operations WHERE task_id=? ORDER BY id').all(id));
   for (const c of [first, second]) c.verifyCompletedAutomaticPublication = async current => {
@@ -1830,7 +1831,13 @@ test(`recovery fallback snapshot race preserves durable ${conflict}`, async cont
       interleaved = true;
       assert.equal(second.task(id).automatic.status, 'progressing'); // A has already read its nonterminal fallback snapshot.
       const replacement = structuredClone(candidate);
-      if (conflict === 'unresolved') {
+      if (conflict === 'operation mismatch') {
+        // A contradictory success/pending pair must now be rejected atomically.
+        assert.throws(() => second.save(replacement, { expectedTask: JSON.stringify(task), expectedOperations: qualifiedOperations }), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+        assert.equal(second.task(id).automatic.status, 'progressing');
+        assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status, 'pending');
+      }
+      if (['unresolved', 'operation mismatch'].includes(conflict)) {
         replacement.publication_error = 'CONCURRENT_PROOF_UNCONFIRMED';
         Object.assign(replacement.automatic, { status: 'uncertain', reason: 'CONCURRENT_PROOF_UNCONFIRMED', human_attention_required: true });
         Object.assign(replacement.automatic.reconciliation, { outcome: 'evidence_unconfirmed', confirmed: false, reason: 'CONCURRENT_PROOF_UNCONFIRMED' });
@@ -1848,7 +1855,7 @@ test(`recovery fallback snapshot race preserves durable ${conflict}`, async cont
   assert.equal(first.db.prepare('SELECT status FROM operations WHERE id=?').get(task.automatic.publish_request_id).status,
     conflict === 'unresolved' ? 'uncertain' : conflict === 'operation mismatch' ? 'pending' : 'accepted');
   assert.equal(first.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").get(id).n,
-    ['unresolved', 'missing outcome'].includes(conflict) ? 0 : 1);
+    ['unresolved', 'operation mismatch', 'missing outcome'].includes(conflict) ? 0 : 1);
   const status = await first.get(id);
   assert.equal(status.automatic.status, conflict === 'confirmed' ? 'succeeded' : 'uncertain');
   assert.equal(status.automatic.reconciliation.confirmed, conflict === 'confirmed');

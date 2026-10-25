@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+const AUTOMATIC_OPERATION_STATES = new Set(['pending', 'reserved', 'submitting', 'submitted', 'accepted', 'failed', 'uncertain', 'result_received', 'push_attempted', 'pushed', 'pr_attempted', 'not_started']);
 const MAX_PACKET = 128 * 1024;
 const MAX_FILES = 100;
 const DEBUG_WINDOW = 30 * 86400000;
@@ -498,6 +499,7 @@ export class Controller {
       if (!protectedWrite) return;
       for (const t of writes) {
         if (this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id)?.value !== intended.get(t.id)) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+        if (t.automatic?.status === 'succeeded' && !this.confirmedAutomaticPublication(t)) throw new BridgeError('AUTOMATIC_PUBLICATION_UNCONFIRMED');
         if (t.correction) this.verifyCorrectionEvidence(t, operationStates.get(t.id), reviewStates.get(t.id));
         if (t.correction && t.automatic?.corrective_publication) this.verifyCorrectivePublicationEvidence(t);
       }
@@ -584,6 +586,7 @@ export class Controller {
     // the receipt below remain authoritative; the in-memory latch grants nothing.
     try {
       const task = this.task(id);
+      if (task.automatic?.status === 'succeeded') return; // Never overwrite another committed terminal outcome.
       if (task.correction) {
         task.correction_state = 'needs_attention'; task.correction_reason = 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED';
         task.implementer.local.human_attention_required = true;
@@ -722,16 +725,113 @@ export class Controller {
     const job = prev.catch(() => {}).then(fn); this.locks.set(id, job);
     try { return await job; } finally { if (this.locks.get(id) === job) this.locks.delete(id); }
   }
+  automaticOperationBinding(id) {
+    const tasks = this.db.prepare("SELECT value FROM tasks WHERE json_extract(value,'$.request_id')=? OR json_extract(value,'$.automatic.review_request_id')=? OR json_extract(value,'$.automatic.publish_request_id')=? LIMIT 3")
+      .all(id, id, id).map(row => JSON.parse(row.value)).filter(task => task.automatic || task.correction);
+    const bindings = tasks.map(task => {
+      const a = task.automatic;
+      let kind, payload, taskId = task.id;
+      if (id === task.request_id) {
+        kind = task.correction ? 'correction' : 'start';
+        payload = task.correction || { execution_backend: 'local_codex', input: { contract: a.contract_binding.contract,
+          repository_id: task.repository.repository_id, base_ref: task.repository.base_ref, automatic: a.authorization } };
+      } else if (id === a?.review_request_id) { kind = 'review'; payload = { id: task.id }; }
+      else if (id === a?.publish_request_id) {
+        kind = 'automatic_publish'; taskId = a.corrective_publication?.task_id || a.correction?.task_id || task.id;
+        payload = a.corrective_publication?.input || { task_id: taskId, ...a.authorization.publish };
+      } else throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+      return { id, fingerprint: digest({ kind, payload }), task_id: taskId };
+    });
+    if (bindings.some(binding => JSON.stringify(binding) !== JSON.stringify(bindings[0]))) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+    return bindings[0] || null;
+  }
+  confirmedAutomaticPublication(task) {
+    try {
+      const expected = this.automaticOperationBinding(task.automatic.publish_request_id);
+      const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.automatic.publish_request_id);
+      return !!expected && row?.id === expected.id && row.fingerprint === expected.fingerprint && row.task_id === expected.task_id && row.status === 'accepted';
+    } catch { return false; }
+  }
   operation(requestId, kind, payload, taskId) {
     this.storageAuthority(true);
     this.rejectSecret(payload);
     const auditId = this.context.getStore();
     if (auditId) { const a = JSON.parse(this.db.prepare('SELECT value FROM audit WHERE id=?').get(auditId).value); a.task_id = this.db.prepare('SELECT task_id FROM operations WHERE id=?').get(requestId)?.task_id || taskId; this.db.prepare('UPDATE audit SET value=? WHERE id=?').run(JSON.stringify(a), auditId); }
-    const fingerprint = digest({ kind, payload }); const old = this.db.prepare('SELECT * FROM operations WHERE id=?').get(requestId);
-    if (old) { if (old.fingerprint !== fingerprint) throw new BridgeError('REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT'); return old; }
-    this.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(requestId, fingerprint, taskId, 'pending'); return null;
+    const fingerprint = digest({ kind, payload });
+    const owner = this.db.prepare('SELECT value FROM tasks WHERE id=?').get(taskId);
+    const task = owner && JSON.parse(owner.value);
+    let bound;
+    try { bound = this.automaticOperationBinding(requestId); }
+    catch { this.persistenceFailures.add(taskId); throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED'); }
+    const automatic = !!(bound || task?.automatic || task?.correction || kind === 'automatic_publish' || kind === 'correction' || payload?.input?.automatic);
+    if (!automatic) {
+      const old = this.db.prepare('SELECT * FROM operations WHERE id=?').get(requestId);
+      if (old) { if (old.fingerprint !== fingerprint) throw new BridgeError('REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT'); return old; }
+      this.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(requestId, fingerprint, taskId, 'pending'); return null;
+    }
+    let expected, duplicate = false;
+    const verify = () => {
+      const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(requestId);
+      if (!row || Object.keys(expected).some(key => row[key] !== expected[key])) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+      return row;
+    };
+    try {
+      const result = this.transaction(() => {
+        const old = this.db.prepare('SELECT * FROM operations WHERE id=?').get(requestId), binding = this.automaticOperationBinding(requestId);
+        if (old) {
+          if (binding && ['id', 'fingerprint', 'task_id'].some(key => old[key] !== binding[key])) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+          if (old.fingerprint !== fingerprint) throw new BridgeError('REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT');
+          if ((old.task_id !== taskId && !(kind === 'start' && binding?.task_id === old.task_id)) ||
+              !AUTOMATIC_OPERATION_STATES.has(old.status)) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+          expected = { ...old }; duplicate = true; return old;
+        }
+        expected = { id: requestId, fingerprint, task_id: taskId, status: 'pending' };
+        if (binding && ['id', 'fingerprint', 'task_id'].some(key => expected[key] !== binding[key])) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+        this.db.prepare('INSERT INTO operations VALUES (?,?,?,?)').run(requestId, fingerprint, taskId, 'pending');
+        verify(); return null;
+      });
+      verify(); // A released transaction, not a successful run() alone, precedes dispatch.
+      return result;
+    } catch (error) {
+      if (error.code === 'REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT') throw error;
+      this.persistenceFailures.add(taskId);
+      if (duplicate) this.persistenceFailures.add(expected.task_id);
+      throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
+    }
   }
-  opDone(id, status = 'accepted') { this.storageAuthority(true); this.db.prepare('UPDATE operations SET status=? WHERE id=?').run(status, id); }
+  opDone(id, status = 'accepted') {
+    this.storageAuthority(true);
+    let binding;
+    try { binding = this.automaticOperationBinding(id); }
+    catch (error) {
+      if (sqliteFailure(error)) throw error;
+      for (const row of this.db.prepare("SELECT id FROM tasks WHERE json_extract(value,'$.request_id')=? OR json_extract(value,'$.automatic.review_request_id')=? OR json_extract(value,'$.automatic.publish_request_id')=? LIMIT 3").all(id, id, id)) this.persistenceFailures.add(row.id);
+      throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
+    }
+    if (!binding) { this.db.prepare('UPDATE operations SET status=? WHERE id=?').run(status, id); return; }
+    const verify = expectedStatus => {
+      const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id);
+      if (!row || ['id', 'fingerprint', 'task_id'].some(key => row[key] !== binding[key]) || row.status !== expectedStatus) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+      return row;
+    };
+    try {
+      const write = () => {
+        const old = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id);
+        if (!old || !AUTOMATIC_OPERATION_STATES.has(old.status) || !AUTOMATIC_OPERATION_STATES.has(status)) throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+        verify(old.status);
+        if (status !== 'accepted' && this.task(binding.task_id).automatic?.status === 'succeeded') throw new BridgeError('AUTOMATIC_OPERATION_BINDING_UNCONFIRMED');
+        this.db.prepare('UPDATE operations SET status=? WHERE id=? AND fingerprint=? AND task_id=? AND status=?')
+          .run(status, id, binding.fingerprint, binding.task_id, old.status);
+        verify(status);
+      };
+      // save() already owns its atomic task/evidence/operation transaction.
+      if (this.transactionOwner) write(); else this.transaction(write);
+      verify(status);
+    } catch {
+      this.persistenceFailures.add(binding.task_id);
+      throw new BridgeError('AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
+    }
+  }
   launch(taskId, role, fn) {
     const key = `${taskId}:${role}`;
     const job = Promise.resolve().then(() => { this.storageAuthority(); return fn(); }).catch(e => { if (this.transactionUnresolved || sqliteFailure(e)) this.persistenceFailures.add(taskId);
@@ -743,7 +843,11 @@ export class Controller {
           diagnostics: [this.bounded(e instanceof BridgeError ? e.code : 'LOCAL_EXECUTION_FAILED')] });
         if (role === 'implementer') this.invalidateLocalRequests(t, 'LOCAL_EXECUTION_FAILED');
         else t[role].review_result = null;
-        this.opDone(role === 'implementer' ? t.request_id : t[role].request_id, 'failed');
+        try { this.opDone(role === 'implementer' ? t.request_id : t[role].request_id, 'failed'); }
+        catch (error) {
+          if (!t.automatic && !t.correction) throw error;
+          this.persistenceFailures.add(taskId); this.persistenceAttention(taskId); return;
+        }
       }
       this.save(t); } }).finally(() => {
         this.jobs.delete(key);
@@ -1607,9 +1711,10 @@ export class Controller {
     if (this.dbClosed) return;
     const task = this.task(id);
     if (!task.automatic || task.automatic.status === 'succeeded') return;
+    const expectedTask = JSON.stringify(task);
     if (task.automatic.status === 'progressing') Object.assign(task.automatic, { status, reason: this.bounded(reason, 256), human_attention_required: status !== 'succeeded' });
     else if (status === 'uncertain') task.automatic.status = 'uncertain';
-    this.save(task);
+    this.save(task, status === 'succeeded' ? { expectedTask, operation: { id: task.automatic.publish_request_id, status: 'accepted' } } : {});
     clearTimeout(this.automaticTimers.get(id)); this.automaticTimers.delete(id);
   }
   automaticUncertain(task) {
@@ -1631,9 +1736,14 @@ export class Controller {
       if (this.transactionUnresolved || sqliteFailure(error)) this.persistenceFailures.add(id);
       if (this.persistenceFailures.has(id)) { this.persistenceAttention(id); return; }
       if (!this.dbClosed) {
-        const task = this.task(id), uncertain = this.automaticUncertain(task);
-        this.opDone(task.automatic.publish_request_id, uncertain ? 'uncertain' : 'failed');
-        try { this.finishAutomatic(id, uncertain ? 'uncertain' : 'stopped', error instanceof BridgeError ? error.code : 'AUTOMATIC_OPERATION_UNCONFIRMED'); }
+        const task = this.task(id);
+        if (task.automatic.status === 'succeeded') return;
+        const uncertain = this.automaticUncertain(task);
+        try {
+          // Before publication admission, no publication operation was attempted.
+          if (this.db.prepare('SELECT id FROM operations WHERE id=?').get(task.automatic.publish_request_id)) this.opDone(task.automatic.publish_request_id, uncertain ? 'uncertain' : 'failed');
+          this.finishAutomatic(id, uncertain ? 'uncertain' : 'stopped', error instanceof BridgeError ? error.code : 'AUTOMATIC_OPERATION_UNCONFIRMED');
+        }
         catch (failure) { if (!this.persistenceFailures.has(id)) throw failure; this.persistenceAttention(id); }
       }
     }).finally(() => this.automaticJobs.delete(id));
@@ -1661,7 +1771,6 @@ export class Controller {
     await this.invoke('publish_task', { ...input, request_id: task.automatic.publish_request_id }, {}, () => this.publish(input, automaticTransition));
     task = this.task(id); this.automaticGuard(task);
     if (task.publication?.phase !== 'complete') throw new BridgeError('AUTOMATIC_PUBLICATION_UNCONFIRMED');
-    this.opDone(task.automatic.publish_request_id);
     this.finishAutomatic(id, 'succeeded', null);
   }
   async start(input) {
@@ -1907,6 +2016,7 @@ export class Controller {
       this.invalidateLocalRequests(task, 'LOCAL_TURN_ENDED_WITHOUT_CALLBACK_RESOLUTION');
       this.localHumanState(task);
       if (task.correction) this.save(task, { operation: { id: task.request_id, status: local.turn_submission_attempted ? 'result_received' : 'failed' } });
+      else if (task.automatic) this.save(task, { operation: { id: task.request_id, status: 'accepted' } });
       else { this.opDone(task.request_id); this.save(task); }
     } finally {
       const closed = await settledWithin(Promise.resolve().then(() => backend.close()));
@@ -2091,7 +2201,7 @@ export class Controller {
       !validation || validation.status === 'pending' ? 'not_attempted' : 'unknown';
     const p = task.publication, publicationOperation = operation(a.publish_request_id);
     const publicationConfirmed = !storageUncertain && a.status === 'succeeded' && a.reconciliation?.confirmed !== false && p?.phase === 'complete' && p.commit_tree_matches_reviewed_tree === true &&
-      p.push_attempted === true && p.pr_attempted === true && publicationOperation === 'accepted';
+      p.push_attempted === true && p.pr_attempted === true && publicationOperation === 'accepted' && this.confirmedAutomaticPublication(task);
     const publication = { request_id: identity(a.publish_request_id), status: publicationConfirmed ? 'confirmed_completed' :
       p?.push_attempted === true || p?.pr_attempted === true || publicationOperation === 'pending' || publicationOperation === 'uncertain' ? 'attempted_unconfirmed' :
       !p && (!publicationOperation || ['reserved', 'not_started', 'failed'].includes(publicationOperation)) ? 'not_attempted' : 'unknown' };
@@ -2270,6 +2380,11 @@ export class Controller {
       } else if (parent.automatic.authorization.max_codex_turns === 4) result.correction.remaining_codex_turns = 1;
     }
     if (t.automatic) {
+      if (result.automatic.status === 'succeeded' && !this.confirmedAutomaticPublication(t)) {
+        result.automatic.status = 'uncertain'; result.automatic.human_attention_required = true;
+        result.automatic.reason = 'AUTOMATIC_PUBLICATION_UNCONFIRMED';
+        if (!t.cleaned) result.state = 'uncertain';
+      }
       result.automatic.progress = this.automaticProgress(t, !!storageDiagnostic || this.persistenceFailures.has(id));
       if (result.automatic.progress.interrupted) {
         if (result.automatic.status === 'progressing') result.automatic.status = 'uncertain';
