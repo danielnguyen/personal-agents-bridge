@@ -2056,6 +2056,12 @@ test(`safe restart integrated publication keeps original authority: ${effect}, e
   const value = await completedPublication(context, { testCommands: [], afterPush: effect === 'push response lost', beforeCompletion: effect === 'PR response lost' });
   const { task } = value, id = task.id, confirmed = effect === 'complete';
   const operations = value.controller.db.prepare('SELECT * FROM operations ORDER BY id').all();
+  const publicationOperation = operations.find(row => row.id === task.automatic.publish_request_id);
+  assert(publicationOperation);
+  if (confirmed) assert.equal(publicationOperation.status, 'pending');
+  // Historical confirmation may acknowledge only the original publication
+  // operation. Every identity field and every unrelated operation must survive.
+  const expectedOperations = operations.map(row => confirmed && row.id === publicationOperation.id ? { ...row, status: 'accepted' } : row);
   const history = value.controller.db.prepare('SELECT * FROM automatic_attempts ORDER BY rowid').all();
   interruptController(value.controller);
   if (expired) context.mock.method(Date, 'now', () => task.deadline + 1000);
@@ -2065,6 +2071,7 @@ test(`safe restart integrated publication keeps original authority: ${effect}, e
       localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); } }).init();
     try {
       const ledger = recoveryLedger(c), calls = { ...value.counts };
+      assert.deepEqual(c.db.prepare('SELECT * FROM operations ORDER BY id').all(), expectedOperations);
       for (let duplicate = 0; duplicate < 3; duplicate++) {
         const view = await c.start(value.input);
         assert.equal(view.task_id, id); assert.equal(view.automatic.status, confirmed ? 'succeeded' : 'uncertain');
@@ -2076,8 +2083,13 @@ test(`safe restart integrated publication keeps original authority: ${effect}, e
       if (stable) assert.equal(ledger, stable); else stable = ledger;
       assert.equal(c.task(id).deadline, task.deadline); assert.equal(c.task(id).automatic.owner_instance, task.automatic.owner_instance);
       assert.deepEqual(c.task(id).automatic.authorization, task.automatic.authorization);
-      assert.deepEqual(c.db.prepare('SELECT * FROM operations ORDER BY id').all(), operations);
+      assert.deepEqual(c.task(id).automatic.contract_binding, task.automatic.contract_binding);
+      assert.deepEqual(c.task(id).implementer, task.implementer);
+      assert.deepEqual(c.task(id).reviewer, task.reviewer);
+      assert.deepEqual(c.task(id).publication, task.publication);
+      assert.deepEqual(c.db.prepare('SELECT * FROM operations ORDER BY id').all(), expectedOperations);
       const retained = c.db.prepare('SELECT * FROM automatic_attempts ORDER BY rowid').all();
+      assert.equal(retained.filter(row => row.task_id === id && JSON.parse(row.value).outcome === 'succeeded').length, confirmed ? 1 : 0);
       for (const row of history) assert(retained.some(current => JSON.stringify(current) === JSON.stringify(row)));
       assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
     } finally { interruptController(c); }
