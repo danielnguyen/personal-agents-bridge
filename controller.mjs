@@ -375,7 +375,10 @@ export class Controller {
       const task = this.task(id), a = task.automatic;
       if (!a || a.status === 'succeeded') return;
       const snapshot = JSON.stringify(task);
-      let outcome = 'external_effects_uncertain', reason = /^[A-Z_]{1,100}$/.test(a.reason || '') ? a.reason : 'AUTOMATIC_RESTART_NO_REPLAY', operations;
+      // Progressing work stopped because this instance restarted; an earlier
+      // phase's reason is not the current stop reason. Retain historical stops
+      // and uncertainty, while the proof/expiry checks below remain authoritative.
+      let outcome = 'external_effects_uncertain', reason = a.status !== 'progressing' && /^[A-Z_]{1,100}$/.test(a.reason || '') ? a.reason : 'AUTOMATIC_RESTART_NO_REPLAY', operations;
       const interrupted = ['progressing', 'uncertain'].includes(a.status);
       if (!interrupted) {
         outcome = a.status === 'stopped' ? a.reason === 'TASK_EXPIRED' ? 'expired' : 'stopped' : 'evidence_unconfirmed';

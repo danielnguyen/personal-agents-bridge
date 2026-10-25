@@ -330,18 +330,25 @@ test('automatic restart with unfinished durable intent requires attention withou
   const started = await value.controller.start({ ...value.input, automatic: automaticAuthority() });
   await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
   const saved = value.controller.task(started.task_id);
+  assert.equal(saved.automatic.status, 'stopped');
+  assert.equal(saved.automatic.reason, 'AUTOMATIC_IMPLEMENTATION_UNQUALIFIED');
   await value.controller.close();
   saved.automatic.status = 'progressing'; saved.automatic.phase = 'validation_and_review';
   const database = new DatabaseSync(path.join(value.controller.stateRoot, 'controller.sqlite'));
   database.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(saved), saved.id); database.close();
-  const before = value.instances.length;
-  const restarted = await new Controller(value.config).init();
+  const before = value.instances.length, effects = [];
+  const restarted = await new Controller({ ...value.config,
+    localValidationFactory() { effects.push('validation'); throw Error('Unexpected validation replay'); },
+    publisher: Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR'].map(name =>
+      [name, () => { effects.push(name); throw Error('Unexpected publication operation'); }])) }).init();
   try {
     const view = await restarted.get(saved.id);
     assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.reason, 'AUTOMATIC_RESTART_NO_REPLAY');
     assert.equal(restarted.automaticJobs.size, 0); assert.equal(value.instances.length, before);
     await restarted.start({ ...value.input, automatic: automaticAuthority() });
     assert.equal(value.instances.length, before);
+    assert.deepEqual(effects, []);
+    assert.equal(restarted.task(saved.id).deadline, saved.deadline);
   } finally { await restarted.close(); }
 });
 
@@ -1735,7 +1742,8 @@ test('terminal publication recovery may record completion after expiry only with
 
 // Pure SQLite classification checks also run where filesystem integration is
 // unavailable. They do not replace the real packet/Git/session tests above.
-for (const state of ['pending', 'expired', 'stopped', 'missing proof', 'write loss', 'manual', 'agents api'])
+for (const state of ['pending', 'expired', 'stopped', 'missing proof', 'write loss', 'manual', 'agents api',
+  'unfinished implementation', 'unfinished validation', 'unfinished publication', 'historical failure', 'established uncertainty'])
 test(`durable recovery classification persists without execution: ${state}`, async context => {
   const effects = [], c = new Controller({ executor: new FakeExecutor(), localBackendFactory() { effects.push('model'); },
     localValidationFactory() { effects.push('validation'); }, publisher: Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR']
@@ -1744,11 +1752,14 @@ test(`durable recovery classification persists without execution: ${state}`, asy
   c.db.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY,value TEXT); CREATE TABLE operations (id TEXT PRIMARY KEY,fingerprint TEXT,task_id TEXT,status TEXT); CREATE TABLE automatic_attempts (task_id TEXT,attempt_id TEXT,observation_sha256 TEXT,value TEXT,PRIMARY KEY(task_id,attempt_id,observation_sha256)); CREATE TABLE audit (id TEXT,created INTEGER,value TEXT);');
   context.after(() => { c.dbClosed = true; c.db.close(); });
   const created = Date.now(), id = 'task_00000000-0000-0000-0000-000000000001', authorization = automaticAuthority();
+  const stopped = ['stopped', 'historical failure'].includes(state), unfinished = state.startsWith('unfinished ');
   const t = { id, execution_backend: 'local_codex', created, deadline: created + 120000, baseline: 'a'.repeat(40), request_id: 'original',
     implementer: { state: 'completed', local: { turn_submission_attempted: true, human_requests: [] } },
-    automatic: { status: state === 'stopped' ? 'stopped' : 'progressing', reason: state === 'stopped' ? 'AUTOMATIC_CANCELLED' : null,
-      phase: 'implementation', authorization, contract_binding: { sha256: digest(contract()), contract: contract() },
+    automatic: { status: stopped ? 'stopped' : state === 'established uncertainty' ? 'uncertain' : 'progressing',
+      reason: state === 'stopped' ? 'AUTOMATIC_CANCELLED' : unfinished || ['historical failure', 'established uncertainty'].includes(state) ? 'AUTOMATIC_IMPLEMENTATION_UNQUALIFIED' : null,
+      phase: state === 'unfinished validation' ? 'validation_and_review' : state === 'unfinished publication' ? 'publication' : 'implementation', authorization, contract_binding: { sha256: digest(contract()), contract: contract() },
       owner_instance: 'previous-owner', deadline: created + 120000, review_request_id: 'review-original', publish_request_id: 'publish-original' } };
+  if (state === 'unfinished publication') t.publication = { phase: 'prepared', push_attempted: true };
   if (state === 'expired') t.deadline = t.automatic.deadline = created - 1;
   if (state === 'missing proof') { t.automatic.phase = 'publication'; t.publication = { phase: 'complete' }; }
   if (['manual', 'agents api'].includes(state)) { delete t.automatic; if (state === 'agents api') t.execution_backend = 'agents_api'; }
@@ -1759,15 +1770,26 @@ test(`durable recovery classification persists without execution: ${state}`, asy
   if (['manual', 'agents api'].includes(state)) { assert.deepEqual(saved, t); assert.deepEqual(effects, []); return; }
   if (state === 'write loss') { assert(c.persistenceFailures.has(id)); assert.equal(saved.automatic.status, 'progressing'); }
   else {
-    assert.equal(saved.automatic.reconciliation.outcome, { pending: 'external_effects_uncertain', expired: 'expired', stopped: 'stopped', 'missing proof': 'evidence_unconfirmed' }[state]);
+    assert.equal(saved.automatic.reconciliation.outcome, unfinished || state === 'established uncertainty' ? 'external_effects_uncertain' : state === 'historical failure' ? 'stopped' :
+      { pending: 'external_effects_uncertain', expired: 'expired', stopped: 'stopped', 'missing proof': 'evidence_unconfirmed' }[state]);
     assert.equal(saved.automatic.reconciliation.confirmed, false);
-    assert.equal(saved.automatic.status, state === 'stopped' ? 'stopped' : 'uncertain');
+    assert.equal(saved.automatic.status, stopped ? 'stopped' : 'uncertain');
+    if (unfinished || ['historical failure', 'established uncertainty'].includes(state)) {
+      const reason = unfinished ? 'AUTOMATIC_RESTART_NO_REPLAY' : 'AUTOMATIC_IMPLEMENTATION_UNQUALIFIED';
+      assert.equal(saved.automatic.reason, reason);
+      assert.equal(saved.automatic.reconciliation.reason, reason);
+    }
     assert.equal(saved.deadline, t.deadline); assert.equal(saved.automatic.owner_instance, 'previous-owner');
   }
   const status = await c.get(id);
-  assert.equal(status.automatic.status, state === 'stopped' ? 'stopped' : 'uncertain');
+  assert.equal(status.automatic.status, stopped ? 'stopped' : 'uncertain');
   assert.equal(status.automatic.reconciliation.confirmed, false);
-  assert.equal(status.automatic.human_attention_required, state === 'stopped' ? saved.automatic.human_attention_required : true);
+  assert.equal(status.automatic.human_attention_required, stopped ? saved.automatic.human_attention_required : true);
+  if (unfinished || ['historical failure', 'established uncertainty'].includes(state)) {
+    const before = JSON.stringify(['tasks', 'operations', 'automatic_attempts', 'audit'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+    await c.reconcileAutomaticPublication(id); c.scheduleAutomatic(id); await Promise.all([...c.automaticJobs.values()]);
+    assert.equal(JSON.stringify(['tasks', 'operations', 'automatic_attempts', 'audit'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())), before);
+  }
   assert.deepEqual(effects, []); assert.equal(c.localRuns.size, 0); assert.equal(c.validationRuns.size, 0); assert.equal(c.automaticJobs.size, 0);
 });
 
