@@ -66,7 +66,13 @@ def report(**fields): os.write(info,(json.dumps(fields)+'\n').encode())
 try:
  assert os.getpid()==1
  status=dict(line.split(':',1) for line in open('/proc/self/status') if ':' in line)
- report(event='ready',pid=int(status['NSpid'].split()[0]))
+ # A matching procfs is required by native sandbox namespace lookups. Never
+ # send a local PID as an outer PID or expose an inherited host-proc handle.
+ assert int(status['Pid'])==1 and list(map(int,status['NSpid'].split()))==[1]
+ assert os.readlink('/proc/self')=='1'
+ namespace=os.readlink('/proc/self/ns/pid')
+ assert os.readlink('/proc/1/ns/pid')==namespace
+ report(event='ready',pid=1,namespace=namespace,mount_namespace=os.readlink('/proc/self/ns/mnt'))
  assert os.read(gate,1)==b'1'
  os.close(gate)
  # unshare may leave SIGTERM ignored; commands retain normal signal behavior.
@@ -109,6 +115,7 @@ try:
   prctl(1,signal.SIGKILL)
   if os.getppid()!=owner: os._exit(125)
  wrapper=subprocess.Popen(['/usr/bin/unshare','--user','--map-current-user','--pid','--fork','--kill-child=KILL',
+  '--mount-proc','--propagation=private',
   '/usr/bin/python3','-B','-c',inner,str(writer),str(gate_reader),json.dumps([request['binary'],*request['args']])],
   pass_fds=(writer,gate_reader),preexec_fn=owned_child)
  wrapper_fd=os.pidfd_open(wrapper.pid)
@@ -130,8 +137,13 @@ try:
     message=json.loads(line)
     if message['event']=='ready':
      if initialized: raise RuntimeError('duplicate ownership')
-     candidate=message['pid']
-     if not isinstance(candidate,int) or candidate<=1: raise RuntimeError('invalid owner')
+     if type(message['pid']) is not int or message['pid']!=1: raise RuntimeError('invalid local owner')
+     # The gated init cannot exit normally or spawn a command yet. Identify it
+     # through our owned wrapper's children in the unchanged outer procfs.
+     children=open('/proc/%d/task/%d/children'%(wrapper.pid,wrapper.pid)).read().split()
+     if len(children)!=1: raise RuntimeError('ambiguous namespace owner')
+     candidate=int(children[0])
+     if candidate<=1: raise RuntimeError('invalid outer owner')
      candidate_fd=os.pidfd_open(candidate)
      status=dict(line.split(':',1) for line in open('/proc/%d/status'%candidate) if ':' in line)
      ids=list(map(int,status['NSpid'].split()))
@@ -140,6 +152,9 @@ try:
      assert own_ids[0]==os.getpid() and ids[0]==candidate and ids[-1]==1 and len(ids)==len(own_ids)+1
      assert int(status['PPid'])==wrapper.pid and int(status['Uid'].split()[0])==os.getuid()
      assert namespace!=os.readlink('/proc/self/ns/pid') and not exited(candidate_fd)
+     assert namespace==message['namespace']
+     mount_namespace=os.readlink('/proc/%d/ns/mnt'%candidate)
+     assert mount_namespace==message['mount_namespace'] and mount_namespace!=os.readlink('/proc/self/ns/mnt')
      init_pid,init_fd=candidate,candidate_fd
      initialized=True
      emit('ready',init_pid=init_pid,namespace=namespace)

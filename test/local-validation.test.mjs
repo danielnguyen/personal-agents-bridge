@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { promises as fs, readFileSync } from 'node:fs';
+import { promises as fs, readFileSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -64,7 +64,8 @@ print('independently checked')`;
   const exact = 'python3 -B -c ' + "'" + script.replaceAll("'", "'\\''") + "'";
   const runner = new LocalValidation({ root: value.root });
   const records = [];
-  const results = await runner.run({ ...value, commands: [exact, 'test "$(cat answer.txt)" = 42'], attemptId: 'validation-attempt', onRecord: record => records.push(record) });
+  const procCheck = `/usr/bin/python3 -B -c 'import os; assert os.readlink("/proc/self")==str(os.getpid()); assert os.readlink("/proc/%d/ns/pid"%os.getpid())==os.readlink("/proc/self/ns/pid")'`;
+  const results = await runner.run({ ...value, commands: [exact, 'test "$(cat answer.txt)" = 42 && ' + procCheck], attemptId: 'validation-attempt', onRecord: record => records.push(record) });
   assert.equal(results.length, 2);
   for (const result of results) assert.equal(result.status, 'passed', JSON.stringify(result));
   assert.equal(results[0].command, exact); assert.equal(results[0].candidate_tree, value.tree);
@@ -98,6 +99,7 @@ for (const [label, command, status] of [
   if (label === 'nonzero exit') { assert.equal(result.exit_code, 7); assert.equal(result.stderr.text, 'failure'); }
   if (label === 'truncated output') { assert.equal(result.stdout.truncated, true); assert(result.stdout.text.length <= 2048); }
   if (label === 'redacted output') { assert.equal(result.stdout.redacted, true); assert(!result.stdout.text.includes('synthetic')); }
+  if (label === 'non-UTF8 output') assert.equal(result.stdout.encoding_error, true);
 });
 
 for (const action of ['timeout', 'cancel']) test(`independent ${action} terminates execution without PASS`, async context => {
@@ -202,6 +204,33 @@ test('ordinary real command has owned namespace and complete output', async () =
   assert.equal(result.escaped_descendants_verified, true);
 });
 
+test('private procfs agrees with local process IDs while the outer observer retains ownership', async () => {
+  const script = `import json,os
+status=dict(line.split(':',1) for line in open('/proc/self/status') if ':' in line)
+print(json.dumps(dict(pid=os.getpid(),proc_pid=int(status['Pid']),ids=list(map(int,status['NSpid'].split())),
+ proc_self=os.readlink('/proc/self'),namespace=os.readlink('/proc/%d/ns/pid'%os.getpid()),mount=os.readlink('/proc/self/ns/mnt'))))`;
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 3000, bound: value => value });
+  assert.equal(result.status, 'passed', JSON.stringify(result));
+  const identity = JSON.parse(result.stdout.text);
+  assert.equal(identity.proc_pid, identity.pid); assert.equal(identity.proc_self, String(identity.pid));
+  assert.deepEqual(identity.ids, [identity.pid]);
+  assert.equal(result.namespace_identity.namespace, identity.namespace);
+  assert(result.namespace_identity.init_pid > 1);
+  assert.notEqual(identity.namespace, await fs.readlink('/proc/self/ns/pid'));
+  assert.notEqual(identity.mount, await fs.readlink('/proc/self/ns/mnt'));
+  assert.equal(result.termination_confirmed, true);
+});
+
+for (const [label, script, flag] of [
+  ['non-UTF8', 'import os; os.write(1,bytes([255]))', 'encoding_error'],
+  ['truncated', 'print("x"*5000)', 'truncated'],
+]) test(`real namespace ${label} output retains explicit incomplete evidence`, async () => {
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 3000, bound: value => value });
+  assert.equal(result.status, 'incomplete', JSON.stringify(result)); assert.equal(result.stdout[flag], true);
+  assert.equal(result.exit_code, 0); assert.equal(result.background_processes_observed, false);
+  assert.equal(result.termination_confirmed, true);
+});
+
 test('a fast command exit cannot overtake its buffered completion observation', async () => {
   const result = await observeValidationProcess('/bin/true', [], { timeoutMs: 3000, bound: value => value,
     spawnProcess(binary, args, options) {
@@ -214,12 +243,20 @@ test('a fast command exit cannot overtake its buffered completion observation', 
   assert.equal(result.termination_confirmed, true);
 });
 
-for (const fault of ['namespace creation', 'ownership verification']) test(`real ${fault} failure never dispatches the command or falls back`, async () => {
+for (const [fault, before, after] of [
+  ['namespace creation', "'--map-current-user'", "'--pab-invalid-option'"],
+  ['procfs mount', "'--mount-proc'", "'--mount-proc=/nonexistent-pab-proc'"],
+  ['missing procfs mount', "'--mount-proc',", ''],
+  ['local PID identity', "report(event='ready',pid=1,", "report(event='ready',pid=2,"],
+  ['PID namespace identity', 'namespace=namespace,mount_namespace=', "namespace='pid:[0]',mount_namespace="],
+  ['mount namespace identity', "mount_namespace=os.readlink('/proc/self/ns/mnt')", "mount_namespace='mnt:[0]'"],
+  ['ambiguous wrapper children', 'if len(children)!=1:', 'children+=children\n     if len(children)!=1:'],
+  ['ownership verification', "assert int(status['PPid'])==wrapper.pid", "assert False and int(status['PPid'])==wrapper.pid"],
+]) test(`real ${fault} failure never dispatches the command or falls back`, async () => {
   const result = await observeValidationProcess('/bin/echo', ['must-not-execute'], { timeoutMs: 3000, bound: value => value,
     spawnProcess(binary, args, options) {
       const changed = [...args];
-      changed[2] = fault === 'namespace creation' ? args[2].replace("'--map-current-user'", "'--pab-invalid-option'") :
-        args[2].replace("assert int(status['PPid'])==wrapper.pid", "assert False and int(status['PPid'])==wrapper.pid");
+      changed[2] = args[2].replace(before, after);
       assert.notEqual(changed[2], args[2]);
       return spawn(binary, changed, options);
     }
@@ -269,19 +306,38 @@ os.close(writer)
 print(os.read(reader,1024).decode(),end='',flush=True)
 time.sleep(float(__import__('sys').argv[1]))`;
 
+function findEscapedProcess(nonce) {
+  const found = [];
+  for (const pid of readdirSync('/proc')) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      if (readFileSync(`/proc/${pid}/comm`, 'utf8').trim() !== 'pab-escape') continue;
+      if (!readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').includes(nonce)) continue;
+      const status = readFileSync(`/proc/${pid}/stat`, 'utf8'), fields = status.slice(status.lastIndexOf(')') + 2).split(' ');
+      assert.notEqual(fields[0], 'Z');
+      assert.equal(Number(fields[2]), Number(pid)); assert.equal(Number(fields[3]), Number(pid));
+      found.push({ pid: Number(pid), starttime: fields[19] });
+    } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
+  }
+  assert(found.length <= 1, 'ambiguous escaped test process');
+  return found[0];
+}
+
 for (const mode of ['background exit', 'timeout', 'cancel', 'observer loss']) test(`real escaped session is killed and reaped after ${mode}`, async context => {
   const abort = new AbortController(); let watcher, watching, identity, output = '';
-  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', escapingCommand, mode === 'background exit' ? '0.5' : '10'], {
+  const nonce = randomUUID();
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', escapingCommand, mode === 'background exit' ? '0.5' : '10', nonce], {
     timeoutMs: mode === 'timeout' ? 1000 : 3000, signal: abort.signal, bound: value => value,
     spawnProcess(binary, args, options) {
       const child = spawn(binary, args, options);
       child.stdout.on('data', data => {
         output += data;
         if (identity || !output.includes('\n')) return;
-        identity = JSON.parse(output.slice(0, output.indexOf('\n')));
-        assert.equal(identity.inner_pid, identity.pgid); assert.equal(identity.pgid, identity.sid);
-        const status = readFileSync(`/proc/${identity.pid}/stat`, 'utf8');
-        assert.notEqual(status.slice(status.lastIndexOf(')') + 2).split(' ')[0], 'Z');
+        const local = JSON.parse(output.slice(0, output.indexOf('\n')));
+        assert.equal(local.pid, local.inner_pid);
+        assert.equal(local.inner_pid, local.pgid); assert.equal(local.pgid, local.sid);
+        identity = findEscapedProcess(nonce);
+        assert(identity, 'escaped child was never independently observed');
         watcher = spawn('/usr/bin/python3', ['-B', '-c', watchExit, String(identity.pid)]);
         watching = new Promise((resolve, reject) => {
           let text = '', error = ''; watcher.stdout.on('data', data => {
@@ -317,23 +373,15 @@ test('native validation contains an escaped session after the main command exits
   // uniquely tagged test child in the observer's /proc rather than confusing
   // the command's local PID with an unrelated process in the parent namespace.
   while (!settled && !identity) {
-    for (const pid of await fs.readdir('/proc')) {
-      if (!/^\d+$/.test(pid)) continue;
-      try {
-        if ((await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim() !== 'pab-escape') continue;
-        if (!(await fs.readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0').includes(nonce)) continue;
-        const status = await fs.readFile(`/proc/${pid}/stat`, 'utf8'), fields = status.slice(status.lastIndexOf(')') + 2).split(' ');
-        assert.equal(Number(fields[2]), Number(pid)); assert.equal(Number(fields[3]), Number(pid));
-        identity = { pid: Number(pid), starttime: fields[19] };
-        watcher = spawn('/usr/bin/python3', ['-B', '-c', watchExit, pid]);
-        watching = new Promise((resolve, reject) => {
-          let output = '', error = '';
-          watcher.stdout.on('data', data => { output += data; }); watcher.stderr.on('data', data => { error += data; });
-          watcher.once('error', reject); watcher.once('close', code => code === 0 ? resolve(output) : reject(Error(error)));
-        });
-        watching.catch(() => {});
-        break;
-      } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
+    identity = findEscapedProcess(nonce);
+    if (identity) {
+      watcher = spawn('/usr/bin/python3', ['-B', '-c', watchExit, String(identity.pid)]);
+      watching = new Promise((resolve, reject) => {
+        let output = '', error = '';
+        watcher.stdout.on('data', data => { output += data; }); watcher.stderr.on('data', data => { error += data; });
+        watcher.once('error', reject); watcher.once('close', code => code === 0 ? resolve(output) : reject(Error(error)));
+      });
+      watching.catch(() => {});
     }
     if (!identity && !settled) await new Promise(resolve => setTimeout(resolve, 10));
   }
