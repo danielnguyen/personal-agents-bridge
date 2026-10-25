@@ -1892,3 +1892,92 @@ test('qualified recovery fallback snapshot race preserves second Controller term
     assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1); assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
   } finally { for (const c of [first, second]) if (c.db && !c.dbClosed) interruptController(c); }
 });
+
+for (const state of ['cleaned stopped', 'deleted stopped', 'cleaned expired', 'cleaned uncertain', 'cleaned progressing', 'incomplete cleanup'])
+test(`historical cleanup retention across fresh Controller connections: ${state}`, async context => {
+  const root = await fs.mkdtemp('/tmp/pab-history-retention-'), file = path.join(root, 'controller.sqlite'), effects = [];
+  const config = { executor: new FakeExecutor(), localBackendFactory() { effects.push('model'); throw Error('Unexpected model'); },
+    localValidationFactory() { effects.push('validation'); throw Error('Unexpected validation'); },
+    publisher: Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR'].map(name =>
+      [name, () => { effects.push(name); throw Error('Unexpected publication operation'); }])) };
+  const original = new Controller(config); original.db = new DatabaseSync(file);
+  original.db.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY,value TEXT); CREATE TABLE operations (id TEXT PRIMARY KEY,fingerprint TEXT,task_id TEXT,status TEXT); CREATE TABLE automatic_attempts (task_id TEXT,attempt_id TEXT,observation_sha256 TEXT,value TEXT,PRIMARY KEY(task_id,attempt_id,observation_sha256)); CREATE TABLE audit (id TEXT,created INTEGER,value TEXT); CREATE TABLE failures (session_id TEXT,turn_id TEXT,expires INTEGER,value TEXT);');
+  context.after(async () => { if (!original.dbClosed) interruptController(original); await fs.rm(root, { recursive: true, force: true }); });
+  const id = 'task_00000000-0000-0000-0000-000000000003', created = Date.now();
+  const historical = ['cleaned stopped', 'deleted stopped', 'cleaned expired'].includes(state);
+  const task = { id, execution_backend: 'local_codex', created, deadline: created + 120000, baseline: 'a'.repeat(40), request_id: 'original',
+    repository: { repository_id: 'fixture', baseline_commit: 'a'.repeat(40), base_ref: 'HEAD', branch: `bridge/${id}` },
+    implementer: { state: 'completed', local: { human_requests: [], turn_submission_attempted: true, result_received: true, server_closed: true } },
+    cleaned: state !== 'incomplete cleanup', workspace_deleted: state === 'deleted stopped',
+    cleanup: { workspace_deleted: state === 'deleted stopped', executor_stopped: state !== 'incomplete cleanup' },
+    automatic: { status: state === 'cleaned uncertain' ? 'uncertain' : state === 'cleaned progressing' ? 'progressing' : 'stopped',
+      reason: state === 'cleaned expired' ? 'TASK_EXPIRED' : 'PUBLICATION_REQUIRES_PASS_REVIEW', phase: 'validation_and_review', human_attention_required: true,
+      authorization: automaticAuthority(), contract_binding: { sha256: digest(contract()), contract: contract() }, deadline: created + 120000,
+      owner_instance: original.instanceId, review_request_id: 'review-original', publish_request_id: 'publish-original' } };
+  if (state === 'cleaned expired') task.deadline = task.automatic.deadline = created - 1;
+  original.save(task);
+  const before = recoveryLedger(original), attempts = original.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+  if (state !== 'cleaned progressing') assert(attempts.length > 0);
+  interruptController(original);
+  for (let restart = 0; restart < 3; restart++) {
+    // Isolate startup's reconciliation call from unavailable filesystem fixtures.
+    // The full init/cleanup/reviewer regression below exercises the real lifecycle.
+    const c = new Controller(config); c.db = new DatabaseSync(file);
+    try {
+      assert.notEqual(c.instanceId, task.automatic.owner_instance);
+      await c.reconcileAutomaticPublication(id);
+      for (let read = 0; read < 2; read++) {
+        const status = await c.get(id);
+        assert.equal(status.automatic.status, historical || state === 'incomplete cleanup' ? 'stopped' : 'uncertain');
+        assert.equal(status.automatic.human_attention_required, true);
+        if (!historical) assert.equal(status.automatic.reconciliation.confirmed, false);
+      }
+      if (historical) {
+        assert.deepEqual(c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id), attempts);
+        assert.equal(recoveryLedger(c), before);
+      } else {
+        assert(c.task(id).automatic.reconciliation);
+        const retained = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+        assert.deepEqual(retained.slice(0, attempts.length), attempts);
+      }
+      assert.equal(c.task(id).deadline, task.deadline); assert.equal(c.task(id).automatic.owner_instance, task.automatic.owner_instance);
+      assert.equal(c.automaticJobs.size, 0); assert.equal(c.localRuns.size, 0); assert.equal(c.validationRuns.size, 0);
+    } finally { interruptController(c); }
+  }
+  assert.deepEqual(effects, []);
+});
+
+test('cleaned stopped review history survives workspace deletion, repeated startup and status reads', async context => {
+  const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, { noApi: true });
+  const effects = [];
+  const publisher = Object.fromEntries(['target', 'remoteHead', 'findPR', 'push', 'createPR'].map(name =>
+    [name, () => { effects.push(name); throw Error('Unexpected publication operation'); }]));
+  value.controller.publisher = publisher; value.config.publisher = publisher;
+  const started = await value.controller.start({ ...value.input, automatic: automaticAuthority() });
+  const implementer = await value.running(); implementer.finish(); await value.drain();
+  const reviewer = await value.running(1), raw = JSON.parse(reviewOutput());
+  raw.overall = 'FAIL'; raw.findings[0].status = 'FAIL';
+  reviewer.finish('completed', true, JSON.stringify(raw)); await value.drain(); await Promise.all([...value.controller.automaticJobs.values()]);
+  const c = value.controller, id = started.task_id, prior = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+  assert.equal(c.task(id).automatic.status, 'stopped'); assert.equal(c.task(id).reviewer.review_result.overall, 'FAIL');
+  const task = c.task(id); task.reviewer.review_result = null; task.reviewer.state = 'needs_attention'; task.reviewer.error = 'LOCAL_REVIEW_INTEGRITY_CHANGED'; c.save(task);
+  await c.cleanup({ task_id: id, delete_workspace: true });
+  assert.equal(c.task(id).cleaned, true); assert.equal(c.task(id).workspace_deleted, true);
+  const retained = c.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id);
+  assert.deepEqual(retained.slice(0, prior.length), prior);
+  const before = recoveryLedger(c); await c.close();
+  for (let restart = 0; restart < 2; restart++) {
+    const recovered = await new Controller({ ...value.config,
+      localBackendFactory() { effects.push('model'); throw Error('Unexpected model replay'); },
+      localValidationFactory() { effects.push('validation'); throw Error('Unexpected validation replay'); } }).init();
+    try {
+      for (let read = 0; read < 2; read++) {
+        const status = await recovered.get(id);
+        assert.equal(status.automatic.status, 'stopped'); assert.equal(status.cleanup.workspace_deleted, true);
+      }
+      assert.deepEqual(recovered.db.prepare('SELECT * FROM automatic_attempts WHERE task_id=? ORDER BY rowid').all(id), retained);
+      assert.equal(recoveryLedger(recovered), before); assert.equal(recovered.automaticJobs.size, 0);
+    } finally { await recovered.close(); }
+  }
+  assert.equal(value.instances.length, 2); assert.deepEqual(effects, []);
+});

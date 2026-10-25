@@ -374,6 +374,9 @@ export class Controller {
     return this.locked(id, async () => {
       const task = this.task(id), a = task.automatic;
       if (!a || a.status === 'succeeded') return;
+      // Completed cleanup of stopped work is historical; no unfinished
+      // publication is eligible for recovery and its retained outcome must not change.
+      if (task.cleaned === true && a.status === 'stopped') return;
       const snapshot = JSON.stringify(task);
       // Progressing work stopped because this instance restarted; an earlier
       // phase's reason is not the current stop reason. Retain historical stops
