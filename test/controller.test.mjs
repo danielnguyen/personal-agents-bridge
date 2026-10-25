@@ -2656,3 +2656,174 @@ test('automatic operation durability late failure cannot downgrade another Contr
     assert.equal(statusLedger(second.db), committed);
   } finally { interruptProgressController(second); }
 });
+
+
+for (const path of ['finishAutomatic', 'finishAutomatic uncertain', 'persistenceAttention'])
+test(`automatic concurrent writes stale ${path} cannot overwrite committed success`, async t => {
+  const { c, root, api, executor } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  const save = c.save.bind(c); let committed, interleaved = false, failure;
+  c.save = (task, options) => {
+    if (!interleaved) {
+      interleaved = true;
+      second.finishAutomatic(input.taskId, 'succeeded', null);
+      committed = statusLedger(second.db);
+    }
+    return save(task, options);
+  };
+  c.localBackendFactory = () => assert.fail('Model dispatch from stale writer');
+  c.localValidationFactory = () => assert.fail('Validation dispatch from stale writer');
+  c.publisher = new Proxy({}, { get() { assert.fail('Publication from stale writer'); } });
+  try {
+    if (path === 'persistenceAttention') c.persistenceFailures.add(input.taskId);
+    try { path.startsWith('finishAutomatic') ? c.finishAutomatic(input.taskId, path.endsWith('uncertain') ? 'uncertain' : 'stopped', 'AUTOMATIC_VALIDATION_FAILED') : c.persistenceAttention(input.taskId); }
+    catch (error) { failure = error; }
+    assert.equal(interleaved, true);
+    assert.equal(second.task(input.taskId).automatic.status, 'succeeded');
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
+    if (path.startsWith('finishAutomatic')) assert.equal(failure?.code, 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED');
+    assert.equal(c.persistenceFailures.has(input.taskId), true);
+    assert.equal((await c.get(input.taskId)).automatic.status, 'uncertain');
+    assert.equal((await second.get(input.taskId)).automatic.status, 'succeeded');
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+    assert.equal(api.created.length + api.sent.length + executor.started.length, 0);
+    assert.equal(statusLedger(second.db), committed);
+  } finally { interruptProgressController(second); }
+  interruptProgressController(c);
+  for (let restart = 0; restart < 3; restart++) {
+    const recovered = await new Controller({ stateRoot: `${root}/state`, workspaceRoot: `${root}/work`, executor: new FakeExecutor(),
+      localBackendFactory() { assert.fail('Model replay'); }, localValidationFactory() { assert.fail('Validation replay'); },
+      publisher: new Proxy({}, { get() { assert.fail('Publication replay'); } }) }).init();
+    try {
+      for (let read = 0; read < 3; read++) {
+        const view = await recovered.invoke('get_task', { task_id: input.taskId }, {}, () => recovered.get(input.taskId));
+        assert.equal(view.automatic.status, 'succeeded'); assert.equal(view.automatic.human_attention_required, false);
+        assert.equal(view.automatic.progress.attempts.publication.status, 'confirmed_completed');
+      }
+      assert.equal(statusLedger(recovered.db), committed);
+    } finally { interruptProgressController(recovered); }
+  }
+});
+
+
+for (const path of ['finishAutomatic', 'persistenceAttention']) for (const latched of [false, true])
+test(`automatic concurrent writes wholly late ${path} preserves success and prior latch=${latched}`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  try {
+    second.finishAutomatic(input.taskId, 'succeeded', null);
+    const committed = statusLedger(second.db);
+    if (latched) c.persistenceFailures.add(input.taskId);
+    path === 'finishAutomatic' ? c.finishAutomatic(input.taskId, 'stopped', 'AUTOMATIC_OPERATION_UNCONFIRMED') : c.persistenceAttention(input.taskId);
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(c.persistenceFailures.has(input.taskId), latched);
+    const view = await c.get(input.taskId);
+    assert.equal(view.automatic.status, latched ? 'uncertain' : 'succeeded');
+    assert.equal(view.automatic.human_attention_required, latched);
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  } finally { interruptProgressController(second); }
+});
+
+for (const status of ['stopped', 'uncertain'])
+test(`automatic concurrent writes genuine ${status} retains original behavior`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const reader = new DatabaseSync(`${root}/state/controller.sqlite`, { readOnly: true });
+  try {
+    c.finishAutomatic(input.taskId, status, 'AUTOMATIC_OPERATION_UNCONFIRMED');
+    const task = JSON.parse(reader.prepare('SELECT value FROM tasks WHERE id=?').get(input.taskId).value);
+    assert.deepEqual(task, { ...input.task, automatic: { ...input.task.automatic, status, reason: 'AUTOMATIC_OPERATION_UNCONFIRMED', human_attention_required: true } });
+    c.verifyAutomaticEvidence(task);
+    assert.equal(reader.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'pending');
+    assert.equal(c.persistenceFailures.has(input.taskId), false);
+    const view = await c.get(input.taskId); assert.equal(view.automatic.status, status); assert.equal(view.automatic.human_attention_required, true);
+  } finally { reader.close(); }
+});
+
+test('automatic concurrent writes genuine persistence attention retains task identity and pending operation', async t => {
+  const { c } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId); c.persistenceFailures.add(input.taskId);
+  c.persistenceAttention(input.taskId);
+  assert.deepEqual(c.task(input.taskId), { ...input.task, reviewer: { ...input.task.reviewer, local: { ...input.task.reviewer.local, human_attention_required: true } },
+    automatic: { ...input.task.automatic, status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true } });
+  assert.equal(c.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'pending');
+  assert.equal(c.persistenceFailures.has(input.taskId), true);
+  assert.equal((await c.get(input.taskId)).automatic.status, 'uncertain');
+});
+
+for (const path of ['finishAutomatic', 'persistenceAttention'])
+test(`automatic concurrent writes ${path} storage uncertainty cannot invent success`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const reader = new DatabaseSync(`${root}/state/controller.sqlite`, { readOnly: true }), before = statusLedger(reader);
+  c.db.exec('CREATE TEMP TRIGGER attention_fault BEFORE INSERT ON tasks BEGIN SELECT RAISE(IGNORE); END;');
+  try {
+    if (path === 'finishAutomatic') assert.throws(() => c.finishAutomatic(input.taskId, 'stopped', 'AUTOMATIC_VALIDATION_FAILED'), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    else c.persistenceAttention(input.taskId);
+    assert.equal(c.persistenceFailures.has(input.taskId), true);
+    assert.equal(statusLedger(reader), before);
+    const view = await c.get(input.taskId); assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+    assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+  } finally { c.db.exec('DROP TRIGGER attention_fault'); reader.close(); }
+});
+
+for (const path of ['finishAutomatic', 'persistenceAttention'])
+test(`automatic concurrent writes stale ${path} nonterminal conflict grants no authority`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  const save = c.save.bind(c); let committed, interleaved = false;
+  c.save = (task, options) => {
+    if (!interleaved) {
+      interleaved = true;
+      const competing = second.task(input.taskId); competing.automatic.phase = 'validation_and_review'; second.save(competing);
+      committed = statusLedger(second.db);
+    }
+    return save(task, options);
+  };
+  try {
+    if (path === 'finishAutomatic') assert.throws(() => c.finishAutomatic(input.taskId, 'stopped', 'AUTOMATIC_VALIDATION_FAILED'), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    else c.persistenceAttention(input.taskId);
+    assert.equal(interleaved, true); assert.equal(statusLedger(second.db), committed);
+    assert.equal(c.persistenceFailures.has(input.taskId), true);
+    const view = await c.get(input.taskId); assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+    assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+    assert.equal(second.task(input.taskId).automatic.status, 'progressing');
+    assert.equal(second.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'pending');
+    assert.equal(second.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE json_extract(value,'$.outcome')='succeeded'").get().n, 0);
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  } finally { interruptProgressController(second); }
+});
+
+for (const path of ['finishAutomatic', 'persistenceAttention']) for (const timing of ['stale', 'late']) for (const fault of ['operation', 'outcome', 'task'])
+test(`automatic concurrent writes ${timing} ${path} rejects unproven terminal ${fault} evidence`, async t => {
+  const { c, root } = await setup(t), input = automaticOperationFixture(c);
+  c.operation(input.id, input.kind, input.payload, input.taskId);
+  const second = new Controller({ executor: new FakeExecutor() }); second.db = new DatabaseSync(`${root}/state/controller.sqlite`);
+  let committed;
+  const competing = () => {
+    second.finishAutomatic(input.taskId, 'succeeded', null);
+    // Deliberately inconsistent storage must never be qualified by the status string.
+    if (fault === 'operation') second.db.prepare("UPDATE operations SET fingerprint='conflicting' WHERE id=?").run(input.id);
+    if (fault === 'outcome') second.db.prepare("DELETE FROM automatic_attempts WHERE json_extract(value,'$.outcome')='succeeded'").run();
+    if (fault === 'task') {
+      const task = second.task(input.taskId); task.baseline = 'c'.repeat(40);
+      second.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), input.taskId);
+    }
+    committed = statusLedger(second.db);
+  };
+  const save = c.save.bind(c);
+  if (timing === 'stale') c.save = (task, options) => { competing(); return save(task, options); };
+  else competing();
+  try {
+    if (path === 'finishAutomatic' && timing === 'stale') assert.throws(() => c.finishAutomatic(input.taskId, 'stopped', 'AUTOMATIC_VALIDATION_FAILED'), /AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED/);
+    else path === 'finishAutomatic' ? c.finishAutomatic(input.taskId, 'stopped', 'AUTOMATIC_VALIDATION_FAILED') : c.persistenceAttention(input.taskId);
+    assert.equal(statusLedger(second.db), committed);
+    assert.equal(c.persistenceFailures.has(input.taskId), true);
+    const view = await c.get(input.taskId); assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+    assert.equal(c.automaticJobs.size + c.localRuns.size + c.validationRuns.size, 0);
+  } finally { interruptProgressController(second); }
+});

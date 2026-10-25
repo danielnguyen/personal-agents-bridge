@@ -586,15 +586,16 @@ export class Controller {
     // the receipt below remain authoritative; the in-memory latch grants nothing.
     try {
       const task = this.task(id);
-      if (task.automatic?.status === 'succeeded') return; // Never overwrite another committed terminal outcome.
+      if (this.preserveAutomaticSuccess(task)) return;
+      const expectedTask = JSON.stringify(task);
       if (task.correction) {
         task.correction_state = 'needs_attention'; task.correction_reason = 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED';
         task.implementer.local.human_attention_required = true;
       }
       if (task.automatic) Object.assign(task.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true });
       if (task.reviewer) task.reviewer.local.human_attention_required = true;
-      this.save(task);
-    } catch { /* Explicit reconciliation is still required, even if this write fails. */ }
+      this.save(task, { expectedTask });
+    } catch { this.persistenceFailures.add(id); /* Explicit reconciliation is still required. */ }
   }
   pruneDiagnostics() {
     this.db.prepare('DELETE FROM failures WHERE expires < ?').run(Date.now());
@@ -751,6 +752,17 @@ export class Controller {
       const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(task.automatic.publish_request_id);
       return !!expected && row?.id === expected.id && row.fingerprint === expected.fingerprint && row.task_id === expected.task_id && row.status === 'accepted';
     } catch { return false; }
+  }
+  preserveAutomaticSuccess(task) {
+    if (task.automatic?.status !== 'succeeded') return false;
+    // Preserve the stored terminal outcome, but never trust its status alone or
+    // clear a prior persistence failure. Missing proof remains attention-worthy.
+    try {
+      this.storageAuthority();
+      if (!this.confirmedAutomaticPublication(task)) throw new BridgeError('AUTOMATIC_PUBLICATION_UNCONFIRMED');
+      this.verifyAutomaticEvidence(task);
+    } catch { this.persistenceFailures.add(task.id); }
+    return true;
   }
   operation(requestId, kind, payload, taskId) {
     this.storageAuthority(true);
@@ -1710,11 +1722,11 @@ export class Controller {
   finishAutomatic(id, status, reason) {
     if (this.dbClosed) return;
     const task = this.task(id);
-    if (!task.automatic || task.automatic.status === 'succeeded') return;
+    if (!task.automatic || this.preserveAutomaticSuccess(task)) return;
     const expectedTask = JSON.stringify(task);
     if (task.automatic.status === 'progressing') Object.assign(task.automatic, { status, reason: this.bounded(reason, 256), human_attention_required: status !== 'succeeded' });
     else if (status === 'uncertain') task.automatic.status = 'uncertain';
-    this.save(task, status === 'succeeded' ? { expectedTask, operation: { id: task.automatic.publish_request_id, status: 'accepted' } } : {});
+    this.save(task, { expectedTask, ...(status === 'succeeded' ? { operation: { id: task.automatic.publish_request_id, status: 'accepted' } } : {}) });
     clearTimeout(this.automaticTimers.get(id)); this.automaticTimers.delete(id);
   }
   automaticUncertain(task) {
