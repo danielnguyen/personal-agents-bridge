@@ -406,6 +406,19 @@ export class Controller {
         // connection's attention latch even when this diagnostic cannot commit.
         try {
           const current = this.task(id);
+          if (current.automatic.status === 'succeeded') {
+            // Another instance may have committed this exact verified result
+            // while our read-only checks were in flight. Never downgrade it.
+            const accepted = operations && JSON.parse(operations).map(row => row.id === a.publish_request_id ? { ...row, status: 'accepted' } : row);
+            if (confirmed && JSON.stringify(current) === JSON.stringify(task) &&
+                JSON.stringify(this.db.prepare('SELECT * FROM operations WHERE task_id=? ORDER BY id').all(id)) === JSON.stringify(accepted)) {
+              this.storageAuthority();
+              this.persistenceFailures.delete(id);
+              try { this.verifyAutomaticEvidence(current); }
+              catch { this.persistenceFailures.add(id); }
+            }
+            return;
+          }
           Object.assign(current.automatic, { status: 'uncertain', reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', human_attention_required: true,
             reconciliation: { outcome: 'evidence_unconfirmed', confirmed: false, attempt_id: a.review_request_id,
               publication_id: a.publish_request_id, reason: 'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED' } });

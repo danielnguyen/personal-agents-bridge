@@ -1615,6 +1615,30 @@ test(`terminal publication recovery confirms one historical outcome without repl
   assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1); assert.equal(value.controller._api, undefined);
 });
 
+test('terminal publication recovery preserves a concurrent second instance confirmation', async context => {
+  const value = await completedPublication(context, { pendingOperation: true }), { task } = value;
+  interruptController(value.controller);
+  const first = new Controller(value.config), second = new Controller(value.config);
+  const find = value.publisher.findPR.bind(value.publisher); let entered = false;
+  value.publisher.findPR = async (...args) => {
+    if (!entered) { entered = true; await second.init(); }
+    return find(...args);
+  };
+  try {
+    await first.init();
+    assert(entered);
+    for (const c of [first, second]) {
+      const status = await c.get(task.id);
+      assert.equal(status.automatic.status, 'succeeded'); assert.equal(status.automatic.reconciliation.confirmed, true);
+      assert.equal(c.persistenceFailures.has(task.id), false);
+      assert.equal(c.db.prepare("SELECT count(*) AS n FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.outcome')='succeeded'").get(task.id).n, 1);
+      assert.equal(c.task(task.id).automatic.owner_instance, task.automatic.owner_instance);
+    }
+    assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
+    assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+  } finally { for (const c of [first, second]) if (c.db && !c.dbClosed) interruptController(c); }
+});
+
 for (const fault of ['lookup failure', 'absent PR', 'branch', 'commit', 'repository', 'base', 'draft', 'PR number', 'merged', 'target', 'remote branch',
   'tree', 'workspace', 'review packet', 'review result', 'review receipt', 'review history', 'corrupt history', 'operation', 'missing operation',
   'uncertain operation', 'extra operation', 'authorization', 'missing authorization', 'input binding', 'deadline', 'owner', 'validation', 'correction', 'after deadline', 'unconfirmed publication', 'unconfirmed push'])
