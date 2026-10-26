@@ -1071,6 +1071,25 @@ test('task evidence captures bounded model messages from native completion and k
   assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
 });
 
+test('Authorization credential redaction covers native messages and command output before durable retention', async context => {
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-authorization-' });
+  const started = await value.start(), backend = await value.running();
+  const payload = 'Authorization: Digest username="SYNTHETIC_NATIVE_USER", response="SYNTHETIC_NATIVE_RESPONSE"\r\nProxy-Authorization: Basic SYNTHETIC_NATIVE_BASIC\r\nX-Trace: useful evidence';
+  const params = { threadId: backend.identity.threadId, turnId: backend.identity.turnId };
+  backend.options.onProgress({ method: 'item/agentMessage/delta', params: { ...params, delta: payload } });
+  backend.options.onProgress({ method: 'item/completed', params: { ...params,
+    item: { id: 'native-command', type: 'commandExecution', status: 'completed', command: 'synthetic check',
+      cwd: backend.options.cwd, exitCode: 7, aggregatedOutput: payload } } });
+  backend.finish('completed', true, payload); await value.drain();
+  const task = value.controller.task(started.task_id);
+  assert(!JSON.stringify(task).includes('SYNTHETIC_'));
+  assert(task.implementer.local.latest_model_output.includes('useful evidence'));
+  assert.equal(task.local_execution_evidence.commands[0].output.redacted, true);
+  assert.equal(task.local_execution_evidence.commands[0].exit_code, 7);
+  assert.equal(task.implementer.evidence_messages.at(-1).redacted, true);
+  assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
+});
+
 test('invalid backend, unsupported non-repository local tasks and protected scope fail before provisioning', async context => {
   const value = await setup(context);
   for (const execution_backend of ['other', null, 1]) await assert.rejects(value.controller.start({ ...value.input, execution_backend }), /INVALID_EXECUTION_BACKEND/);

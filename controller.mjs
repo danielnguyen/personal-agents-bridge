@@ -37,8 +37,34 @@ async function settledWithin(promise, timeout = 3000) {
 }
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export class BridgeError extends Error { constructor(code) { super(code); this.code = code; } }
+function redactAuthorizationHeaders(text) {
+  if (!/(?:Proxy-)?Authorization[\t ]*["']?[\t ]*:/i.test(text)) return text;
+  // Header values end at the physical line boundary, including quoted Digest
+  // parameters. Do not let generic whitespace/token filters split credentials.
+  const lines = value => value.replace(/((?<![\w-])(?:Proxy-)?Authorization[\t ]*["']?[\t ]*:[\t ]*)[^\r\n\u2028\u2029]*/gi, '$1[REDACTED]');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return lines(text); }
+  // Receipts and packets may contain JSON-encoded headers or model messages.
+  // Sanitize their string values without consuming JSON delimiters/other fields.
+  let changed = false;
+  const visit = value => {
+    if (typeof value === 'string') {
+      const safe = redactAuthorizationHeaders(value); changed ||= safe !== value; return safe;
+    }
+    if (Array.isArray(value)) return value.map(visit);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      if (/^(?:Proxy-)?Authorization$/i.test(key.trim()) && typeof item === 'string') {
+        changed ||= item !== '[REDACTED]'; return [key, '[REDACTED]'];
+      }
+      return [key, visit(item)];
+    }));
+    return value;
+  };
+  const sanitized = visit(parsed);
+  return changed ? JSON.stringify(sanitized) : text;
+}
 export function redact(text, secrets = []) {
-  let s = String(text);
+  let s = redactAuthorizationHeaders(String(text));
   for (const secret of secrets.filter(Boolean)) s = s.split(secret).join('[REDACTED]');
   return s.replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
@@ -613,7 +639,7 @@ export class Controller {
   bounded(value, limit = 256) {
     if (typeof value !== 'string' && typeof value !== 'number') return null;
     return this.safe(String(value)).replace(/https?:\/\/[^\s<>"']+/gi, '[URL REDACTED]')
-      .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
+      .replace(/((?:api[_-]?key|token|secret|password|authorization(?=\s*=))\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
   }
   async invoke(name, input, extra, handler) {
     if (name === 'get_task_evidence') {
@@ -2112,12 +2138,12 @@ export class Controller {
   }
   evidenceText(value) {
     // Remove complete quoted values before the older unquoted diagnostic filter.
-    const quoted = this.safe(value).replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization|cookie)["']?)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gi, '$1[REDACTED]')
+    const quoted = this.safe(value).replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization(?=["']?\s*=)|cookie)["']?)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gi, '$1[REDACTED]')
       .replace(/\b(?:Cookie|Set-Cookie):[^\r\n]*/gi, '[REDACTED COOKIE]');
     return this.bounded(quoted, Number.MAX_SAFE_INTEGER)
       .replace(/-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END [^-]+-----/g, '[REDACTED AUTHENTICATION MATERIAL]')
       .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g, '[REDACTED]')
-      .replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization|cookie)["']?)\s*[=:]\s*)["']?[^\s,;"'}]+["']?/gi, '$1[REDACTED]')
+      .replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization(?=["']?\s*=)|cookie)["']?)\s*[=:]\s*)["']?[^\s,;"'}]+["']?/gi, '$1[REDACTED]')
       .replace(/(^|[\s"'`=(])\/(?:[^\s"'`<>),;]+\/?)+/gm, '$1[PATH REDACTED]');
   }
   async retainedEvidencePacket(task) {

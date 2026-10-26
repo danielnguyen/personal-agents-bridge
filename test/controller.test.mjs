@@ -170,6 +170,98 @@ test('task evidence pages complete Unicode output, reject stale/cross-task curso
   assert.equal((await allowed.client.callTool({ name: 'get_task_evidence', arguments: { task_id: 'task_unknown' } })).isError, true);
 });
 
+for (const [header, value] of [
+  ['Authorization', 'Basic SYNTHETIC_BASIC_CREDENTIAL'],
+  ['Authorization', 'Digest username="SYNTHETIC_DIGEST_USER", response="SYNTHETIC_DIGEST_RESPONSE", nonce="SYNTHETIC_DIGEST_NONCE"'],
+  ['Proxy-Authorization', 'Basic SYNTHETIC_PROXY_CREDENTIAL'],
+]) test(`Authorization credential redaction removes the complete ${header} ${value.split(' ')[0]} value`, () => {
+  const c = Object.create(Controller.prototype); c.secrets = [];
+  const output = c.evidenceText(`${header}: ${value}\r\nX-Trace: useful evidence\ncommand exit: 7`);
+  assert(!output.includes('SYNTHETIC_'), 'Every synthetic credential fragment must be removed');
+  assert(output.includes('X-Trace: useful evidence')); assert(output.includes('command exit: 7'));
+});
+
+test('Authorization credential redaction preserves adjacent lines, JSON fields and authority objects', () => {
+  const c = Object.create(Controller.prototype); c.secrets = [];
+  for (const name of ['Authorization', 'Proxy-Authorization', 'authorization', 'pRoXy-AuThOrIzAtIoN']) {
+    for (const value of ['Basic SYNTHETIC_A SYNTHETIC_B', 'Bearer SYNTHETIC_A, SYNTHETIC_B',
+      'Digest username="SYNTHETIC_A", response="SYNTHETIC_B", nonce="SYNTHETIC_C"', '"Basic SYNTHETIC_A SYNTHETIC_B"', "'Digest SYNTHETIC_A, SYNTHETIC_B'", '']) {
+      for (const newline of ['\n', '\r\n', '\r']) {
+        const text = `useful prefix${newline}\t${name}\t : \t${value}${newline}X-Trace: useful header${newline}exit code: 7`;
+        const safe = c.evidenceText(text);
+        assert(!safe.includes('SYNTHETIC_')); assert(safe.startsWith(`useful prefix${newline}`));
+        assert(safe.endsWith(`${newline}X-Trace: useful header${newline}exit code: 7`));
+        assert.equal(c.evidenceText(safe), safe, 'Repeated projection must preserve nonsensitive evidence');
+      }
+    }
+  }
+  const data = { headers: { Authorization: 'Basic SYNTHETIC_A SYNTHETIC_B', 'Proxy-Authorization': 'Digest response="SYNTHETIC_C"',
+    'X-Trace': 'useful header' }, evidence: 'Authorization: Digest username="SYNTHETIC_D", response="SYNTHETIC_E"\nexit code: 7',
+    authorization: { publish: { draft: true }, max_codex_turns: 2 } };
+  const text = c.evidenceText(JSON.stringify(data)), safe = JSON.parse(text);
+  assert(!text.includes('SYNTHETIC_')); assert.equal(safe.headers['X-Trace'], 'useful header');
+  assert.equal(safe.evidence, 'Authorization: [REDACTED]\nexit code: 7');
+  assert.deepEqual(safe.authorization, data.authorization); assert.equal(c.evidenceText(text), text);
+});
+
+test('Authorization credential redaction protects new messages, command streams and reviewer receipts before retention', async t => {
+  const payload = 'Authorization: Basic SYNTHETIC_BASIC_A SYNTHETIC_BASIC_B\r\nProxy-Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE"\r\nX-Trace: useful evidence';
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, output(output) { output.findings[0].evidence = payload; } });
+  const task = c.task(id), receipt = task.reviewer.received_review_output;
+  assert(!receipt.output.includes('SYNTHETIC_')); assert(receipt.output.includes('useful evidence'));
+  assert.equal(receipt.complete, false, 'A redacted receipt must not qualify as complete independent output');
+  assert.equal(task.reviewer.review_result, null); assert.notEqual(task.automatic.status, 'succeeded');
+  c.retainTaskMessage(task, 'implementer', payload);
+  c.retainAPIItems(task, 'implementer', [{ id: 'authorization-command', type: 'command_execution', turn_id: task.implementer.local.turn_id,
+    command: 'synthetic check', exit_code: 7, output: payload, stdout: payload, stderr: payload }], task.implementer.local.turn_id);
+  assert(!JSON.stringify(task).includes('SYNTHETIC_'));
+  assert.equal(task.implementer.evidence_messages.at(-1).redacted, true);
+  for (const field of ['output', 'stdout', 'stderr']) assert.equal(task.implementer.evidence_commands[0][field].redacted, true);
+  c.save(task);
+  assert(!c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value.includes('SYNTHETIC_'));
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('Authorization credential redaction protects every paginated MCP projection of existing retained output without mutations', async t => {
+  const { c, id, calls, publisherCalls, normal } = await automaticAttempt(t, { versioned: true });
+  const payload = 'useful prefix\nAuthorization: Basic SYNTHETIC_BASIC_A SYNTHETIC_BASIC_B\r\nProxy-Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE", nonce="SYNTHETIC_NONCE"\r\nX-Trace: useful evidence';
+  const task = c.task(id), result = task.reviewer.review_result;
+  // Simulate old records already claiming redacted:true while retaining leaked fragments.
+  task.implementer.evidence_messages = [{ provenance: 'model_statement', text: payload, redacted: true, truncated: false }];
+  task.implementer.local.latest_model_output = payload;
+  task.local_execution_evidence.commands = [{ provenance: 'codex_app_server_notification', item_id: 'native-command', exit_code: 7,
+    command: { value: 'synthetic check' }, output: { value: payload, redacted: true, truncated: false } }];
+  task.implementer.evidence_commands = [{ provenance: 'agents_api_command_execution', item_id: 'api-command', exit_code: 7,
+    command: { text: 'synthetic check' }, output: { text: payload, redacted: true }, stdout: { text: payload }, stderr: { text: payload } }];
+  task.local_validation.results = [{ command: 'synthetic independent check', candidate_tree: task.reviewer.reviewed_git_state.tree_sha,
+    exit_code: 7, independently_observed: true, stdout: { text: payload, available: true, redacted: true }, stderr: { text: payload, available: true } }];
+  result.findings[0].evidence = payload; task.reviewer.findings_sha256 = digest(result);
+  task.reviewer.received_review_output.output = JSON.stringify({ overall: 'FAIL', findings: result.findings });
+  task.reviewer.received_output_sha256 = digest(task.reviewer.received_review_output);
+  task.previous_reviewers = [{ ...task.reviewer, independent_validation: task.local_validation }];
+  task.automatic.reason = payload;
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const { client } = await statusClient(t, c);
+  const before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot, normal);
+  for (let read = 0; read < 2; read++) for (const section of ['outcome', 'implementer', 'validation', 'review', 'history']) {
+    let cursor, joined = '', pages = 0;
+    do {
+      const response = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, section, limit: 256, ...(cursor ? { cursor } : {}) } });
+      assert.notEqual(response.isError, true); const page = response.structuredContent;
+      assert.equal(page.redacted, true); assert(Buffer.byteLength(page.content) <= 256);
+      for (const fragment of ['SYNTHETIC_', 'BASIC_A', 'BASIC_B', 'RESPONSE', 'NONCE']) assert(!JSON.stringify(response).includes(fragment), `Leaked synthetic fragment in ${section} page`);
+      joined += page.content; cursor = page.next_cursor; pages++;
+    } while (cursor);
+    assert(pages > 1); assert(!joined.includes('SYNTHETIC_')); assert(joined.includes('useful evidence'));
+    const data = JSON.parse(joined);
+    if (section === 'implementer') { assert.equal(data.messages[0].provenance, 'model_statement'); assert.equal(data.commands[0].exit_code, 7); }
+    if (section === 'validation') assert.equal(data.results[0].exit_code, 7);
+    if (section === 'review') { assert.equal(data.overall, 'FAIL'); assert.equal(data.current_authority_verified, false); }
+  }
+  assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot, normal), files);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
 test('task evidence redacts credentials/paths, bounds future messages and keeps controller overrides separate from model statements', async t => {
   const { c, id } = await automaticAttempt(t, { versioned: true });
   const task = c.task(id);
