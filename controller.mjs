@@ -616,6 +616,10 @@ export class Controller {
       .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
   }
   async invoke(name, input, extra, handler) {
+    if (name === 'get_task_evidence') {
+      this.task(input.task_id); // Same owner-scoped task lookup; never an audit write.
+      return this.context.run(undefined, () => handler(input));
+    }
     if (name === 'get_task') {
       const task = this.task(input.task_id);
       if (task.correction || task.automatic) {
@@ -1828,7 +1832,8 @@ export class Controller {
     if (old) return this.get(old.task_id);
     const active = this.db.prepare('SELECT value FROM tasks').all().filter(r => !JSON.parse(r.value).cleaned);
     if (active.length >= 3) { this.db.prepare('DELETE FROM operations WHERE id=?').run(request_id); throw new BridgeError('ACTIVE_TASK_LIMIT'); }
-    const t = { id, execution_backend, created: Date.now(), deadline: Date.now() + this.timeoutMs, baseline: repository?.baseline_commit || null, ...(repository ? { repository } : {}), implementer: { state: 'starting' }, request_id };
+    const t = { id, execution_backend, created: Date.now(), deadline: Date.now() + this.timeoutMs, baseline: repository?.baseline_commit || null, ...(repository ? { repository } : {}), implementer: { state: 'starting' }, request_id,
+      evidence_contract: { sha256: digest(contract), contract } };
     if (automatic) {
       t.deadline = t.created + Math.min(this.timeoutMs, automatic.max_duration_seconds * 1000);
       t.automatic = { authorization: automatic, status: 'progressing', phase: 'implementation', reason: null,
@@ -2008,6 +2013,7 @@ export class Controller {
       if (event.method === 'item/agentMessage/delta' && typeof params.delta === 'string') output = (local.latest_model_output || '') + params.delta;
       if (event.method === 'item/completed' && params.item?.type === 'agentMessage') output = params.item.text;
       if (typeof output === 'string') { local.latest_model_output = this.bounded(output, 4096); local.output_truncated ||= output.length > 4096; }
+      if (event.method === 'item/completed' && params.item?.type === 'agentMessage') this.retainTaskMessage(current, 'implementer', output);
       if (evidenceChanged || typeof output === 'string') this.save(current);
     } });
     this.localRuns.set(id, { backend, abort, parent_id: task.correction?.parent_task_id });
@@ -2029,6 +2035,7 @@ export class Controller {
       if (local.execution_state !== 'completed') local.diagnostics = [`LOCAL_TURN_${local.execution_state.toUpperCase()}`, ...local.diagnostics].slice(0, 12);
       const output = result.messages?.filter(item => item.provenance === 'model').at(-1)?.text;
       if (typeof output === 'string') { local.latest_model_output = this.bounded(output, 4096); local.output_truncated ||= output.length > 4096; }
+      for (const item of result.messages || []) if (item.provenance === 'model') this.retainTaskMessage(task, 'implementer', item.text);
       local.command_count = Array.isArray(result.commands) ? result.commands.length : null;
       local.subscription_usage_attribution = 'unverified';
       for (const request of local.human_requests) {
@@ -2067,6 +2074,266 @@ export class Controller {
       clarification_required: humanRequests.some(request => request.status === 'pending' && request.expected_response === 'clarification'),
       human_attention_required: orphaned || local.human_attention_required, error: ref.error || null,
       evidence_notice: 'Native adapter observations only; no exhaustive command history, controller-certified test evidence, or test PASS is implied.' };
+  }
+  retainTaskMessage(task, role, text) {
+    if (typeof text !== 'string') return;
+    const ref = task[role], sanitized = this.evidenceText(text), content = [...sanitized].slice(0, 4096).join('');
+    const record = { provenance: 'model_statement', text: content, redacted: sanitized !== text,
+      truncated: content !== sanitized, turn_id: ref.local?.turn_id || ref.turn_id || null };
+    ref.evidence_messages ||= [];
+    if (ref.evidence_messages.some(previous => digest(previous) === digest(record))) return;
+    ref.evidence_messages.push(record);
+    if (ref.evidence_messages.length > 16) { ref.evidence_messages.shift(); ref.evidence_messages_omitted = (ref.evidence_messages_omitted || 0) + 1; }
+  }
+  retainAPIItems(task, role, items, turnId) {
+    const ref = task[role];
+    for (const item of items) {
+      if (turnId && item.turn_id !== turnId) continue;
+      if (item.type === 'message' && item.role === 'assistant') {
+        const text = (item.content || []).filter(content => content.type === 'output_text').map(content => content.text).join('\n');
+        if (text) this.retainTaskMessage(task, role, text);
+      }
+      if (role !== 'implementer' || item.type !== 'command_execution' || typeof item.id !== 'string') continue;
+      const stream = value => {
+        if (typeof value !== 'string') return { unavailable: true };
+        const text = this.evidenceText(value);
+        return { text: [...text].slice(0, 2048).join(''), redacted: text !== value, truncated: [...text].length > 2048, completeness: 'unverified' };
+      };
+      const record = { provenance: 'agents_api_command_execution', item_id: this.evidenceText(item.id).slice(0, 200), turn_id: this.evidenceText(item.turn_id || '').slice(0, 200),
+        command: stream(item.command), output: stream(item.output), stdout: stream(item.stdout), stderr: stream(item.stderr),
+        exit_code: Number.isInteger(item.exit_code) ? item.exit_code : null, source_truncated: item.truncated === true || item.output_truncated === true };
+      ref.evidence_commands ||= [];
+      const index = ref.evidence_commands.findIndex(previous => previous.item_id === record.item_id);
+      if (index >= 0) ref.evidence_commands[index] = record; else ref.evidence_commands.push(record);
+      while (ref.evidence_commands.length > 64 || Buffer.byteLength(JSON.stringify(ref.evidence_commands)) > 24576) {
+        ref.evidence_commands.shift(); ref.evidence_commands_omitted = (ref.evidence_commands_omitted || 0) + 1;
+      }
+    }
+  }
+  evidenceText(value) {
+    // Remove complete quoted values before the older unquoted diagnostic filter.
+    const quoted = this.safe(value).replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization|cookie)["']?)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gi, '$1[REDACTED]')
+      .replace(/\b(?:Cookie|Set-Cookie):[^\r\n]*/gi, '[REDACTED COOKIE]');
+    return this.bounded(quoted, Number.MAX_SAFE_INTEGER)
+      .replace(/-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END [^-]+-----/g, '[REDACTED AUTHENTICATION MATERIAL]')
+      .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g, '[REDACTED]')
+      .replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization|cookie)["']?)\s*[=:]\s*)["']?[^\s,;"'}]+["']?/gi, '$1[REDACTED]')
+      .replace(/(^|[\s"'`=(])\/(?:[^\s"'`<>),;]+\/?)+/gm, '$1[PATH REDACTED]');
+  }
+  async retainedEvidencePacket(task) {
+    const ref = task.reviewer;
+    if (!ref?.packet_hash) return null;
+    const savedPacket = ref.retained_packet || task.retained_packet;
+    let text = savedPacket?.sha256 === ref.packet_hash ? savedPacket.text : undefined;
+    const rows = this.db.prepare("SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND value LIKE '%\"packet_utf8\"%' ORDER BY rowid DESC LIMIT 64").all(task.id);
+    for (const row of rows) {
+      try {
+        const record = JSON.parse(row.value);
+        if (record.task_id === task.id && digest(record) === row.observation_sha256 && record.review_packet?.sha256 === ref.packet_hash &&
+            typeof record.packet_utf8 === 'string' && Buffer.byteLength(record.packet_utf8) <= MAX_PACKET && digest(record.packet_utf8) === ref.packet_hash) { text = record.packet_utf8; break; }
+      } catch { /* Invalid records do not supply evidence. */ }
+    }
+    if (text === undefined && !task.workspace_deleted && /^review(?:-[A-Za-z0-9_-]+)?$/.test(ref.packet_directory || '')) {
+      let handle;
+      try {
+        const directory = path.join(this.workspaceRoot, task.id, ref.packet_directory);
+        if (await fs.realpath(directory) !== directory) throw Error();
+        handle = await fs.open(path.join(directory, 'evidence.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        const stat = await handle.stat();
+        if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_PACKET) throw Error();
+        // A fixed-size positional read also bounds a file grown after fstat.
+        const buffer = Buffer.alloc(MAX_PACKET + 1), read = await handle.read(buffer, 0, buffer.length, 0);
+        if (read.bytesRead > MAX_PACKET) throw Error();
+        text = buffer.subarray(0, read.bytesRead).toString('utf8');
+      } catch { text = undefined; }
+      finally { await handle?.close(); }
+    }
+    try {
+      if (typeof text !== 'string' || Buffer.byteLength(text) > MAX_PACKET || digest(text) !== ref.packet_hash) return null;
+      const packet = JSON.parse(text);
+      let binding = task.automatic?.contract_binding || task.evidence_contract;
+      // Old local packets already contain the Controller-bound structured contract.
+      if (!binding && packet.contract_binding?.structured_json) binding = {
+        contract: JSON.parse(packet.contract_binding.structured_json), sha256: packet.local_scope?.contract_sha256 };
+      if (!binding || binding.sha256 !== digest(binding.contract) || !ref.reviewed_git_state?.tree_sha ||
+          digest(packet.reviewed_git_state) !== digest(ref.reviewed_git_state) || packet.baseline_commit !== task.baseline ||
+          packet.contract !== contractMarkdown(binding.contract, task.execution_backend || 'agents_api') ||
+          (task.execution_backend === 'local_codex' && packet.contract_binding?.structured_json !== JSON.stringify(binding.contract))) return null;
+      return { packet, contract: binding.contract };
+    } catch { return null; }
+  }
+  async taskEvidence({ task_id: id, section = 'outcome', packet_sha256, cursor, limit = 12000, ...extra }) {
+    const sections = ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'];
+    if (Object.keys(extra).length || !sections.includes(section) || !Number.isInteger(limit) || limit < 256 || limit > 16000 ||
+        (cursor !== undefined && (typeof cursor !== 'string' || cursor.length > 1000)) ||
+        (packet_sha256 !== undefined && (!/^[a-f0-9]{64}$/.test(packet_sha256) || !['candidate', 'review', 'validation'].includes(section)))) throw new BridgeError('INVALID_EVIDENCE_REQUEST');
+    let task = this.task(id); // No remote calls, reconciliation, Git operations, scratch or saves.
+    if (packet_sha256 !== undefined) {
+      let ref = [task.reviewer, ...(task.previous_reviewers || [])].find(ref => ref?.packet_hash === packet_sha256);
+      let retainedValidation;
+      if (!ref) for (const row of this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? AND value LIKE ? ORDER BY rowid DESC LIMIT 64').all(id, `%${packet_sha256}%`)) {
+        try {
+          const record = JSON.parse(row.value);
+          if (record.task_id !== id || digest(record) !== row.observation_sha256 || record.review_packet?.sha256 !== packet_sha256) continue;
+          ref = { packet_hash: packet_sha256, reviewed_git_state: record.reviewed_git_state, review_result: record.review_result,
+            findings_sha256: record.findings_sha256, received_review_output: record.received_review_output, received_output_sha256: record.received_output_sha256 };
+          retainedValidation = record.independent_validation; break;
+        } catch { /* Only verified owner-task observations may select an attempt. */ }
+      }
+      if (!ref) throw new BridgeError('EVIDENCE_ATTEMPT_UNAVAILABLE');
+      task = { ...task, reviewer: ref, retained_packet: ref.retained_packet,
+        local_validation: ref === task.reviewer ? task.local_validation : retainedValidation || ref.independent_validation };
+    }
+    const pick = (value, keys) => Object.fromEntries(keys.filter(key => value?.[key] !== undefined).map(key => [key, value[key]]));
+    const tree = value => pick(value, ['tree_sha', 'baseline_commit']);
+    const stream = value => value == null ? { unavailable: true, reason: 'This stream was not retained.' } : typeof value === 'string' ? { text: value, completeness: 'unverified' } :
+      pick(value, ['text', 'value', 'available', 'availability', 'unavailable', 'reason', 'missing', 'truncated', 'redacted', 'source_truncated', 'completeness', 'encoding_error', 'bytes_observed']);
+    const validation = value => value ? { ...pick(value, ['provenance', 'version', 'task_id', 'attempt_id', 'request_id', 'status', 'diagnostic', 'termination_confirmed', 'original_unchanged']),
+      reviewed_git_state: tree(value.reviewed_git_state), results: (value.results || []).slice(0, 10).map(record => ({
+        ...pick(record, ['provenance', 'attempt_id', 'validation_attempt_id', 'command_index', 'command', 'candidate_tree', 'status', 'diagnostic', 'exit_code', 'signal', 'timeout', 'cancelled', 'start_attempted', 'start_observed', 'completion_observed', 'termination_confirmed', 'independently_observed']),
+        stdout: stream(record.stdout), stderr: stream(record.stderr) })), truncated: (value.results || []).length > 10 } :
+      { unavailable: true, reason: 'No independent validation was retained.' };
+    const review = ref => {
+      const result = ref?.review_result, received = ref?.received_review_output;
+      const verified = !!result && (!ref.findings_sha256 || digest(result) === ref.findings_sha256) && result.packet_hash === ref.packet_hash;
+      return { provenance: 'independent_reviewer_with_controller_qualification', unavailable: !verified,
+        qualification: 'retained_result_binding_only', current_authority_verified: false,
+        reason: verified ? null : 'Qualified findings are missing or their retained binding is invalid.',
+        packet_sha256: ref?.packet_hash || null, reviewed_git_state: tree(ref?.reviewed_git_state),
+        ...(verified ? { ...pick(result, ['overall', 'model_overall', 'controller_overrides', 'controller_context', 'validation_contract', 'actionability_qualification']),
+          findings: (result.findings || []).slice(0, 52).map(finding => ({ ...pick(finding, ['id', 'status', 'evidence']),
+            classification: finding.classification ? { ...pick(finding.classification, ['kind', 'target_files']),
+              remedy: pick(finding.classification.remedy, ['kind', 'description', 'requires_human_approval']) } : null })),
+          findings_truncated: (result.findings || []).length > 52 } : {}),
+        model_output: received && digest(received) === ref.received_output_sha256 ? { provenance: 'model_statement',
+          text: received.output, complete: received.complete === true, truncated: received.complete !== true,
+          qualified: verified, notice: 'Model output alone does not establish independent findings or executed tests.' } :
+          { unavailable: true, reason: 'No verified retained reviewer output.' },
+        messages: (ref?.evidence_messages || []).map(message => pick(message, ['provenance', 'text', 'redacted', 'truncated', 'turn_id'])),
+        messages_omitted: ref?.evidence_messages_omitted || 0,
+        error: ref?.error || null };
+    };
+    let data;
+    if (section === 'outcome') data = { provenance: 'controller_retained_task_state', state: task.cleaned ? 'cleaned' : task.automatic?.status || task.implementer.state,
+      reason: task.automatic?.reason || task.correction_reason || task.implementer.error || null,
+      expires_at: task.deadline, expired_now: Date.now() >= task.deadline,
+      automatic: pick(task.automatic, ['status', 'phase', 'reason', 'human_attention_required', 'reconciliation', 'expiry_stop']),
+      correction: pick(task.correction || task.automatic?.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_attempt_id', 'rejected_tree_sha', 'baseline_commit']),
+      correction_state: task.correction_state || null, correction_reason: task.correction_reason || null,
+      publication: pick(task.publication, ['phase', 'reviewed_tree_sha', 'commit_sha', 'commit_tree_matches_reviewed_tree', 'push_attempted', 'pr_attempted', 'pr_number', 'draft']),
+      publication_error: task.publication_error || null, publication_frozen: task.publication_frozen === true,
+      cleanup: pick(task.cleanup, ['executor_stopped', 'remote_session_deleted', 'server_closed', 'cancellation_confirmed', 'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted', 'cleanup_diagnostic']),
+      workspace_deleted: task.workspace_deleted === true, execution_authorized: false,
+      retention_uncertain: this.persistenceFailures.has(id) || this.transactionUnresolved === true };
+    if (section === 'implementer') {
+      const ref = task.implementer, local = ref.local, ledger = task.local_execution_evidence;
+      const retained = !ledger ? await this.retainedEvidencePacket(task) : null;
+      const apiCommands = retained?.packet.command_execution_evidence;
+      data = { provenance: 'retained_model_statements_and_adapter_observations',
+        state: ref.state, error: ref.error || null, diagnostics: local?.diagnostics || [],
+        failure: pick(this.diagnostic(ref), ['status', 'reason', 'api_error', 'terminal_event_type', 'latest_output']),
+        messages: ref.evidence_messages?.map(message => pick(message, ['provenance', 'text', 'redacted', 'truncated', 'turn_id'])) || (local?.latest_model_output ? [{ provenance: 'model_statement', text: local.latest_model_output,
+          truncated: local.output_truncated === true, redaction_status: 'unknown_historical', completeness: 'historical_latest_only' }] : []),
+        messages_unavailable: !ref.evidence_messages?.length && !local?.latest_model_output,
+        messages_omitted: ref.evidence_messages_omitted || 0, historical_messages_complete: false,
+        human_requests: (local?.human_requests || []).slice(-32).map(request => pick(request, ['request_ref', 'method', 'status', 'summary', 'questions', 'expected_response', 'diagnostic', 'delivery'])),
+        human_requests_truncated: (local?.human_requests || []).length > 32,
+        commands: (ledger?.commands || []).slice(0, 64).map(record => ({
+          ...pick(record, ['provenance', 'item_id', 'start_observed', 'completion_observed', 'exit_code', 'missing', 'start_completion_conflict']),
+          command: stream(record.command), output: stream(record.output) })),
+        commands_unavailable: !ledger?.commands?.length && !apiCommands?.records?.length && !ref.evidence_commands?.length, exhaustive: false,
+        retained_api_commands: (ref.evidence_commands || []).slice(0, 64).map(record => ({ ...pick(record, ['provenance', 'item_id', 'turn_id', 'exit_code', 'source_truncated']),
+          command: stream(record.command), output: stream(record.output), stdout: stream(record.stdout), stderr: stream(record.stderr) })),
+        retained_api_commands_omitted: ref.evidence_commands_omitted || 0,
+        agents_api_commands: (apiCommands?.records || []).slice(0, 64).map(record => ({
+          ...pick(record, ['provenance', 'item_id', 'turn_id', 'command', 'exit_code', 'truncated', 'stdout_truncated', 'stderr_truncated']),
+          output: stream(record.output), stdout: stream(record.stdout), stderr: stream(record.stderr) })),
+        agents_api_coverage: pick(apiCommands, ['items_scan_complete', 'omitted_command_records', 'required_test_commands_missing']),
+        omitted_events: ledger?.omitted_events || 0, rejected_events: ledger?.rejected_events || 0,
+        notice: 'Adapter notifications and model statements do not certify execution or test PASS. Private reasoning is excluded.' };
+    }
+    if (section === 'validation') {
+      const retained = !task.local_validation ? await this.retainedEvidencePacket(task) : null;
+      data = validation(task.local_validation || retained?.packet.independent_validation);
+      if (retained?.packet.test_execution_evidence) data.implementer_test_observations = retained.packet.test_execution_evidence.slice(0, 10).map(record =>
+        pick(record, ['command', 'exit_code', 'output', 'truncated', 'provenance']));
+    }
+    if (section === 'review') data = review(task.reviewer);
+    if (section === 'history') {
+      const rows = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 65').all(id);
+      data = { provenance: 'controller_retained_history', truncated: rows.length > 64,
+        observations: rows.slice(0, 64).map(row => {
+          try {
+            const record = JSON.parse(row.value);
+            if (record.task_id !== id || digest(record) !== row.observation_sha256) throw Error();
+            return { observation_sha256: row.observation_sha256, ...pick(record, ['attempt_id', 'kind', 'outcome', 'stop_reason', 'state', 'reason']),
+              reviewed_git_state: tree(record.reviewed_git_state),
+              review: pick(record.review_result, ['overall', 'model_overall', 'controller_overrides']),
+              packet_sha256: record.review_packet?.sha256 || null, findings_sha256: record.findings_sha256 || null,
+              evidence: record.review_packet?.sha256 ? { operation: 'get_task_evidence', task_id: id, packet_sha256: record.review_packet.sha256,
+                sections: ['review', 'validation', 'candidate'] } : null,
+              correction: pick(record.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_tree_sha']) };
+          } catch { return { unavailable: true, reason: 'Retained observation integrity check failed.' }; }
+        }), previous_reviewers: (task.previous_reviewers || []).slice(-16).map(ref => ({ ...review(ref), independent_validation: validation(ref.independent_validation) })),
+        previous_reviewers_truncated: (task.previous_reviewers || []).length > 16,
+        correction: pick(task.correction || task.automatic?.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_attempt_id', 'rejected_tree_sha']) };
+    }
+    if (section === 'candidate') {
+      data = { unavailable: true, reason: 'No verified frozen packet and authorized file scope were retained.' };
+      const retained = await this.retainedEvidencePacket(task);
+      if (retained) {
+        const { packet, contract } = retained, ref = task.reviewer;
+        const files = contract.allowed_files.filter(name => {
+          try { safeRelative(name); } catch { return false; }
+          return !name.split('/').some(part => /^(?:\.codex|\.agents|\.aws|\.ssh|\.env(?:\..*)?|auth\.json|credentials(?:\.json)?|id_rsa|id_ed25519)$/i.test(part));
+        });
+        data = { provenance: 'controller_frozen_review_packet', packet_sha256: ref.packet_hash,
+          reviewed_git_state: tree(ref.reviewed_git_state), baseline_commit: task.baseline,
+          historical_snapshot: true, current_tree_verified: false, execution_authorized: false, source_redaction_status: 'unknown_historical', content_representation: 'sanitized_text',
+          notice: 'Retained content belongs to the recorded tree, not the current worktree; it grants no publication or correction authority.',
+          files: files.map(name => ({ path: name,
+            baseline: typeof packet.baseline?.[name] === 'string' ? packet.baseline[name] : null,
+            candidate: typeof packet.current?.[name] === 'string' ? packet.current[name] : null,
+            unavailable: packet.current?.[name] !== undefined && typeof packet.current[name] !== 'string',
+            deleted: packet.current?.[name] === undefined,
+            byte_evidence: pick(packet.file_byte_evidence?.[name], ['git_mode', 'byte_length', 'sha256', 'hex_omitted_reason']) })),
+          redacted_files: contract.allowed_files.length - files.length,
+          // A whole patch may contain unauthorized changes. Source pairs above
+          // provide the bounded per-file comparison in that case.
+          diff: (packet.changed_files || []).every(name => files.includes(name)) ? packet.diff : null,
+          diff_unavailable: !(packet.changed_files || []).every(name => files.includes(name)),
+          truncation: packet.packet_budget || packet.truncation || packet.completeness || null };
+      }
+    }
+    if (this.db.isTransaction || this.transactionUnresolved) data = { unavailable: true, retention_uncertain: true,
+      reason: 'Storage has an unresolved transaction; committed evidence cannot be confirmed on this connection.' };
+    let redacted = false;
+    const sanitize = value => {
+      if (typeof value === 'string') { const text = this.evidenceText(value); redacted ||= text !== value; return text; }
+      if (Array.isArray(value)) return value.map(sanitize);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+        if (key === 'redacted' && item === true) redacted = true;
+        const safeKey = this.evidenceText(key); redacted ||= safeKey !== key; return [safeKey, sanitize(item)];
+      }));
+      return value;
+    };
+    let content = JSON.stringify(sanitize(data));
+    if (Buffer.byteLength(content) > 512 * 1024) content = JSON.stringify({ unavailable: true, truncated: true, reason: 'Evidence projection exceeds the 512 KiB section limit.' });
+    const snapshot = digest(content), bytes = Buffer.from(content);
+    let offset = 0;
+    if (cursor !== undefined) {
+      let decoded;
+      try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')); } catch { throw new BridgeError('INVALID_EVIDENCE_CURSOR'); }
+      if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded) || decoded.task_id !== id || decoded.section !== section || decoded.packet_sha256 !== (packet_sha256 || null) || !Number.isSafeInteger(decoded.offset) || decoded.offset < 0 || decoded.offset >= bytes.length ||
+          (bytes[decoded.offset] & 0xc0) === 0x80) throw new BridgeError('INVALID_EVIDENCE_CURSOR');
+      if (decoded.snapshot !== snapshot) throw new BridgeError('EVIDENCE_CHANGED_RESTART_PAGINATION');
+      offset = decoded.offset;
+    }
+    let end = Math.min(bytes.length, offset + limit);
+    while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+    return { task_id: id, section, snapshot_sha256: snapshot, format: 'json-utf8', offset, total_bytes: bytes.length,
+      content: bytes.subarray(offset, end).toString('utf8'), redacted,
+      next_cursor: end < bytes.length ? Buffer.from(JSON.stringify({ task_id: id, section, packet_sha256: packet_sha256 || null, snapshot, offset: end })).toString('base64url') : null };
   }
   async recoverSession(t, role) {
     // Creation has no documented idempotency parameter: discover by ownership metadata, never recreate blindly.
@@ -2140,6 +2407,10 @@ export class Controller {
             await this.reconcileFailure(id, role);
           } else if (/\.turn\.(completed|cancelled)$/.test(event.type)) {
             const t = this.task(id); t[role].state = event.turn?.status || event.type.split('.').at(-1); this.save(t);
+            try {
+              const page = await this.api.items.list(t[role].session_id, { order: 'desc', limit: 100 });
+              const current = this.task(id); this.retainAPIItems(current, role, [...(page.data || [])].reverse(), current[role].turn_id); this.save(current);
+            } catch { /* Retained output remains explicitly incomplete if unavailable. */ }
           }
         } } catch { /* get_task reconciles from persisted API state */ }
         finally { if (this.streams.get(key) === stream) this.streams.delete(key); }
@@ -2181,6 +2452,7 @@ export class Controller {
       } catch { view.state = 'needs_attention'; view.error = 'INVALID_REVIEW_OUTPUT'; }
     }
     const fresh = this.task(t.id); fresh[role].state = view.state; fresh[role].turn_id = view.turn_id;
+    this.retainAPIItems(fresh, role, [...page.data].reverse(), view.turn_id);
     if (role === 'reviewer') fresh[role].review_result = view.overall ? { overall: view.overall, findings: view.findings, packet_hash: ref.packet_hash, turn_id: view.turn_id } : null;
     this.save(fresh);
     return view;
@@ -2416,6 +2688,17 @@ export class Controller {
     }
     if (storageDiagnostic) result.storage_diagnostic = storageDiagnostic;
     if (versioned && result.cleanup) { result.cleanup = { ...result.cleanup }; delete result.cleanup.workspace_path; }
+    const reason = result.automatic?.reason || result.correction?.reason || result.implementer?.error || result.reviewer?.error;
+    const failedFinding = t.reviewer?.review_result?.findings?.find(finding => finding.status === 'FAIL');
+    result.explanation = { provenance: 'controller_summary_of_retained_evidence', state: result.state,
+      reason: reason ? this.evidenceText(String(reason)) : null,
+      detail: failedFinding ? this.evidenceText(failedFinding.evidence).slice(0, 1000) :
+        t.implementer.local?.diagnostics?.length ? this.evidenceText(t.implementer.local.diagnostics.join('; ')).slice(0, 1000) :
+        'Read retained evidence for available output and supporting details; missing evidence is reported explicitly.',
+      finding_id: failedFinding?.id || null, execution_authorized: false };
+    result.evidence = { operation: 'get_task_evidence', task_id: id,
+      sections: ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'],
+      notice: 'Read-only retained evidence. Does not execute, correct, publish or restore authority.' };
     return result;
   }
   async continue({ task_id: id, instruction, request_id, human_response }) {
@@ -2684,6 +2967,11 @@ export class Controller {
     const name = t.reviewer ? `review-${(t.previous_reviewers?.length || 0) + 2}` : 'review';
     const dir = path.join(this.workspaceRoot, t.id, name); await fs.mkdir(dir, { mode: 0o700 });
     await fs.writeFile(path.join(dir, 'evidence.json'), packet.text, { mode: 0o400 });
+    if (!t.automatic) {
+      const current = this.task(t.id);
+      current.retained_packet = { sha256: packet.hash, text: packet.text };
+      this.save(current);
+    }
     return { directory: dir, hash: packet.hash, bytes: packet.bytes };
   }
   async review({ task_id: id, request_id }, owner) {
@@ -2704,7 +2992,9 @@ export class Controller {
       if (!await this.executor.stop(t.implementer.executor)) throw new BridgeError('EXECUTOR_NOT_STOPPED');
       const packet = await this.packet(t); const fresh = this.task(id);
       if (fresh.reviewer) { fresh.previous_reviewers ||= []; fresh.previous_reviewers.push(fresh.reviewer); }
-      fresh.reviewer = { state: 'starting', packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory) }; fresh.deadline = Date.now() + this.timeoutMs; this.save(fresh);
+      fresh.reviewer = { state: 'starting', packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory),
+        reviewed_git_state: JSON.parse(fresh.retained_packet.text).reviewed_git_state, retained_packet: fresh.retained_packet };
+      delete fresh.retained_packet; fresh.deadline = Date.now() + this.timeoutMs; this.save(fresh);
       this.launch(id, 'reviewer', () => this.openSession(id, 'reviewer', packet.directory, 'Read evidence.json. Independently assess the original contract against the baseline/current files, patch and test execution records. Return the required JSON findings for every requirement and invariant plus SCOPE and TEST_EVIDENCE. Never modify files.', request_id));
       return this.get(id, false);
     });
@@ -2978,6 +3268,7 @@ export class Controller {
     const data = JSON.parse(await fs.readFile(path.join(packet.directory, 'evidence.json'), 'utf8'));
     if (JSON.stringify(data.reviewed_git_state) !== JSON.stringify(task.local_validation.reviewed_git_state)) throw new BridgeError('VALIDATION_TREE_CHANGED');
     Object.assign(task.reviewer, { packet_hash: packet.hash, packet_bytes: packet.bytes, packet_directory: path.basename(packet.directory) });
+    if (!task.automatic) { task.reviewer.retained_packet = task.retained_packet; delete task.retained_packet; }
     task.reviewer.local.phase = 'snapshot'; this.save(task);
     await this.verifyLocalReviewPacket(task);
     if (task.automatic) {

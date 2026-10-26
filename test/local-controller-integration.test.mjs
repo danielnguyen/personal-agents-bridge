@@ -50,7 +50,7 @@ class FakeLocal {
 }
 
 async function setup(context, mode = {}, options = {}) {
-  const root = await fs.mkdtemp('/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
+  const root = await fs.mkdtemp(options.fixturePrefix || '/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
   await fs.mkdir(normal);
   repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n');
@@ -1055,6 +1055,20 @@ test('unconfirmed reviewer closure prevents workspace deletion and remains expli
   assert.equal(result.cleanup.server_closed, false); assert.equal(result.cleanup.workspace_deleted, false);
   assert.match(result.cleanup.cleanup_diagnostic, /REVIEWER_LOCAL_CLOSE_UNCONFIRMED/);
   assert.equal(result.reviewer.review_result, null);
+});
+
+test('task evidence captures bounded model messages from native completion and keeps them after cleanup', async context => {
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-evidence-' }), started = await value.start(), backend = await value.running();
+  backend.finish('completed', true, 'Final task result: synthetic greeting mismatch.'); await value.drain();
+  const read = async () => JSON.parse((await value.controller.invoke('get_task_evidence', { task_id: started.task_id, section: 'implementer' }, {},
+    input => value.controller.taskEvidence(input))).content);
+  const before = await read();
+  assert.equal(before.messages.at(-1).provenance, 'model_statement');
+  assert.equal(before.messages.at(-1).text, 'Final task result: synthetic greeting mismatch.');
+  assert.equal(before.commands_unavailable, true);
+  assert.equal((await value.controller.cleanup({ task_id: started.task_id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual((await read()).messages, before.messages);
+  assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
 });
 
 test('invalid backend, unsupported non-repository local tasks and protected scope fail before provisioning', async context => {

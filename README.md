@@ -3,7 +3,7 @@
 A single-owner demonstration of **ChatGPT → MCP → Agents API → self-hosted Codex
 → sandboxed Git worktree → independent review → exact-tree draft PR publication**.
 
-ChatGPT invokes eight MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
+ChatGPT invokes nine MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
 API sessions and connects a local Codex executor. For an allowlisted repository,
 implementation happens in an isolated Git worktree backed by a task-private Git
 store. Command networking is disabled; writes are confined to the task worktree
@@ -85,7 +85,7 @@ After: explicitly authorize the bounded draft-publication path once; the Control
 advances after implementation job settlement, independently validates the exact tree,
 runs a distinct reviewer and invokes the existing publisher only on qualified PASS.
 `get_task` observes persisted automatic progress; polling is not its execution engine.
-No new MCP tools, services, queues or task stores are introduced.
+The automatic path uses the existing execution operations and task storage.
 
 All automatic fields are strictly checked and included in request fingerprinting.
 Only explicit `local_codex` repository tasks qualify. The metadata authorizes one
@@ -902,10 +902,45 @@ or production acceptance. No live registration is part of implementation validat
 | `register_github_repository` | Controller-register an eligible GitHub user-owned repository; never starts execution. |
 | `start_task` | Start a contract in a disposable workspace or allowlisted repository worktree. |
 | `get_task` | Inspect bounded progress, clarification, review and publication state. |
+| `get_task_evidence` | Read paginated retained results, findings, validation and authorized frozen candidate content. |
 | `continue_task` | Answer clarification or explicitly request further implementation. |
 | `review_task` | Freeze evidence and request independent review in a separate session. |
 | `publish_task` | Freeze a completed PASS-reviewed repository task and create a draft PR. |
 | `cleanup_task` | Stop execution/delete remote sessions; optionally remove the worktree. |
+
+`get_task` includes a concise explanation and references to evidence sections for
+successful, failed, stopped, uncertain and interrupted outcomes. Use
+`get_task_evidence` with the same `task_id` and a `section`: `outcome`, `implementer`,
+`validation`, `review`, `candidate` or `history`. Each response contains a JSON
+fragment in `content`. Concatenate fragments in order and parse the resulting JSON;
+pass `next_cursor` back with the same task and section until it is null. `limit`
+bounds each fragment to 256–16000 UTF-8 bytes (default 12000). Cursors bind task,
+section, optional packet hash and projected snapshot; changed evidence requires
+restarting pagination. For `candidate`, `review` or `validation`, an optional
+`packet_sha256` from this task's history selects a retained earlier review attempt.
+
+The evidence operation uses the existing single-owner tunnel authorization and
+performs no reconciliation, audit/task writes, Git commands, model execution,
+validation, correction or publication. Reads preserve existing authority and
+spending limits. Automatic status reads remain observational; manual status keeps
+its existing session-observation behavior. Evidence provenance separates model
+statements, adapter notifications, independent validation and reviewer findings
+with Controller overrides. A retained verdict describes historical evidence and
+does not restore current publication or correction authority.
+
+Candidate source is limited to task-authorized files in a hash-checked frozen
+review packet bound to the recorded Git tree. Live workspace contents and private
+Controller fields are excluded. Existing retained packets/findings remain readable
+after restart and cleanup where saved; missing historical messages cannot be
+reconstructed. Future model messages retain at most 16 messages of 4096 characters
+per role, excluding private reasoning. Future manual review packets also retain
+their existing bounded snapshot in the task ledger. Future API command observations
+retain at most 64 records and 24 KiB per role, with 2048 characters per stream.
+Known credentials, common
+authentication patterns, URLs and absolute paths are redacted; the existing
+confidentiality limits in SECURITY.md still apply. Omission, unavailability,
+redaction and truncation are explicit; history is bounded to 64 observations and
+16 previous reviewers, and each projected section is bounded to 512 KiB.
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
 and publication for the default Agents API path. Local execution is the limited

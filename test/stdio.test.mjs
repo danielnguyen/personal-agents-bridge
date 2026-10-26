@@ -10,7 +10,7 @@ test('actual stdio MCP process initializes and returns stable task IDs', async t
   const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./stdio-server.mjs', import.meta.url)), root], env: { PATH: '/usr/bin:/bin', LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH || '' }, stderr: 'pipe' });
   const client = new Client({ name: 'stdio-verifier', version: '1' });
   t.after(async () => { await client.close(); await fs.rm(root, { recursive: true, force: true }); });
-  await client.connect(transport); assert.equal((await client.listTools()).tools.length, 8);
+  await client.connect(transport); assert.equal((await client.listTools()).tools.length, 9);
   const automatic = { publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 3,
     max_corrections: 1, review_protocol: 'pab.local-review.actionability.v1' };
   const missing = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'stdio_corrective',
@@ -23,4 +23,10 @@ test('actual stdio MCP process initializes and returns stable task IDs', async t
   assert(started.structuredContent.task_id);
   const got = await client.callTool({ name: 'get_task', arguments: { task_id: started.structuredContent.task_id } });
   assert.equal(got.structuredContent.task_id, started.structuredContent.task_id);
+  assert.equal(got.structuredContent.evidence.operation, 'get_task_evidence');
+  const evidence = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: started.structuredContent.task_id } });
+  assert.notEqual(evidence.isError, true);
+  assert.equal(JSON.parse(evidence.structuredContent.content).execution_authorized, false);
+  const invalidEvidence = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: started.structuredContent.task_id, path: '/private/auth.json' } });
+  assert.equal(invalidEvidence.isError, true);
 });

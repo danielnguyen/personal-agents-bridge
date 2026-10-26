@@ -41,6 +41,285 @@ async function statusFiles(...roots) {
   for (const root of roots) await walk(root);
   return JSON.stringify(entries);
 }
+async function readEvidence(c, id, section, limit = 16000) {
+  let cursor, text = '', redacted = false, snapshot;
+  do {
+    const page = await c.invoke('get_task_evidence', { task_id: id, section, cursor, limit }, {}, input => c.taskEvidence(input));
+    assert(Buffer.byteLength(page.content) <= limit);
+    assert.equal(page.offset, Buffer.byteLength(text));
+    snapshot ||= page.snapshot_sha256; assert.equal(page.snapshot_sha256, snapshot);
+    text += page.content; redacted ||= page.redacted; cursor = page.next_cursor || undefined;
+  } while (cursor);
+  return { data: JSON.parse(text), text, redacted };
+}
+test('task evidence exposes a synthetic historical first-run FAIL without another execution, before and after cleanup/restart', async t => {
+  const { c, id, calls, publisherCalls, root } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id), reviewed = task.reviewer.reviewed_git_state;
+  delete task.evidence_contract; // The interface must work with pre-existing records.
+  task.local_validation.results = [{ provenance: 'controller_process_observation', command: 'check greeting.txt', command_index: 0,
+    candidate_tree: reviewed.tree_sha, exit_code: 0, independently_observed: true, completion_observed: true,
+    stdout: { text: 'synthetic validation output', available: true, truncated: false, redacted: false },
+    stderr: { text: '', available: true, truncated: false, redacted: false } }];
+  c.save(task);
+  const originalFindings = task.reviewer.review_result.findings;
+  const summary = await c.get(id);
+  assert.equal(summary.explanation.finding_id, 'R1'); assert.match(summary.explanation.detail, /greeting/);
+  assert.equal(summary.evidence.operation, 'get_task_evidence');
+  const review = (await readEvidence(c, id, 'review', 256)).data;
+  assert.equal(review.overall, 'FAIL'); assert.deepEqual(review.findings.map(({ classification, ...finding }) => finding), originalFindings.map(({ classification, ...finding }) => finding));
+  assert.equal(review.model_output.provenance, 'model_statement');
+  assert.equal((await readEvidence(c, id, 'implementer')).data.messages_unavailable, true);
+  const validation = (await readEvidence(c, id, 'validation')).data;
+  assert.equal(validation.results[0].exit_code, 0); assert.equal(validation.results[0].stdout.text, 'synthetic validation output');
+  const candidate = (await readEvidence(c, id, 'candidate', 256)).data;
+  assert.equal(candidate.reviewed_git_state.tree_sha, reviewed.tree_sha);
+  assert.equal(candidate.files[0].baseline, 'baseline\n'); assert.equal(candidate.files[0].candidate, 'candidate\n');
+  assert.equal(candidate.current_tree_verified, false); assert.equal(candidate.execution_authorized, false);
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual((await readEvidence(c, id, 'candidate')).data, candidate);
+  assert.equal((await readEvidence(c, id, 'review')).data.overall, 'FAIL');
+  assert.equal((await readEvidence(c, id, 'outcome')).data.cleanup.workspace_deleted, true);
+  assert((await readEvidence(c, id, 'history')).data.observations.some(record => record.review.overall === 'FAIL'));
+  await c.close();
+  const recovered = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'),
+    api: new FakeAPI(), executor: new FakeExecutor(), localBackendFactory: () => assert.fail('No model execution on restart/read') }).init();
+  try {
+    const before = statusLedger(recovered.db), files = await statusFiles(recovered.stateRoot, recovered.workspaceRoot);
+    for (let count = 0; count < 3; count++) {
+      assert.deepEqual((await readEvidence(recovered, id, 'candidate')).data, candidate);
+      assert.equal((await readEvidence(recovered, id, 'review')).data.overall, 'FAIL');
+    }
+    assert.equal(statusLedger(recovered.db), before); assert.equal(await statusFiles(recovered.stateRoot, recovered.workspaceRoot), files);
+  } finally { await recovered.close(); }
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('task evidence repeated MCP reads preserve database/files, authority, token counters and all execution boundaries', async t => {
+  const { c, id, calls, publisherCalls, normal } = await automaticAttempt(t, { versioned: true });
+  const { client, get } = await statusClient(t, c);
+  const before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot, normal);
+  const counters = JSON.stringify((await c.get(id)).automatic.usage);
+  const save = t.mock.method(c, 'save', () => assert.fail('Evidence reads cannot save'));
+  const model = t.mock.method(c, 'localBackendFactory', () => assert.fail('Evidence reads cannot execute'));
+  const tests = t.mock.method(c, 'runLocalValidation', () => assert.fail('Evidence reads cannot run tests'));
+  const publication = t.mock.method(c, 'publish', () => assert.fail('Evidence reads cannot publish'));
+  const correction = t.mock.method(c, 'runCorrection', () => assert.fail('Evidence reads cannot correct'));
+  try {
+    for (let count = 0; count < 3; count++) {
+      for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+        const result = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, section } });
+        assert.notEqual(result.isError, true); assert(JSON.parse(result.structuredContent.content));
+      }
+      assert.notEqual((await get(id)).isError, true);
+    }
+    assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot, normal), files);
+    assert.equal(JSON.stringify((await c.get(id)).automatic.usage), counters);
+  } finally { for (const mock of [save, model, tests, publication, correction]) mock.mock.restore(); }
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+for (const state of ['PASS', 'needs_attention', 'uncertain', 'interrupted', 'expired', 'publication', 'correction'])
+test(`task evidence explains retained ${state} outcomes without granting authority`, async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id);
+  if (state === 'PASS') {
+    task.reviewer.review_result.overall = 'PASS'; task.reviewer.review_result.model_overall = 'PASS';
+    for (const finding of task.reviewer.review_result.findings) { finding.status = 'PASS'; finding.classification = null; }
+    task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
+  } else if (state === 'publication') {
+    task.publication = { phase: 'pr_attempted', reviewed_tree_sha: task.reviewer.reviewed_git_state.tree_sha, push_attempted: true, pr_attempted: true };
+    task.publication_error = 'PR_RESPONSE_UNCONFIRMED'; task.automatic.status = 'uncertain';
+  } else if (state === 'correction') {
+    task.automatic.correction = { parent_task_id: id, task_id: 'task_synthetic_child', rejected_tree_sha: task.reviewer.reviewed_git_state.tree_sha };
+  } else if (state === 'expired') task.deadline = 1;
+  else { task.automatic.status = state === 'needs_attention' ? 'stopped' : state; task.automatic.reason = `SYNTHETIC_${state.toUpperCase()}`; }
+  if (state === 'needs_attention') task.implementer.local.human_requests.push({ status: 'interrupted', summary: 'Human decision required', request_ref: 'request_fixture' });
+  // Fixture injection deliberately does not run any lifecycle transition.
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const before = statusLedger(c.db), outcome = (await readEvidence(c, id, 'outcome')).data;
+  assert.equal(outcome.execution_authorized, false);
+  if (state === 'PASS') assert.equal((await readEvidence(c, id, 'review')).data.overall, 'PASS');
+  else if (state === 'expired') assert.equal(outcome.expired_now, true);
+  else if (state === 'publication') assert.equal(outcome.publication_error, 'PR_RESPONSE_UNCONFIRMED');
+  else if (state === 'correction') assert.equal(outcome.correction.task_id, 'task_synthetic_child');
+  else assert.equal(outcome.reason, `SYNTHETIC_${state.toUpperCase()}`);
+  if (state === 'needs_attention') assert.equal((await readEvidence(c, id, 'implementer')).data.human_requests[0].summary, 'Human decision required');
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('task evidence pages complete Unicode output, reject stale/cross-task cursors and enforce strict authorization/schema', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id); c.retainTaskMessage(task, 'implementer', '😀界'.repeat(500)); c.save(task);
+  const output = (await readEvidence(c, id, 'implementer', 257)).data;
+  assert.equal(output.messages[0].text, '😀界'.repeat(500)); assert.equal(output.messages[0].provenance, 'model_statement');
+  const first = await c.taskEvidence({ task_id: id, section: 'implementer', limit: 256 }); assert(first.next_cursor);
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'review', cursor: first.next_cursor }), /INVALID_EVIDENCE_CURSOR/);
+  const other = await c.start({ contract: contract(), request_id: 'evidence_other' }); await Promise.all([...c.jobs.values()]);
+  await assert.rejects(c.taskEvidence({ task_id: other.task_id, section: 'implementer', cursor: first.next_cursor }), /INVALID_EVIDENCE_CURSOR/);
+  c.retainTaskMessage(task, 'implementer', 'New retained output'); c.save(task);
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'implementer', cursor: first.next_cursor }), /EVIDENCE_CHANGED_RESTART_PAGINATION/);
+  await assert.rejects(c.taskEvidence({ task_id: id, cursor: 'invalid' }), /INVALID_EVIDENCE_CURSOR/);
+  await assert.rejects(c.taskEvidence({ task_id: id, cursor: Buffer.from('null').toString('base64url') }), /INVALID_EVIDENCE_CURSOR/);
+  for (const limit of [0, 255, 16001, 1.5]) await assert.rejects(c.taskEvidence({ task_id: id, limit }), /INVALID_EVIDENCE_REQUEST/);
+  const { client } = await statusClient(t, c, async () => { throw new Error('Authorization denied'); });
+  assert.equal((await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id } })).isError, true);
+  const allowed = await statusClient(t, c);
+  for (const args of [{ path: '/private/auth.json' }, { command: 'true' }, { section: 'private' }, { limit: 16001 }]) {
+    assert.equal((await allowed.client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, ...args } })).isError, true);
+  }
+  assert.equal((await allowed.client.callTool({ name: 'get_task_evidence', arguments: { task_id: 'task_unknown' } })).isError, true);
+});
+
+test('task evidence redacts credentials/paths, bounds future messages and keeps controller overrides separate from model statements', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id);
+  const sensitive = 'test-sensitive-value Bearer example-secret github_pat_fixture_secret token=private https://private.invalid /private/controller/auth.json\n-----BEGIN PRIVATE KEY-----\nexample-key\n-----END PRIVATE KEY-----';
+  for (let count = 0; count < 20; count++) c.retainTaskMessage(task, 'implementer', `${count}: ${sensitive}\n${'x'.repeat(5000)}`);
+  task.reviewer.review_result.controller_overrides = ['TEST_EVIDENCE']; task.reviewer.review_result.model_overall = 'PASS';
+  task.reviewer.findings_sha256 = digest(task.reviewer.review_result);
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const output = await readEvidence(c, id, 'implementer', 256);
+  assert.equal(output.data.messages.length, 16); assert.equal(output.data.messages_omitted, 4);
+  assert(output.data.messages.every(message => message.truncated && message.redacted));
+  for (const secret of ['test-sensitive-value', 'example-secret', 'github_pat_fixture_secret', 'token=private', 'https://private.invalid', '/private/controller/auth.json', 'example-key']) assert(!output.text.includes(secret));
+  const review = (await readEvidence(c, id, 'review')).data;
+  assert.equal(review.model_overall, 'PASS'); assert.equal(review.overall, 'FAIL'); assert.deepEqual(review.controller_overrides, ['TEST_EVIDENCE']);
+  assert(!output.text.includes('Private reasoning must not be retained'));
+});
+
+test('task evidence preserves a frozen candidate after live tree changes and fails closed for changed/missing packet bindings', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id), root = path.join(c.workspaceRoot, id);
+  const original = (await readEvidence(c, id, 'candidate')).data;
+  await fs.writeFile(path.join(root, 'repo/greeting.txt'), 'Live candidate changed\n');
+  assert.deepEqual((await readEvidence(c, id, 'candidate')).data, original);
+  // Remove just the synthetic retained packet observations to exercise safe fixed-path fallback.
+  c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=?').run(id);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.files[0].candidate, 'candidate\n');
+  const file = path.join(root, task.reviewer.packet_directory, 'evidence.json');
+  await fs.chmod(file, 0o600); await fs.writeFile(file, '{}');
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+  await fs.unlink(file); assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+  await fs.symlink(path.join(root, 'contract.json'), file);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+  task.reviewer.packet_directory = '../../private'; c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+});
+
+test('task evidence reports unavailable historical output/findings and bounds oversized sections without executing or saving', async t => {
+  const { c, api, executor } = await setup(t), started = await c.start({ contract: contract(), request_id: 'missing_evidence_start' });
+  await Promise.all([...c.jobs.values()]);
+  const id = started.task_id, before = statusLedger(c.db), executions = [api.created.length, api.sent.length, executor.started.length];
+  for (const section of ['review', 'candidate', 'validation']) assert.equal((await readEvidence(c, id, section)).data.unavailable, true);
+  const implementer = (await readEvidence(c, id, 'implementer')).data;
+  assert.equal(implementer.messages_unavailable, true); assert.equal(implementer.commands_unavailable, true);
+  assert.equal(statusLedger(c.db), before); assert.deepEqual([api.created.length, api.sent.length, executor.started.length], executions);
+  const task = c.task(id); task.implementer.evidence_messages = [{ provenance: 'model_statement', text: 'x'.repeat(512 * 1024) }];
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const bounded = (await readEvidence(c, id, 'implementer')).data;
+  assert.equal(bounded.unavailable, true); assert.equal(bounded.truncated, true);
+});
+
+test('task evidence candidate projection excludes unauthorized source/diff and rejects a conflicting recorded Git tree', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }), task = c.task(id);
+  const row = attemptRows(c, id).map(row => JSON.parse(row.value)).find(record => record.packet_utf8);
+  const packet = JSON.parse(row.packet_utf8);
+  packet.current['unapproved.txt'] = 'PRIVATE_UNAPPROVED_SOURCE'; packet.changed_files.push('unapproved.txt');
+  packet.diff += '\nPRIVATE_UNAPPROVED_SOURCE';
+  const text = JSON.stringify(packet); task.reviewer.packet_hash = digest(text); task.retained_packet = { text, sha256: digest(text) };
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const evidence = await readEvidence(c, id, 'candidate');
+  assert.deepEqual(evidence.data.files.map(file => file.path), ['greeting.txt']);
+  assert.equal(evidence.data.diff_unavailable, true); assert(!evidence.text.includes('PRIVATE_UNAPPROVED_SOURCE'));
+  task.reviewer.reviewed_git_state.tree_sha = 'a'.repeat(40);
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+});
+
+test('task evidence selects a retained earlier review packet only within its owning task', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }), task = c.task(id);
+  const original = task.reviewer.packet_hash;
+  task.previous_reviewers = [{ ...task.reviewer, independent_validation: task.local_validation }];
+  task.reviewer = { ...task.reviewer, packet_hash: 'a'.repeat(64), review_result: null };
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, true);
+  for (const section of ['candidate', 'review', 'validation']) {
+    const result = JSON.parse((await c.taskEvidence({ task_id: id, section, packet_sha256: original })).content);
+    if (section === 'candidate') assert.equal(result.files[0].candidate, 'candidate\n');
+    if (section === 'review') assert.equal(result.overall, 'FAIL');
+    if (section === 'validation') assert.equal(result.status, 'completed');
+  }
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'candidate', packet_sha256: 'b'.repeat(64) }), /EVIDENCE_ATTEMPT_UNAVAILABLE/);
+  const page = await c.taskEvidence({ task_id: id, section: 'candidate', packet_sha256: original, limit: 256 });
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'candidate', cursor: page.next_cursor }), /INVALID_EVIDENCE_CURSOR/);
+  task.previous_reviewers = []; c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert.equal(JSON.parse((await c.taskEvidence({ task_id: id, section: 'review', packet_sha256: original })).content).overall, 'FAIL');
+});
+
+test('task evidence retains future manual review packets after cleanup without automatic ledger history', async t => {
+  const { c, id } = await automaticAttempt(t, { manual: true });
+  assert.equal(attemptRows(c, id).length, 0); assert(c.task(id).reviewer.retained_packet);
+  const candidate = (await readEvidence(c, id, 'candidate')).data;
+  assert.equal(candidate.files[0].candidate, 'candidate\n');
+  assert.equal((await c.cleanup({ task_id: id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual((await readEvidence(c, id, 'candidate')).data, candidate);
+});
+
+test('task evidence retains bounded API command observations/output independently of model claims', async t => {
+  const { c, api } = await setup(t), started = await c.start({ contract: contract(), request_id: 'api_output_fixture' });
+  await Promise.all([...c.jobs.values()]);
+  const id = started.task_id, ref = c.task(id).implementer;
+  api.rows.get(ref.session_id).items.push({ type: 'command_execution', id: 'command-fixture', turn_id: api.rows.get(ref.session_id).turns[0].id,
+    command: 'synthetic check', exit_code: 7, output: 'actual retained failure token=private', stdout: '', stderr: 'synthetic stderr' });
+  api.completed(ref.session_id, 'Model claims everything passed');
+  await c.get(id); // Existing manual status observes the API once and retains the available records.
+  const before = statusLedger(c.db), output = (await readEvidence(c, id, 'implementer')).data;
+  assert.equal(output.retained_api_commands[0].exit_code, 7);
+  assert.equal(output.retained_api_commands[0].provenance, 'agents_api_command_execution');
+  assert.equal(output.messages[0].provenance, 'model_statement'); assert.match(output.messages[0].text, /claims everything passed/);
+  assert(!JSON.stringify(output).includes('token=private')); assert.equal(statusLedger(c.db), before);
+  await c.cleanup({ task_id: id, delete_workspace: true });
+  assert.deepEqual((await readEvidence(c, id, 'implementer')).data.retained_api_commands, output.retained_api_commands);
+});
+
+test('task evidence marks unresolved storage unavailable without repairing or committing it', async t => {
+  const { c } = await setup(t), started = await c.start({ contract: contract(), request_id: 'transaction_evidence' });
+  await Promise.all([...c.jobs.values()]);
+  c.db.exec('BEGIN');
+  try {
+    const before = statusLedger(c.db), state = (await readEvidence(c, started.task_id, 'outcome')).data;
+    assert.equal(state.unavailable, true); assert.equal(state.retention_uncertain, true);
+    assert.equal(c.db.isTransaction, true); assert.equal(statusLedger(c.db), before);
+  } finally { c.db.exec('ROLLBACK'); }
+});
+
+test('task evidence retains future Agents API repository candidate packets through cleanup', async t => {
+  const { c, api, root } = await setup(t), normal = path.join(root, 'normal');
+  await fs.mkdir(normal); repoGit(normal, 'init', '--initial-branch=main');
+  await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n'); repoGit(normal, 'add', '.');
+  repoGit(normal, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline');
+  await fs.writeFile(path.join(c.stateRoot, 'repositories.json'), JSON.stringify({ version: 1, repositories: { fixture: await repositoryIdentity(normal) } }), { mode: 0o600 });
+  const started = await c.start({ contract: contract(), request_id: 'api_candidate_fixture', repository_id: 'fixture' });
+  await Promise.all([...c.jobs.values()]);
+  await fs.writeFile(path.join(c.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'candidate\n');
+  api.completed(c.task(started.task_id).implementer.session_id);
+  await c.review({ task_id: started.task_id, request_id: 'api_candidate_review' }); await Promise.all([...c.jobs.values()]);
+  const candidate = (await readEvidence(c, started.task_id, 'candidate')).data;
+  assert.equal(candidate.files[0].candidate, 'candidate\n'); assert(candidate.reviewed_git_state.tree_sha);
+  await c.cleanup({ task_id: started.task_id, delete_workspace: true });
+  assert.deepEqual((await readEvidence(c, started.task_id, 'candidate')).data, candidate);
+});
+
+test('task evidence exposes actual synthetic corrective execution history and its separate task reference', async t => {
+  const { c, id, calls } = await automaticAttempt(t, { versioned: true, correction: true });
+  const parent = (await readEvidence(c, id, 'outcome')).data, childId = parent.correction.task_id;
+  const child = (await readEvidence(c, childId, 'outcome')).data;
+  assert.equal(child.correction_state, 'awaiting_review'); assert.equal(child.execution_authorized, false);
+  const history = (await readEvidence(c, childId, 'history')).data;
+  assert(history.observations.some(record => record.kind === 'corrective_execution' && record.state === 'awaiting_review'));
+  assert.deepEqual(calls, ['implementer', 'reviewer', 'corrector']);
+});
+
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
   let active;
@@ -1980,13 +2259,14 @@ test('tunnel owner confirmation accepts 30 days, rejects longer and stale claims
     /LIVE_TUNNEL_ASSOCIATION_MISMATCH/,
   );
 });
-test('MCP advertises exactly eight tools; schema/authorization failures cannot execute', async t => {
+test('MCP advertises exactly nine tools; schema/authorization failures cannot execute', async t => {
   const { c, api } = await setup(t); let allowed = false;
   const server = createServer(c, async () => { if (!allowed) throw Error('private'); });
   const client = new Client({ name: 'local-test', version: '1' }); const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
   t.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
+  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'get_task_evidence', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
   assert.equal(list.tools.find(x => x.name === 'get_task').annotations.readOnlyHint, true);
+  assert.equal(list.tools.find(x => x.name === 'get_task_evidence').annotations.readOnlyHint, true);
   assert.equal(list.tools.find(x => x.name === 'cleanup_task').annotations.destructiveHint, true);
   const input = { name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_request' } };
   assert.equal((await client.callTool(input)).isError, true); assert.equal(api.created.length, 0);
