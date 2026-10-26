@@ -37,34 +37,70 @@ async function settledWithin(promise, timeout = 3000) {
 }
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export class BridgeError extends Error { constructor(code) { super(code); this.code = code; } }
-function redactAuthorizationHeaders(text) {
-  if (!/(?:Proxy-)?Authorization[\t ]*["']?[\t ]*:/i.test(text)) return text;
+function redactAuthorizationHeaders(text, depth = 0, headers = false) {
+  if (depth > 64) throw new Error('AUTHORIZATION_REDACTION_DEPTH');
   // Header values end at the physical line boundary, including quoted Digest
   // parameters. Do not let generic whitespace/token filters split credentials.
   const lines = value => value.replace(/((?<![\w-])(?:Proxy-)?Authorization[\t ]*["']?[\t ]*:[\t ]*)[^\r\n\u2028\u2029]*/gi, '$1[REDACTED]');
   let parsed;
-  try { parsed = JSON.parse(text); } catch { return lines(text); }
+  try { parsed = JSON.parse(text); } catch {
+    // Malformed/truncated JSON can hide a header name behind escapes. Do not
+    // project it using a raw-text shortcut that cannot interpret those keys.
+    return /^\s*[\[{"]/.test(text) ? '[REDACTED]' : lines(text);
+  }
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  const keysWithin = (value, keys) => Object.keys(value).every(key => keys.includes(key));
+  const optional = (value, key, test) => !Object.hasOwn(value, key) || test(value[key]);
+  const config = value => object(value) && [2, 3, 4].includes(value.max_codex_turns) &&
+    object(value.publish) && value.publish.draft === true && keysWithin(value.publish, ['title', 'body', 'draft']) &&
+    ['title', 'body'].every(key => optional(value.publish, key, item => typeof item === 'string')) &&
+    keysWithin(value, ['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol', 'publish_after_correction']) &&
+    ['max_duration_seconds', 'max_corrections'].every(key => optional(value, key, Number.isInteger)) &&
+    optional(value, 'review_protocol', item => item === LOCAL_ACTIONABILITY_REVIEW_VERSION) &&
+    optional(value, 'publish_after_correction', item => typeof item === 'boolean');
+  // Lowercase `authorization` is also Controller task authority data. Preserve
+  // only its known object shapes, never arbitrary header objects/arrays. This
+  // classification grants no authority; the existing binding checks still do.
+  const authority = value => object(value) && (
+    config(value) ||
+    (/^[a-f0-9]{64}$/.test(value.authorization_sha256 || '') &&
+      keysWithin(value, ['task_id', 'authorization_sha256', 'contract_sha256', 'baseline_commit', 'deadline', 'owner_instance',
+        'review_request_id', 'publish_request_id', 'request_fingerprint', 'parent_task_id', 'lineage_sha256',
+        'parent_review_authorization_sha256', 'operation_id', 'original_request_id', 'original_request_fingerprint', 'lineage',
+        'rejected_tree_sha', 'rejected_packet_sha256', 'rejected_findings_sha256', 'reviewed_tree_sha', 'packet_sha256',
+        'findings_sha256', 'reviewer_thread_id', 'reviewer_turn_id', 'validation_attempt_id', 'validation_sha256', 'branch', 'input']) &&
+      Object.entries(value).every(([key, item]) => key === 'deadline' ? Number.isFinite(item) :
+        ['lineage', 'input'].includes(key) ? object(item) : typeof item === 'string')) ||
+    (config(value.authorization) &&
+      keysWithin(value, ['authorization', 'contract_binding', 'review_authorization', 'deadline', 'owner_instance', 'review_request_id', 'publish_request_id'])));
   // Receipts and packets may contain JSON-encoded headers or model messages.
   // Sanitize their string values without consuming JSON delimiters/other fields.
-  let changed = false;
-  const visit = value => {
+  let changed = false, keys = 0;
+  const visit = (value, level, inHeaders) => {
+    if (level > 64) throw new Error('AUTHORIZATION_REDACTION_DEPTH');
     if (typeof value === 'string') {
-      const safe = redactAuthorizationHeaders(value); changed ||= safe !== value; return safe;
+      const safe = redactAuthorizationHeaders(value, level + 1, inHeaders); changed ||= safe !== value; return safe;
     }
-    if (Array.isArray(value)) return value.map(visit);
+    if (Array.isArray(value)) return value.map(item => visit(item, level + 1, inHeaders));
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => {
-      if (/^(?:Proxy-)?Authorization$/i.test(key.trim()) && typeof item === 'string') {
+      keys++;
+      if (/^(?:Proxy-)?Authorization$/i.test(key.trim()) && !(key === 'authorization' && !inHeaders && (item === null || authority(item)))) {
         changed ||= item !== '[REDACTED]'; return [key, '[REDACTED]'];
       }
-      return [key, visit(item)];
+      return [key, visit(item, level + 1, inHeaders || /^headers$/i.test(key.trim()))];
     }));
     return value;
   };
-  const sanitized = visit(parsed);
-  return changed ? JSON.stringify(sanitized) : text;
+  const sanitized = visit(parsed, depth, headers);
+  // JSON.parse discards duplicate keys. Never return raw text containing hidden
+  // values that traversal could not inspect, even if the surviving value is safe.
+  const rawKeys = [...text.matchAll(/"(?:\\.|[^"\\])*"(\s*:)?/g)].filter(match => match[1]).length;
+  return changed || rawKeys !== keys ? JSON.stringify(sanitized) : text;
 }
 export function redact(text, secrets = []) {
-  let s = redactAuthorizationHeaders(String(text));
+  let s;
+  try { s = redactAuthorizationHeaders(String(text)); }
+  catch { s = '[REDACTED]'; } // Unsafe depth/interpretation never returns raw input.
   for (const secret of secrets.filter(Boolean)) s = s.split(secret).join('[REDACTED]');
   return s.replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');

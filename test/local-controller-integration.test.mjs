@@ -1074,7 +1074,10 @@ test('task evidence captures bounded model messages from native completion and k
 test('Authorization credential redaction covers native messages and command output before durable retention', async context => {
   const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-authorization-' });
   const started = await value.start(), backend = await value.running();
-  const payload = 'Authorization: Digest username="SYNTHETIC_NATIVE_USER", response="SYNTHETIC_NATIVE_RESPONSE"\r\nProxy-Authorization: Basic SYNTHETIC_NATIVE_BASIC\r\nX-Trace: useful evidence';
+  const payload = JSON.stringify({ headers: { Authorization: ['Basic SYNTHETIC_NATIVE_ARRAY'],
+    'pRoXy-AuThOrIzAtIoN': { credential: 'SYNTHETIC_NATIVE_OBJECT' } },
+    encoded: '{"Authorizatio\\u006e":"Basic SYNTHETIC_NATIVE_ESCAPED"}',
+    plain: 'Authorization: Digest username="SYNTHETIC_NATIVE_USER", response="SYNTHETIC_NATIVE_RESPONSE"\r\nX-Trace: useful evidence' });
   const params = { threadId: backend.identity.threadId, turnId: backend.identity.turnId };
   backend.options.onProgress({ method: 'item/agentMessage/delta', params: { ...params, delta: payload } });
   backend.options.onProgress({ method: 'item/completed', params: { ...params,

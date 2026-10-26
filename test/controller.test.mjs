@@ -170,6 +170,53 @@ test('task evidence pages complete Unicode output, reject stale/cross-task curso
   assert.equal((await allowed.client.callTool({ name: 'get_task_evidence', arguments: { task_id: 'task_unknown' } })).isError, true);
 });
 
+const structuredAuthorizationEvidence = JSON.stringify({
+  headers: { Authorization: ['Basic SYNTHETIC_ARRAY_A', 'SYNTHETIC_ARRAY_B'],
+    ' pRoXy-AuThOrIzAtIoN ': { scheme: 'Digest', parameters: { username: 'SYNTHETIC_OBJECT_A', response: ['SYNTHETIC_OBJECT_B'] } },
+    'X-Trace': 'useful evidence' },
+  nested: [{ encoded: '{"Authorizatio\\u006e":"Basic SYNTHETIC_ESCAPED_A"}',
+    twice_encoded: JSON.stringify('{"pROXY-Authorizatio\\u006e":["Bearer SYNTHETIC_ENCODED_A"]}') }],
+  plain: 'Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE"\r\nX-Trace: useful evidence',
+});
+
+for (const [name, text] of [
+  ['array value', '{"Authorization":["Basic SYNTHETIC_CREDENTIAL"]}'],
+  ['decoded key', '{"Authorizatio\\u006e":"Basic SYNTHETIC_CREDENTIAL"}'],
+]) test(`Authorization credential redaction handles structured JSON ${name}`, () => {
+  const c = Object.create(Controller.prototype); c.secrets = [];
+  assert(!c.evidenceText(text).includes('SYNTHETIC_CREDENTIAL'));
+});
+
+test('Authorization credential redaction handles nested, escaped and encoded structured values and fails closed', () => {
+  const c = Object.create(Controller.prototype); c.secrets = [];
+  for (const key of ['Authorization', 'Proxy-Authorization', 'authorization', 'pRoXy-AuThOrIzAtIoN']) {
+    for (const value of ['Basic SYNTHETIC_A', ['Digest SYNTHETIC_A', 'SYNTHETIC_B'],
+      { scheme: 'Basic', credential: 'SYNTHETIC_A' }, { nested: [{ credential: 'SYNTHETIC_A' }] },
+      { max_codex_turns: 2, publish: { draft: true }, credential: 'SYNTHETIC_A' },
+      { max_codex_turns: 2, publish: { draft: true, title: { credential: 'SYNTHETIC_A' } } }]) {
+      const text = JSON.stringify({ before: 'useful prefix', nested: [{ [key]: value, after: 'useful evidence' }] });
+      for (const encoded of [text, JSON.stringify(text), JSON.stringify(JSON.stringify(text)), text.replace(/Authorization/gi, 'Authorizatio\\u006e')]) {
+        const safe = c.evidenceText(encoded);
+        assert(!safe.includes('SYNTHETIC_')); assert(safe.includes('useful evidence')); assert(safe.includes('useful prefix'));
+        assert.equal(c.evidenceText(safe), safe);
+      }
+    }
+  }
+  const safe = c.evidenceText(structuredAuthorizationEvidence);
+  assert(!safe.includes('SYNTHETIC_')); assert(safe.includes('useful evidence')); assert.equal(c.evidenceText(safe), safe);
+  for (const text of ['{"Authorization":"Basic SYNTHETIC_A","Authorization":"[REDACTED]","trace":"useful evidence"}',
+    '{"message":"{\\"Authorizatio\\\\u006e\\":[\\"Basic SYNTHETIC_A\\"]}","message":"useful evidence"}',
+    '{"headers":{"authorization":{"max_codex_turns":2,"publish":{"draft":true,"title":"Basic SYNTHETIC_A"}}},"trace":"useful evidence"}']) {
+    const safe = c.evidenceText(text); assert(!safe.includes('SYNTHETIC_')); assert(safe.includes('useful evidence'));
+  }
+  for (const unsafe of ['{"Authorizatio\\u006e":["Basic SYNTHETIC_A"]',
+    '[{"Proxy-Authorizatio\\u006e":{"credential":"SYNTHETIC_A"}}',
+    '"{\\"Authorizatio\\\\u006e\\":\\"Basic SYNTHETIC_A\\"}',
+    '['.repeat(80) + '{"Authorizatio\\u006e":"Basic SYNTHETIC_A"}' + ']'.repeat(80)]) {
+    assert.equal(c.evidenceText(unsafe), '[REDACTED]', 'Uninterpretable JSON must fail closed');
+  }
+});
+
 for (const [header, value] of [
   ['Authorization', 'Basic SYNTHETIC_BASIC_CREDENTIAL'],
   ['Authorization', 'Digest username="SYNTHETIC_DIGEST_USER", response="SYNTHETIC_DIGEST_RESPONSE", nonce="SYNTHETIC_DIGEST_NONCE"'],
@@ -205,7 +252,7 @@ test('Authorization credential redaction preserves adjacent lines, JSON fields a
 });
 
 test('Authorization credential redaction protects new messages, command streams and reviewer receipts before retention', async t => {
-  const payload = 'Authorization: Basic SYNTHETIC_BASIC_A SYNTHETIC_BASIC_B\r\nProxy-Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE"\r\nX-Trace: useful evidence';
+  const payload = structuredAuthorizationEvidence;
   const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, output(output) { output.findings[0].evidence = payload; } });
   const task = c.task(id), receipt = task.reviewer.received_review_output;
   assert(!receipt.output.includes('SYNTHETIC_')); assert(receipt.output.includes('useful evidence'));
@@ -224,8 +271,12 @@ test('Authorization credential redaction protects new messages, command streams 
 
 test('Authorization credential redaction protects every paginated MCP projection of existing retained output without mutations', async t => {
   const { c, id, calls, publisherCalls, normal } = await automaticAttempt(t, { versioned: true });
-  const payload = 'useful prefix\nAuthorization: Basic SYNTHETIC_BASIC_A SYNTHETIC_BASIC_B\r\nProxy-Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE", nonce="SYNTHETIC_NONCE"\r\nX-Trace: useful evidence';
+  const payload = structuredAuthorizationEvidence;
   const task = c.task(id), result = task.reviewer.review_result;
+  const packet = JSON.parse(attemptRows(c, id).map(row => JSON.parse(row.value)).find(record => record.packet_utf8).packet_utf8);
+  packet.current['greeting.txt'] = payload; packet.diff = payload;
+  const text = JSON.stringify(packet); task.reviewer.packet_hash = digest(text); task.retained_packet = { text, sha256: digest(text) };
+  result.packet_hash = task.reviewer.packet_hash;
   // Simulate old records already claiming redacted:true while retaining leaked fragments.
   task.implementer.evidence_messages = [{ provenance: 'model_statement', text: payload, redacted: true, truncated: false }];
   task.implementer.local.latest_model_output = payload;
@@ -243,20 +294,22 @@ test('Authorization credential redaction protects every paginated MCP projection
   c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
   const { client } = await statusClient(t, c);
   const before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot, normal);
-  for (let read = 0; read < 2; read++) for (const section of ['outcome', 'implementer', 'validation', 'review', 'history']) {
+  for (let read = 0; read < 2; read++) for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
     let cursor, joined = '', pages = 0;
     do {
       const response = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, section, limit: 256, ...(cursor ? { cursor } : {}) } });
       assert.notEqual(response.isError, true); const page = response.structuredContent;
       assert.equal(page.redacted, true); assert(Buffer.byteLength(page.content) <= 256);
-      for (const fragment of ['SYNTHETIC_', 'BASIC_A', 'BASIC_B', 'RESPONSE', 'NONCE']) assert(!JSON.stringify(response).includes(fragment), `Leaked synthetic fragment in ${section} page`);
+      for (const fragment of ['SYNTHETIC_', 'ARRAY_A', 'ARRAY_B', 'OBJECT_A', 'OBJECT_B', 'ESCAPED_A', 'ENCODED_A', 'RESPONSE']) assert(!JSON.stringify(response).includes(fragment), `Leaked synthetic fragment in ${section} page`);
       joined += page.content; cursor = page.next_cursor; pages++;
     } while (cursor);
-    assert(pages > 1); assert(!joined.includes('SYNTHETIC_')); assert(joined.includes('useful evidence'));
+    assert(pages > 1); assert(joined.includes('useful evidence'));
+    for (const fragment of ['SYNTHETIC_', 'ARRAY_A', 'ARRAY_B', 'OBJECT_A', 'OBJECT_B', 'ESCAPED_A', 'ENCODED_A', 'RESPONSE']) assert(!joined.includes(fragment), `Leaked synthetic fragment in assembled ${section}`);
     const data = JSON.parse(joined);
     if (section === 'implementer') { assert.equal(data.messages[0].provenance, 'model_statement'); assert.equal(data.commands[0].exit_code, 7); }
     if (section === 'validation') assert.equal(data.results[0].exit_code, 7);
     if (section === 'review') { assert.equal(data.overall, 'FAIL'); assert.equal(data.current_authority_verified, false); }
+    if (section === 'candidate') { assert.equal(data.provenance, 'controller_frozen_review_packet'); assert.equal(data.execution_authorized, false); }
   }
   assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot, normal), files);
   assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
