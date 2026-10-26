@@ -353,13 +353,13 @@ test('automatic restart with unfinished durable intent requires attention withou
 });
 
 test('MCP automatic authority is optional and strictly bounded without new tools', async context => {
-  const value = await setup(context), server = createServer(value.controller, async () => {});
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-schema-' }), server = createServer(value.controller, async () => {});
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'automatic-fixture', version: '1' });
   context.after(async () => { await client.close(); await server.close(); });
   await server.connect(serverTransport); await client.connect(clientTransport);
   const tools = (await client.listTools()).tools, start = tools.find(tool => tool.name === 'start_task');
-  assert.equal(tools.length, 8); assert(!start.inputSchema.required.includes('automatic'));
+  assert.equal(tools.length, 9); assert(!start.inputSchema.required.includes('automatic'));
   assert.equal(start.inputSchema.properties.automatic.additionalProperties, false);
   assert(!start.inputSchema.properties.automatic.required.includes('review_protocol'));
   assert(JSON.stringify(start.inputSchema.properties.automatic.properties.review_protocol).includes(LOCAL_ACTIONABILITY_REVIEW_VERSION));
@@ -1232,11 +1232,11 @@ test('local continue, review and publish reject explicitly without downstream AP
 });
 
 test('MCP exposes explicit local opt-in and persisted state without adding operations', async context => {
-  const value = await setup(context, { status: 'completed' }), server = createServer(value.controller, async () => {});
+  const value = await setup(context, { status: 'completed' }, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-schema-' }), server = createServer(value.controller, async () => {});
   const client = new Client({ name: 'local-integration-test', version: '1' }), [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport); await client.connect(clientTransport);
   context.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.equal(list.tools.length, 8);
+  const list = await client.listTools(); assert.equal(list.tools.length, 9);
   assert.match(client.getInstructions(), /qualified local Codex repository tasks/);
   assert.match(client.getInstructions(), /No local post-completion continuation\./);
   assert(!client.getInstructions().includes('No local post-completion continuation, review or publication'));
