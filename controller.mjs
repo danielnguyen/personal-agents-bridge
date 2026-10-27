@@ -61,10 +61,16 @@ const reportCode = z.enum(['TASK_EXPIRED', 'LOCAL_HUMAN_ATTENTION_REQUIRED', 'HU
   'AUTOMATIC_VALIDATION_FAILED', 'AUTOMATIC_IMPLEMENTATION_UNQUALIFIED', 'CORRECTIVE_REVIEW_RETAINED', 'CORRECTIVE_REVIEW_UNCONFIRMED',
   'CORRECTION_REQUIRES_INDEPENDENT_REVIEW',
   'UNCERTAINTY_UNRESOLVED', 'NON_IMPLEMENTATION_FINDING', 'HUMAN_APPROVAL_REQUIRED', 'STORAGE_UNAVAILABLE',
+  'STORAGE_TRANSACTION_UNRESOLVED', 'STORAGE_TRANSACTION_OWNED',
   'UNCLASSIFIED_WITHHELD']).catch('UNCLASSIFIED_WITHHELD').nullable();
 const reportHash = z.string().regex(/^[a-f0-9]{64}$/).nullable().catch(null);
 const reportGit = z.string().regex(/^[a-f0-9]{40}$/).nullable().catch(null);
 const reportTaskId = z.string().regex(/^task_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).nullable().catch(null);
+// Controller operation/native execution identities, never evidence text or paths.
+const reportIdentity = z.string().regex(/^[A-Za-z0-9_.:-]{1,200}$/).nullable().catch(null);
+const reportRepositoryId = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/).nullable().catch(null);
+const reportBaseRef = z.string().max(200).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/).refine(value => !value.includes('..')).nullable().catch(null);
+const reportTaskBranch = z.string().regex(/^bridge\/task_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).nullable().catch(null);
 const reportNumber = z.number().finite().safe().nullable().catch(null);
 const reportInteger = z.number().int().safe().nullable().catch(null);
 const reportBool = z.boolean().catch(false);
@@ -101,7 +107,8 @@ export function discloseObservation(value) {
 const reportLimits = z.object({ max_duration_seconds: reportInteger, max_codex_turns: reportInteger, max_corrections: reportInteger,
   review_protocol: z.enum(['pab.local-review.v2', LOCAL_ACTIONABILITY_REVIEW_VERSION]).nullable().catch(null),
   publish_after_correction: reportBool }).nullable().catch(null);
-const reportLocal = z.object({ phase: reportPhase, execution_state: reportState, turn_submission_attempted: reportBool,
+const reportLocal = z.object({ phase: reportPhase, execution_state: reportState,
+  thread_id: reportIdentity, turn_id: reportIdentity, model: reportIdentity, turn_submission_attempted: reportBool,
   turn_submission_acknowledged: reportBool, terminal_observed: reportBool, result_received: reportBool,
   server_closed: reportBool, human_attention_required: reportBool }).nullable().catch(null);
 const reportCleanup = z.object(Object.fromEntries(['executor_stopped', 'remote_session_deleted', 'server_closed', 'cancellation_confirmed',
@@ -120,16 +127,19 @@ const reportRole = z.object({ state: reportState, local: reportLocal, overall: r
   packet_hash: reportHash, reviewed_git_state: z.object({ tree_sha: reportGit, baseline_commit: reportGit }).optional() }).nullable().catch(null);
 const reportAttemptStatus = z.enum(['not_attempted', 'attempted_unconfirmed', 'confirmed_completed', 'confirmed_failed', 'unknown']).catch('unknown');
 const reportAttempt = z.object({ status: reportAttemptStatus, result: reportVerdict.optional(),
-  commands: z.array(z.object({ command_index: reportInteger, completion_confirmed: reportBool })).max(10).optional(),
+  request_id: reportIdentity.optional(), attempt_id: reportIdentity.optional(), thread_id: reportIdentity.optional(), turn_id: reportIdentity.optional(),
+  commands: z.array(z.object({ attempt_id: reportIdentity, command_index: reportInteger, completion_confirmed: reportBool })).max(10).optional(),
   commands_truncated: reportBool.optional() });
 const reportProgress = z.object({ stage: reportPhase.nullable(), last_confirmed_stage: reportPhase.nullable(),
   interrupted: reportBool, resume_authorized: z.literal(false).catch(false), attempts: z.object({ implementation: reportAttempt,
     validation: reportAttempt, review: reportAttempt, publication: reportAttempt }) }).optional();
 const reportCorrectiveReview = z.object({ state: reportState, overall: reportVerdict, qualified: reportBool, uncertain: reportBool,
+  request_id: reportIdentity, evidence: z.enum(['retained', 'pending', 'unavailable']).catch('unavailable'),
+  received_output: z.enum(['durable', 'volatile_only', 'unavailable']).catch('unavailable'),
   current_authority_verified: z.literal(false).catch(false),
   reason: reportCode, corrected_tree_sha: reportGit, attempted_turns: reportInteger, reserved_turns: reportInteger,
   execution_authorized: z.literal(false).catch(false), publication_authorized: z.literal(false).catch(false),
-  validation: z.object({ status: reportState, qualified: reportBool, termination_confirmed: reportBool,
+  validation: z.object({ attempt_id: reportIdentity, status: reportState, qualified: reportBool, termination_confirmed: reportBool,
     results: z.array(z.object({ command_index: reportInteger, status: reportState, exit_code: reportInteger,
       start_observed: reportBool, completion_observed: reportBool, termination_confirmed: reportBool })).max(10) }) }).optional();
 const reportWithheld = z.object({ unavailable: reportBool, withheld: reportBool, reason: z.enum(['UNSTRUCTURED_WITHHELD',
@@ -139,7 +149,9 @@ export const taskReportSchema = z.object({ task_id: reportTaskId, state: reportS
   cleanup: reportCleanup, expires_at: z.string().datetime().nullable().catch(null),
   automatic: z.object({ status: reportState, phase: reportPhase, reason: reportCode, human_attention_required: reportBool,
     limits: reportLimits, review: reportReviewSummary, progress: reportProgress,
-    reconciliation: z.object({ confirmed: reportBool, outcome: z.enum(['completed', 'evidence_unconfirmed', 'publication_unconfirmed']).catch('evidence_unconfirmed'), reason: reportCode }).optional(),
+    reconciliation: z.object({ confirmed: reportBool, outcome: z.enum(['completed', 'evidence_unconfirmed', 'publication_unconfirmed',
+      'publication_confirmed', 'external_effects_uncertain', 'stopped', 'expired']).catch('evidence_unconfirmed'),
+      attempt_id: reportIdentity, publication_id: reportIdentity, reason: reportCode }).optional(),
     evidence_retention: z.object({ packet: z.enum(['retained', 'pending', 'unavailable']).catch('unavailable'),
       review: z.enum(['retained', 'pending', 'awaiting_receipt', 'unavailable']).catch('unavailable'),
       received_output: z.enum(['durable', 'volatile_only', 'unavailable']).catch('unavailable'),
@@ -147,12 +159,14 @@ export const taskReportSchema = z.object({ task_id: reportTaskId, state: reportS
     usage: z.object({ implementer_turn_submissions_attempted: reportInteger, reviewer_turn_submissions_attempted: reportInteger,
       correction_turns: reportInteger, token_usage: z.null().catch(null), corrective_reviewer_turn_submissions_attempted: reportInteger.optional(),
       total_codex_turn_submissions_attempted: reportInteger.optional() }).optional() }).optional(),
-  correction: z.object({ parent_task_id: reportTaskId, task_id: reportTaskId, state: reportState, reason: reportCode,
+  correction: z.object({ parent_task_id: reportTaskId, task_id: reportTaskId, attempt_id: reportIdentity, rejected_attempt_id: reportIdentity,
+    state: reportState, reason: reportCode,
     rejected_tree_sha: reportGit, baseline_commit: reportGit, remaining_codex_turns: reportInteger, remaining_corrections: reportInteger,
     execution_authorized: z.literal(false).catch(false), retention_uncertain: reportBool, attempted_corrections: reportInteger,
     reserved_corrections: reportInteger, terminal_confirmed: reportBool, codex_turns_attempted: reportInteger.optional(),
     review: reportCorrectiveReview, execution: reportLocal.optional(), publication: reportPublication.optional() }).optional(),
-  repository: z.object({ baseline_commit: reportGit }).optional(), publication: reportPublication.optional(),
+  repository: z.object({ repository_id: reportRepositoryId, base_ref: reportBaseRef, branch: reportTaskBranch,
+    worktree_id: reportTaskId, baseline_commit: reportGit }).optional(), publication: reportPublication.optional(),
   storage_diagnostic: reportCode.optional(), disclosure: z.literal('typed_metadata_only').optional(),
   explanation: z.object({ provenance: z.literal('controller_summary_of_retained_evidence'), state: reportState, reason: reportCode,
     failed_requirements: z.array(reportFindingId).max(52), failed_validation_commands: z.array(z.object({ index: reportInteger,

@@ -413,7 +413,7 @@ test('MCP four-turn authority is explicit, fingerprinted, immutable and admits n
 });
 
 test('local opt-in reuses owned worktree, baseline, contract and audit without Agents API sessions', async context => {
-  const value = await setup(context);
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-opt-in-' });
   const { controller, input, normal, baseline } = value;
   const result = await controller.invoke('start_task', input, { requestId: 'mcp_start' }, params => controller.start(params));
   const backend = await value.running(), repo = path.join(controller.workspaceRoot, result.task_id, 'repo');
@@ -1568,7 +1568,7 @@ for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real
 async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false, testCommands = ['test "$(cat greeting.txt)" = candidate'] } = {}) {
   let validations = 0;
   const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, {
-    noApi: true, localValidationFactory: options => {
+    fixturePrefix: '/var/tmp/personal-agents-bridge/local-recovery-', noApi: true, localValidationFactory: options => {
       const runner = new LocalValidation(options), run = runner.run.bind(runner);
       runner.run = input => { validations++; return run(input); }; return runner;
     },

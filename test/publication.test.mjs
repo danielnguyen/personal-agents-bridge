@@ -541,6 +541,7 @@ test(`corrective publication SQLite ${effect} at ${boundary} cannot fabricate au
     c.db.exec(`CREATE TEMP TRIGGER publication_fault_trigger BEFORE ${event} ON ${table} WHEN (${condition}) AND publication_fault() BEGIN SELECT RAISE(${effect}${effect === 'ABORT' ? ", 'Injected publication failure'" : ''}); END;`);
   } });
   assert(hits > 0); value.c.db.exec('DROP TRIGGER publication_fault_trigger');
+  context.diagnostic(`SQLite ${effect} trigger fired at ${boundary}: ${hits} matching write(s).`);
   assert.notEqual(value.parent.automatic.status, 'succeeded'); assert.equal(value.localCalls.length, 4);
   assert(value.publisher.pushes <= 1); assert(value.publisher.creates <= 1);
   if (['operation', 'parent reservation', 'child reservation', 'history', 'prepared', 'push intent'].includes(boundary)) assert.equal(value.publisher.pushes, 0);
@@ -647,6 +648,7 @@ async function historicalStatus(c, parentId, childId, overall, publicationUncert
       const view = result.structuredContent, review = view.correction.review;
       assert.equal(review.overall, overall, `Historical review for ${id}: ${JSON.stringify(review)}`);
       assert.equal(review.qualified, overall !== null); assert.equal(review.evidence, overall === null ? 'unavailable' : 'retained');
+      assert.equal(review.current_authority_verified, false);
       assert.equal(review.execution_authorized, false); assert.equal(review.publication_authorized, false);
       assert.equal(view.correction.execution_authorized, false);
       if (!readUnavailable) assert.equal(view.correction.codex_turns_attempted, 4);
@@ -673,6 +675,7 @@ test('historical corrective review remains fail closed on missing or conflicting
   } });
   const { c, id, child } = value; c.db.exec('DROP TRIGGER publication_fault_trigger'); assert(hits > 0);
   await historicalStatus(c, id, child.id, 'PASS', true);
+  assert.equal((await c.retainedCorrectiveReview(c.task(child.id))).overall, 'PASS');
   const evidence = await retainedReviewEvidence(c, id, child.id), calls = [...value.localCalls];
   for (const fault of ['missing review', 'result hash', 'reviewed tree', 'lineage', 'contract binding', 'reviewer identity', 'validation']) {
     await context.test(fault, async () => {
@@ -693,7 +696,12 @@ test('historical corrective review remains fail closed on missing or conflicting
     const task = c.task(taskId), file = path.join(c.workspaceRoot, taskId, task.reviewer.packet_directory, 'evidence.json');
     const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777;
     await fs.chmod(file, 0o600); await fs.writeFile(file, '{}'); await fs.chmod(file, mode);
-    try { await historicalStatus(c, id, child.id, null, true); }
+    try {
+      // Public reporting qualifies retained history; the existing current
+      // verifier must independently continue rejecting the altered live packet.
+      await assert.rejects(c.retainedCorrectiveReview(c.task(child.id)));
+      await historicalStatus(c, id, child.id, 'PASS', true);
+    }
     finally { await fs.chmod(file, 0o600); await fs.writeFile(file, bytes); await fs.chmod(file, mode); }
   });
   for (const kind of ['review_result', 'review_packet', 'corrective_execution']) await context.test(`missing retained ${kind}`, async () => {
@@ -707,7 +715,11 @@ test('historical corrective review remains fail closed on missing or conflicting
   await context.test('missing corrected Git tree', async () => {
     const tree = child.reviewer.reviewed_git_state.tree_sha, file = path.join(c.workspaceRoot, child.id, 'git-store/objects', tree.slice(0, 2), tree.slice(2));
     const bytes = await fs.readFile(file), mode = (await fs.stat(file)).mode & 0o777; await fs.rm(file);
-    try { await historicalStatus(c, id, child.id, null, true); await assert.rejects(fs.stat(file), { code: 'ENOENT' }); }
+    try {
+      await assert.rejects(c.retainedCorrectiveReview(c.task(child.id)));
+      await historicalStatus(c, id, child.id, 'PASS', true);
+      await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+    }
     finally { await fs.writeFile(file, bytes, { mode }); }
   });
   await context.test('later expiry does not erase historical qualification or renew authority', async () => {
@@ -724,16 +736,21 @@ test('historical corrective review remains fail closed on missing or conflicting
     executor: value.executor, publisher: value.publisher, secrets: [], localBackendFactory: () => assert.fail('Historical verification cannot replay models') }).init();
   context.after(() => restarted.close());
   await historicalStatus(restarted, id, child.id, 'PASS', true);
+  assert.equal((await restarted.retainedCorrectiveReview(restarted.task(child.id))).overall, 'PASS');
   await context.test('packet integrity after restart', async () => {
     const packet = path.join(c.workspaceRoot, child.id, child.reviewer.packet_directory, 'evidence.json'), bytes = await fs.readFile(packet);
     await fs.chmod(packet, 0o600); await fs.writeFile(packet, '{}'); await fs.chmod(packet, 0o400);
-    try { await historicalStatus(restarted, id, child.id, null, true); }
+    try {
+      await assert.rejects(restarted.retainedCorrectiveReview(restarted.task(child.id)));
+      await historicalStatus(restarted, id, child.id, 'PASS', true);
+    }
     finally { await fs.chmod(packet, 0o600); await fs.writeFile(packet, bytes); await fs.chmod(packet, 0o400); }
   });
   await historicalStatus(restarted, id, child.id, 'PASS', true);
   await context.test('changed corrected worktree after restart', async () => {
     await fs.writeFile(path.join(c.workspaceRoot, child.id, 'repo/one.txt'), 'Changed after qualified review\n');
-    await historicalStatus(restarted, id, child.id, null, true);
+    await assert.rejects(restarted.retainedCorrectiveReview(restarted.task(child.id)));
+    await historicalStatus(restarted, id, child.id, 'PASS', true);
   });
   await restarted.start(value.startInput); restarted.scheduleAutomatic(id); await Promise.all([...restarted.automaticJobs.values()]);
   assert.deepEqual(value.localCalls, calls); assert.equal(value.publisher.pushes, 0); assert.equal(value.publisher.creates, 0);

@@ -431,6 +431,55 @@ test('typed boundary additional schemas discard unknown fields and preserve only
   assert.deepEqual(review.controller_overrides, ['TEST_EVIDENCE']); assert.equal(review.current_authority_verified, false); noRaw(review);
 });
 
+test('typed reporting metadata admits bounded identities and fixed classifications only', async t => {
+  const { c } = await setup(t), task = progressTask(c), id = task.id;
+  task.automatic.status = 'stopped'; task.automatic.reason = 'AUTOMATIC_TASK_STOPPED';
+  task.automatic.reconciliation = { confirmed: false, outcome: 'external_effects_uncertain',
+    attempt_id: 'review-attempt', publication_id: 'publication-attempt', reason: 'AUTOMATIC_RESTART_NO_REPLAY' };
+  task.repository = { repository_id: 'fixture', base_ref: 'approved-base', baseline_commit: task.baseline,
+    branch: `bridge/${id}`, worktree_id: id, canonical_path: '/private/not-for-reporting' };
+  c.save(task);
+  const { get } = await statusClient(t, c), before = statusLedger(c.db);
+  for (let read = 0; read < 2; read++) {
+    const status = (await get(id)).structuredContent, evidence = (await readEvidence(c, id, 'implementer')).data;
+    assert.deepEqual(status.implementer.local, evidence.local);
+    assert.equal(status.implementer.local.model, 'fixture-model');
+    assert.equal(status.implementer.local.thread_id, task.implementer.local.thread_id);
+    assert.equal(status.automatic.progress.attempts.implementation.request_id, task.request_id);
+    assert.equal(status.automatic.progress.attempts.validation.attempt_id, task.local_validation.attempt_id);
+    assert.equal(status.automatic.reconciliation.attempt_id, 'review-attempt');
+    assert.equal(status.automatic.reconciliation.publication_id, 'publication-attempt');
+    assert.equal(status.automatic.reconciliation.outcome, 'external_effects_uncertain');
+    assert.deepEqual(status.repository, { repository_id: 'fixture', base_ref: 'approved-base', baseline_commit: task.baseline,
+      branch: `bridge/${id}`, worktree_id: id });
+    assert.equal(status.remaining_authority.execution_authorized, false);
+  }
+  assert.equal(statusLedger(c.db), before);
+  const raw = await c.reportTask(id);
+  for (const invalid of ['Authorization: Basic SYNTHETIC_CREDENTIAL', '/private/file', 'https://example.invalid/path',
+    '{"Authorization":["SYNTHETIC_CREDENTIAL"]}', '```encoded```', 'line\nbreak', 'x'.repeat(201), {}, ['unclassified'], 42]) {
+    const value = structuredClone(raw);
+    Object.assign(value.implementer.local, { model: invalid, thread_id: invalid, turn_id: invalid });
+    Object.assign(value.repository, { repository_id: invalid, base_ref: invalid, branch: invalid, worktree_id: invalid });
+    Object.assign(value.automatic.reconciliation, { attempt_id: invalid, publication_id: invalid });
+    Object.assign(value.automatic.progress.attempts.validation, { attempt_id: invalid, request_id: invalid });
+    const result = taskReportSchema.parse(value);
+    for (const key of ['model', 'thread_id', 'turn_id']) assert.equal(result.implementer.local[key], null);
+    for (const key of ['repository_id', 'base_ref', 'branch', 'worktree_id']) assert.equal(result.repository[key], null);
+    assert.equal(result.automatic.reconciliation.attempt_id, null); assert.equal(result.automatic.reconciliation.publication_id, null);
+    assert.equal(result.automatic.progress.attempts.validation.attempt_id, null);
+    assert.equal(result.automatic.progress.attempts.validation.request_id, null);
+  }
+  const classification = { state: 'reviewed', evidence: 'retained', received_output: 'durable', request_id: 'review-attempt',
+    validation: { attempt_id: 'validation-attempt', results: [] }, execution_authorized: true, publication_authorized: true };
+  const classified = taskReportSchema.parse({ ...raw, correction: { review: classification } }).correction.review;
+  assert.equal(classified.evidence, 'retained'); assert.equal(classified.received_output, 'durable');
+  assert.equal(classified.validation.attempt_id, 'validation-attempt');
+  assert.equal(classified.execution_authorized, false); assert.equal(classified.publication_authorized, false);
+  classification.evidence = 'arbitrary reviewer explanation';
+  assert.equal(taskReportSchema.parse({ ...raw, correction: { review: classification } }).correction.review.evidence, 'unavailable');
+});
+
 test('shared publication proof review disclosure requires present packet, findings and reviewer identities', () => {
   const findings = { packet_hash: 'a'.repeat(64), overall: 'FAIL', thread_id: 'synthetic-reviewer', turn_id: 'synthetic-turn',
     findings: [{ id: 'R1', status: 'FAIL', evidence: 'ARBITRARY_RAW_LITERAL' }] };
@@ -3159,9 +3208,17 @@ test(`automatic concurrent writes stale ${path} cannot overwrite committed succe
       publisher: new Proxy({}, { get() { assert.fail('Publication replay'); } }) }).init();
     try {
       for (let read = 0; read < 3; read++) {
+        // This concurrency fixture commits success without original review or
+        // complete publication proof. Preserve that durable success independently
+        // from what the public historical-evidence boundary can confirm.
+        assert.equal(recovered.task(input.taskId).automatic.status, 'succeeded');
+        assert.equal(recovered.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
         const view = await recovered.invoke('get_task', { task_id: input.taskId }, {}, () => recovered.get(input.taskId));
-        assert.equal(view.automatic.status, 'succeeded'); assert.equal(view.automatic.human_attention_required, false);
-        assert.equal(view.automatic.progress.attempts.publication.status, 'confirmed_completed');
+        assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+        assert.equal(view.publication.confirmed, false); assert.equal(view.automatic.reason, 'AUTOMATIC_PUBLICATION_UNCONFIRMED');
+        assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+        assert.equal(view.remaining_authority.execution_authorized, false); assert.equal(view.remaining_authority.publication_authorized, false);
+        assert.deepEqual((await readEvidence(recovered, input.taskId, 'outcome')).data.publication, view.publication);
       }
       assert.equal(statusLedger(recovered.db), committed);
     } finally { interruptProgressController(recovered); }
