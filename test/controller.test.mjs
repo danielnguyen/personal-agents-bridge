@@ -30,6 +30,16 @@ async function statusClient(t, c, authorize = async () => {}) {
   t.after(async () => { await client.close(); await server.close(); });
   return { client, get: id => client.callTool({ name: 'get_task', arguments: { task_id: id } }) };
 }
+async function currentReviewStillRejected(c, id, response) {
+  // Reporting now checks retained evidence without Git. Keep the original
+  // live qualification negatives independently asserted on the unchanged
+  // Controller qualifier, rather than treating historical findings as authority.
+  assert.equal(response.structuredContent.automatic.review.current_authority_verified, false);
+  assert.equal(response.structuredContent.automatic.review.execution_authorized, false);
+  const current = await c.automaticReviewSummary(c.task(id));
+  assert.equal(current.potentially_correctable, false);
+  return current;
+}
 async function statusFiles(...roots) {
   const entries = [];
   async function walk(file) {
@@ -413,12 +423,30 @@ test('typed boundary additional schemas discard unknown fields and preserve only
   noRaw(result); assert.equal(result.automatic.limits.max_codex_turns, 2); assert.equal(result.automatic.limits.publish, undefined);
   assert.equal(result.automatic.review.execution_authorized, false); assert.equal(result.implementer.error, 'UNCLASSIFIED_WITHHELD');
   assert.equal(JSON.stringify(raw), before);
-  const findings = { packet_hash: 'a'.repeat(64), overall: 'FAIL', model_overall: 'PASS', controller_overrides: ['TEST_EVIDENCE'],
+  const findings = { packet_hash: 'a'.repeat(64), thread_id: 'synthetic-reviewer', turn_id: 'synthetic-review-turn', overall: 'FAIL', model_overall: 'PASS', controller_overrides: ['TEST_EVIDENCE'],
     findings: [{ id: 'TEST_EVIDENCE', status: 'FAIL', evidence: 'SYNTHETIC_CREDENTIAL' }] };
   const review = Controller.prototype.discloseReview({ packet_hash: findings.packet_hash, review_result: findings,
-    findings_sha256: digest(findings) }, contract());
+    findings_sha256: digest(findings), local: { thread_id: findings.thread_id, turn_id: findings.turn_id } }, contract());
   assert.equal(review.overall, 'FAIL'); assert.equal(review.model_overall, 'PASS');
   assert.deepEqual(review.controller_overrides, ['TEST_EVIDENCE']); assert.equal(review.current_authority_verified, false); noRaw(review);
+});
+
+test('shared publication proof review disclosure requires present packet, findings and reviewer identities', () => {
+  const findings = { packet_hash: 'a'.repeat(64), overall: 'FAIL', thread_id: 'synthetic-reviewer', turn_id: 'synthetic-turn',
+    findings: [{ id: 'R1', status: 'FAIL', evidence: 'ARBITRARY_RAW_LITERAL' }] };
+  const original = { packet_hash: findings.packet_hash, findings_sha256: digest(findings), review_result: findings,
+    local: { thread_id: findings.thread_id, turn_id: findings.turn_id } };
+  assert.equal(Controller.prototype.discloseReview(original, contract()).overall, 'FAIL');
+  for (const paths of [['packet_hash'], ['findings_sha256'], ['local.thread_id'], ['local.turn_id'], ['review_result.packet_hash'],
+    ['review_result.thread_id'], ['review_result.turn_id'], ['packet_hash', 'review_result.packet_hash'],
+    ['local.thread_id', 'review_result.thread_id'], ['local.turn_id', 'review_result.turn_id']]) {
+    const ref = structuredClone(original);
+    for (const name of paths) { const parts = name.split('.'), key = parts.pop(); delete parts.reduce((value, part) => value[part], ref)[key]; }
+    if (!paths.includes('findings_sha256')) ref.findings_sha256 = digest(ref.review_result);
+    const before = JSON.stringify(ref), review = Controller.prototype.discloseReview(ref, contract());
+    assert.equal(review.overall, null, paths.join(', ')); assert.equal(review.unavailable, true); noRaw(review);
+    assert.equal(JSON.stringify(ref), before);
+  }
 });
 
 test('typed boundary additional candidate metadata fails closed on missing, changed and symlink packets', async t => {
@@ -874,9 +902,11 @@ for (const unavailable of ['packet', 'tree']) test(`corrective review MCP status
   try {
     for (const taskId of [id, child.id, id, child.id]) {
       const response = await get(taskId); assert.notEqual(response.isError, true);
-      assert.equal(response.structuredContent.correction.review.qualified, false);
-      assert.equal(response.structuredContent.correction.review.overall, null);
-      if (taskId === child.id) assert.equal(response.structuredContent.reviewer.overall, null);
+      assert.equal(response.structuredContent.correction.review.qualified, true);
+      assert.equal(response.structuredContent.correction.review.current_authority_verified, false);
+      assert.equal(response.structuredContent.correction.review.overall, child.reviewer.review_result.overall);
+      if (taskId === child.id) assert.equal(response.structuredContent.reviewer.overall, child.reviewer.review_result.overall);
+      assert.equal((await c.correctiveReviewSummary(child)).qualified, false);
     }
     assert.equal(writes, 0); assert.equal(statusLedger(c.db), ledger);
     assert.equal(await statusFiles(value.normal, c.workspaceRoot), files); assert.equal(value.calls.length, 4); assert.deepEqual(value.publisherCalls, []);
@@ -1315,9 +1345,9 @@ test(`MCP versioned status cannot lazily fetch a missing ${location} ${missing}`
   try {
     for (let count = 0; count < 3; count++) {
       const result = await get(id); assert.notEqual(result.isError, true);
-      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      await currentReviewStillRejected(c, id, result);
       assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
-      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+      assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
       assert.deepEqual(await fs.readdir(path.join(store, 'objects/pack')), packs, 'Status lazily fetched promised objects');
       await assert.rejects(fs.access(object), { code: 'ENOENT' });
       assert.equal(await statusFiles(normal, workspace, registry, remote), files);
@@ -1337,8 +1367,8 @@ test('MCP versioned status denies qualification after actual registration remova
   await fs.writeFile(registry, JSON.stringify({ version: 1, repositories: {} }));
   await assert.rejects(c.start({ ...input, request_id: 'removed_registration' }), /UNKNOWN_REPOSITORY_ID/);
   const before = statusLedger(c.db), result = await get(id);
-  assert.notEqual(result.isError, true); assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
-  assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+  assert.notEqual(result.isError, true); await currentReviewStillRejected(c, id, result);
+  assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
   assert.equal(statusLedger(c.db), before); assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
   await fs.writeFile(registry, original);
   assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
@@ -1360,7 +1390,7 @@ for (const location of ['source', 'candidate']) test(`MCP versioned status canno
   const ledger = statusLedger(c.db);
   for (let count = 0; count < 3; count++) {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
     await assert.rejects(fs.access(path.join(repo, 'status-filter-ran')), { code: 'ENOENT' });
     assert.equal(await statusFiles(normal, workspace, registry), before);
@@ -1384,7 +1414,7 @@ for (const location of ['index', 'head']) test(`MCP versioned status rejects cur
   await assert.rejects(c.verifyLocalReviewPacket(task, { readOnly: true }), { code: 'LOCAL_REVIEW_EXECUTION_UNVERIFIED' });
   for (let count = 0; count < 3; count++) {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
     assert.equal(await statusFiles(normal, workspace, registry), before);
     assert.equal(statusLedger(c.db), ledger);
@@ -1409,8 +1439,8 @@ for (const changed of ['identity', 'path', 'corrupt', 'missing', 'unsafe', 'syml
     const before = statusLedger(reader), files = await statusFiles(normal, workspace);
     for (let count = 0; count < 3; count++) {
       const result = await get(id); assert.notEqual(result.isError, true);
-      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
-      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+      await currentReviewStillRejected(c, id, result);
+      assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
     }
     assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, workspace), files);
     assert.deepEqual(c.task(id).reviewer.review_result, historical);
@@ -1456,7 +1486,7 @@ for (const changed of ['metadata removed', 'origin binding', 'baseline binding',
       const before = statusLedger(reader), files = await statusFiles(normal, path.join(c.workspaceRoot, id), file);
       for (let count = 0; count < 2; count++) {
         const result = await get(id); assert.notEqual(result.isError, true);
-        assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+        await currentReviewStillRejected(c, id, result);
       }
       assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, path.join(c.workspaceRoot, id), file), files);
       assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
@@ -1494,7 +1524,7 @@ test('MCP versioned status never repairs a conflicting backend or synthesizes a 
   const before = statusLedger(c.db), fault = sqliteAbort(c, 'failures', '1');
   try {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(fault.hits, 0); assert.equal(statusLedger(c.db), before);
   } finally {
     c.db.exec('DROP TRIGGER evidence_fault');

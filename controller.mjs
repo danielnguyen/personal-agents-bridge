@@ -107,11 +107,13 @@ const reportLocal = z.object({ phase: reportPhase, execution_state: reportState,
 const reportCleanup = z.object(Object.fromEntries(['executor_stopped', 'remote_session_deleted', 'server_closed', 'cancellation_confirmed',
   'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted'].map(key => [key, reportBool]))).nullable().catch(null);
 const reportPublication = z.object({ phase: reportPhase, reviewed_tree_sha: reportGit, commit_sha: reportGit,
-  commit_tree_matches_reviewed_tree: reportBool, push_attempted: reportBool, pr_attempted: reportBool, pr_number: reportInteger,
+  commit_tree_matches_reviewed_tree: reportBool, push_attempted: z.boolean().nullable().catch(null), pr_attempted: z.boolean().nullable().catch(null), pr_number: reportInteger,
   draft: reportBool, confirmed: reportBool, uncertain: reportBool,
+  live_github_verified: z.literal(false).catch(false),
   execution_authorized: z.literal(false).catch(false) }).nullable().catch(null);
 const reportReviewSummary = z.object({ state: z.enum(['not_started', 'pass', 'fail', 'potentially_correctable_fail', 'non_correctable_fail',
   'malformed_or_uncertain']).catch('malformed_or_uncertain'), potentially_correctable: reportBool,
+  current_authority_verified: z.literal(false).catch(false),
   execution_authorized: z.literal(false).catch(false), blockers: z.array(reportCode).max(16).catch([]) }).nullable().catch(null);
 const reportRole = z.object({ state: reportState, local: reportLocal, overall: reportVerdict,
   human_attention_required: reportBool, clarification_required: reportBool, error: reportCode,
@@ -124,6 +126,7 @@ const reportProgress = z.object({ stage: reportPhase.nullable(), last_confirmed_
   interrupted: reportBool, resume_authorized: z.literal(false).catch(false), attempts: z.object({ implementation: reportAttempt,
     validation: reportAttempt, review: reportAttempt, publication: reportAttempt }) }).optional();
 const reportCorrectiveReview = z.object({ state: reportState, overall: reportVerdict, qualified: reportBool, uncertain: reportBool,
+  current_authority_verified: z.literal(false).catch(false),
   reason: reportCode, corrected_tree_sha: reportGit, attempted_turns: reportInteger, reserved_turns: reportInteger,
   execution_authorized: z.literal(false).catch(false), publication_authorized: z.literal(false).catch(false),
   validation: z.object({ status: reportState, qualified: reportBool, termination_confirmed: reportBool,
@@ -1170,9 +1173,9 @@ export class Controller {
     }
     return current;
   }
-  async retainedCorrectiveReview(task) {
+  async retainedCorrectiveReview(task, retainedOnly = false) {
     // Historical proof is read-only. It is never used by an execution guard.
-    this.storageAuthority();
+    if (!retainedOnly) this.storageAuthority();
     const parent = this.correctiveReviewAuthority(task);
     const records = value => this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(value.id).map(row => {
       const record = JSON.parse(row.value);
@@ -1227,20 +1230,27 @@ export class Controller {
       }
       return assessed;
     };
-    const previous = assess(parent, original, await this.currentReviewPacket(parent));
+    const packetFor = async value => {
+      if (!retainedOnly) return this.currentReviewPacket(value);
+      const retained = await this.retainedEvidencePacket(value);
+      if (!retained) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      return retained.packet;
+    };
+    const previous = assess(parent, original, await packetFor(parent));
     if (previous.overall !== 'FAIL' || !previous.actionability_qualification.potentially_correctable ||
         task.correction.rejected_tree_sha !== parent.reviewer.reviewed_git_state.tree_sha || task.correction.packet_sha256 !== parent.reviewer.packet_hash ||
         task.correction.findings_sha256 !== parent.reviewer.findings_sha256 || task.correction.validation_sha256 !== digest(parent.local_validation) ||
         task.correction.contract_sha256 !== parent.automatic.contract_binding.sha256 || task.correction.authorization_sha256 !== digest(parent.automatic.authorization)) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
-    const review = assess(task, history, await this.currentReviewPacket(task));
+    const review = assess(task, history, await packetFor(task));
     return { overall: review.overall };
   }
-  async automaticReviewSummary(task) {
+  async automaticReviewSummary(task, retainedOnly = false) {
     const summary = { protocol: task.automatic.authorization?.review_protocol === undefined ? 'pab.local-review.v2' : LOCAL_ACTIONABILITY_REVIEW_VERSION,
       state: 'not_started', potentially_correctable: false, execution_authorized: false, blockers: ['CORRECTION_EXECUTION_DISABLED'] };
-    if (task.automatic.reconciliation?.confirmed === true) return { ...summary, state: 'pass' };
+    if (task.automatic.reconciliation?.confirmed === true && this.discloseReview(task.reviewer, task.automatic.contract_binding?.contract).overall === 'PASS') return { ...summary, state: 'pass' };
     try {
       const protocol = this.reviewProtocol(task), ref = task.reviewer;
+      if (ref?.review_result && !this.discloseReview(ref, task.automatic.contract_binding?.contract).overall) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
       if (protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION) {
         summary.state = !ref ? 'not_started' : ref.review_result ? ref.review_result.overall.toLowerCase() : 'malformed_or_uncertain';
         return summary;
@@ -1251,16 +1261,26 @@ export class Controller {
       }
       // Resolving an existing entry only reads the private registry and local Git
       // identity/binding. No registration, fetch, lock or checkout synchronization.
-      const packet = await this.currentReviewPacket(task);
-      const text = await fs.readFile(path.join(this.workspaceRoot, task.id, ref.packet_directory, 'evidence.json'), 'utf8');
+      const retained = retainedOnly ? await this.retainedEvidencePacket(task) : null;
+      if (retainedOnly && !retained) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
+      const packet = retainedOnly ? retained.packet : await this.currentReviewPacket(task);
+      const text = retainedOnly ? null : await fs.readFile(path.join(this.workspaceRoot, task.id, ref.packet_directory, 'evidence.json'), 'utf8');
       const records = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=?').all(task.id).map(row => {
         const record = JSON.parse(row.value);
         if (digest(record) !== row.observation_sha256) throw new BridgeError('AUTOMATIC_RETAINED_EVIDENCE_INVALID');
         return record;
       });
-      if (!records.some(record => record.packet_utf8 === text && record.review_packet?.sha256 === ref.packet_hash) ||
+      if (!records.some(record => (retainedOnly ? typeof record.packet_utf8 === 'string' && digest(record.packet_utf8) === ref.packet_hash : record.packet_utf8 === text) && record.review_packet?.sha256 === ref.packet_hash) ||
           !records.some(record => record.findings_sha256 === ref.findings_sha256 && digest(record.review_result) === ref.findings_sha256)) throw new BridgeError('AUTOMATIC_REVIEW_NOT_RETAINED');
-      const assessed = this.revalidateVersionedReview(task, packet), qualification = assessed.actionability_qualification;
+      let assessed;
+      if (retainedOnly) {
+        this.verifyVersionedReviewBinding(task, packet, ref.review_result, ref.findings_sha256, false);
+        assessed = validateLocalActionabilityReview(ref.review_result.review_output, task.automatic.contract_binding.contract,
+          packet, this.bounded.bind(this), ref.review_result.controller_context);
+        if (['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract'].some(key =>
+          digest(assessed[key]) !== digest(ref.review_result[key]))) throw new BridgeError('LOCAL_REVIEW_RESULT_BINDING_CHANGED');
+      } else assessed = this.revalidateVersionedReview(task, packet);
+      const qualification = assessed.actionability_qualification;
       summary.potentially_correctable = qualification.potentially_correctable;
       summary.state = assessed.overall === 'PASS' ? 'pass' : qualification.potentially_correctable ? 'potentially_correctable_fail' : 'non_correctable_fail';
       summary.blockers = [...qualification.blockers, 'CORRECTION_EXECUTION_DISABLED'].slice(0, 16);
@@ -1274,7 +1294,7 @@ export class Controller {
     }
     return summary;
   }
-  async correctiveReviewSummary(task) {
+  async correctiveReviewSummary(task, retainedOnly = false) {
     const ref = task.reviewer, validation = task.local_validation;
     const summary = { protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION, request_id: task.automatic.review_request_id,
       state: task.automatic.status === 'progressing' ? validation?.status === 'running' || validation?.status === 'pending' ? 'validating' : ref?.state || 'reserved' : 'needs_attention',
@@ -1289,7 +1309,7 @@ export class Controller {
       reviewer: ref ? Object.fromEntries(['thread_id', 'turn_id', 'model', 'authentication', 'turn_submission_attempted',
         'turn_submission_acknowledged', 'terminal_observed', 'result_received', 'server_closed'].map(key => [key, ref.local[key]])) : null };
     try {
-      this.storageAuthority();
+      if (!retainedOnly) this.storageAuthority();
       const parent = this.correctiveReviewAuthority(task);
       if (!ref?.review_result) {
         this.verifyCorrectionEvidence(task);
@@ -1297,7 +1317,7 @@ export class Controller {
         if (ref?.error || task.automatic.status !== 'progressing' || ref?.pending_review_output || ref?.pending_review_result) throw new BridgeError('REVIEW_EVIDENCE_UNVERIFIED');
         return summary;
       }
-      const review = await this.retainedCorrectiveReview(task);
+      const review = await this.retainedCorrectiveReview(task, retainedOnly);
       summary.validation.qualified = true;
       Object.assign(summary, { state: 'reviewed', overall: review.overall, qualified: true, evidence: 'retained', uncertain: false });
     } catch {
@@ -2318,8 +2338,13 @@ export class Controller {
   }
   discloseReview(ref, contract) {
     const result = ref?.review_result;
-    const verified = !!result && result.packet_hash === ref.packet_hash &&
-      (!ref.findings_sha256 || digest(result) === ref.findings_sha256) && ref.received_review_output?.complete !== false;
+    const identity = value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/.test(value);
+    const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    const verified = !!result && hash(ref.packet_hash) && hash(result.packet_hash) && result.packet_hash === ref.packet_hash &&
+      hash(ref.findings_sha256) && digest(result) === ref.findings_sha256 && identity(result.turn_id) &&
+      (ref.local ? identity(ref.local.thread_id) && identity(result.thread_id) && result.thread_id === ref.local.thread_id &&
+        identity(ref.local.turn_id) && result.turn_id === ref.local.turn_id : identity(ref.session_id) && identity(ref.turn_id) && result.turn_id === ref.turn_id) &&
+      ref.received_review_output?.complete !== false;
     const obligations = [...(contract?.requirements || []), ...(contract?.invariants || [])].map(item => item.id);
     return { provenance: 'independent_reviewer_with_controller_qualification', unavailable: !verified,
       qualification: 'retained_result_binding_only', current_authority_verified: false, execution_authorized: false,
@@ -2352,49 +2377,149 @@ export class Controller {
         stdout: discloseObservation(record.stdout), stderr: discloseObservation(record.stderr) })),
       truncated: Array.isArray(value?.results) && value.results.length > 10 };
   }
-  disclosePublication(task) {
+  async qualifyPublicationEvidence(task) {
     // A historical Controller completion is not fresh publication authority.
     // Use the same retained projection on both reporting surfaces; never query
     // Git/GitHub or try to reconcile a publication during a read.
-    if (task.automatic?.correction && !task.correction) {
-      const child = this.task(task.automatic.correction.task_id);
-      if (child.correction?.parent_task_id === task.id && child.automatic?.corrective_publication) task = child;
-    }
-    const p = task.publication;
-    if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
-    let confirmed = false;
+    let p = task.publication, confirmed = false;
+    const require = condition => { if (!condition) throw new BridgeError('PUBLICATION_EVIDENCE_UNCONFIRMED'); };
+    const identity = value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/.test(value);
+    const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    const git = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
+    const operation = (id, taskId, fingerprint) => {
+      require(identity(id) && hash(fingerprint));
+      const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id);
+      require(row?.id === id && row.task_id === taskId && row.fingerprint === fingerprint && row.status === 'accepted');
+    };
+    const reviewProof = async (value, overall) => {
+      const ref = value.reviewer, binding = value.automatic?.contract_binding || value.evidence_contract, contract = binding?.contract;
+      require(!this.persistenceFailures.has(value.id) && typed(reportTaskId, value.id) && git(value.baseline) &&
+        value.baseline === value.repository?.baseline_commit && value.repository.branch === `bridge/${value.id}` && git(ref?.reviewed_git_state?.tree_sha) &&
+        hash(binding?.sha256) && !!contract && digest(contract) === binding.sha256 && this.discloseReview(ref, contract).overall === overall);
+      const retained = await this.retainedEvidencePacket(value);
+      require(retained && digest(retained.contract) === binding.sha256);
+      const { packet } = retained;
+      if (value.execution_backend === 'local_codex') {
+        require(identity(value.implementer.local?.thread_id) && value.implementer.local.thread_id !== ref.local.thread_id &&
+          git(ref.review_result.reviewed_git_state?.tree_sha) && ref.review_result.reviewed_git_state.tree_sha === ref.reviewed_git_state.tree_sha &&
+          hash(ref.received_output_sha256) && hash(ref.received_review_output?.output_sha256));
+        this.verifyReceivedReview(value, ref.received_review_output, ref.received_output_sha256, packet);
+        require(independentValidationPassed(value.local_validation, contract.test_commands, ref.reviewed_git_state, value.id) &&
+          digest(packet.independent_validation) === digest(value.local_validation));
+        const versioned = this.reviewProtocol(value) === LOCAL_ACTIONABILITY_REVIEW_VERSION;
+        if (versioned) this.verifyVersionedReviewBinding(value, packet, ref.review_result, ref.findings_sha256, false);
+        const assessed = versioned ? validateLocalActionabilityReview(ref.review_result.review_output, contract, packet,
+          this.bounded.bind(this), ref.review_result.controller_context) :
+          validateLocalReview(JSON.stringify({ overall: ref.review_result.overall, findings: ref.review_result.findings }), contract, packet, this.bounded.bind(this));
+        require(assessed.overall === overall && ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']
+          .every(key => digest(assessed[key]) === digest(ref.review_result[key])));
+        if (versioned) require(Object.keys(ref.review_result.controller_context || {}).sort().join() === 'authorityValid,executionQualified,reviewerIndependent,uncertaintyFree' &&
+          Object.values(ref.review_result.controller_context).every(confirmed => confirmed === true));
+      } else {
+        require(identity(ref.session_id) && identity(value.implementer.session_id) && ref.session_id !== value.implementer.session_id);
+        const required = [...contract.requirements, ...contract.invariants].map(item => item.id).concat(['SCOPE', 'TEST_EVIDENCE']);
+        const findings = ref.review_result.findings;
+        require(Array.isArray(findings) && findings.length === required.length && required.every(id => findings.filter(finding =>
+          finding.id === id && ['PASS', 'FAIL'].includes(finding.status) && typeof finding.evidence === 'string' && finding.evidence.trim()).length === 1) &&
+          overall === (findings.every(finding => finding.status === 'PASS') ? 'PASS' : 'FAIL'));
+      }
+      if (value.automatic) {
+        const a = value.automatic;
+        require(identity(a.review_request_id) && identity(a.publish_request_id));
+        if (a.authorization.review_protocol !== undefined) require(hash(a.review_authorization?.request_fingerprint));
+        this.verifyAutomaticEvidence(value);
+        for (const id of [value.request_id, a.review_request_id]) {
+          const expected = this.automaticOperationBinding(id); require(expected && expected.task_id === value.id);
+          operation(id, value.id, expected.fingerprint);
+        }
+      } else {
+        const payload = { contract, repository_id: value.repository.repository_id, base_ref: value.repository.base_ref };
+        operation(value.request_id, value.id, digest({ kind: 'start', payload: value.execution_backend === 'local_codex' ?
+          { execution_backend: 'local_codex', input: payload } : payload }));
+        operation(ref.request_id || ref.creation_request, value.id, digest({ kind: 'review', payload: { id: value.id } }));
+      }
+      return ref;
+    };
     try {
-      this.storageAuthority();
-      if (this.persistenceFailures.has(task.id) || task.publication_error) throw Error();
-      const ref = task.reviewer, contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
-      confirmed = p.phase === 'complete' && p.task_id === task.id && p.push_attempted === true && p.pr_attempted === true &&
-        p.commit_tree_matches_reviewed_tree === true && /^[a-f0-9]{40}$/.test(p.commit_sha || '') &&
-        Number.isSafeInteger(p.pr_number) && p.pr_number > 0 && Number.isFinite(Date.parse(p.completed_at)) &&
-        p.pushed_branch === task.repository?.branch && p.review_overall === 'PASS' &&
-        p.reviewed_tree_sha === ref?.reviewed_git_state?.tree_sha && p.review_packet_sha256 === ref?.packet_hash &&
-        p.reviewer_turn_id === ref?.review_result?.turn_id && this.discloseReview(ref, contract).overall === 'PASS' &&
-        (task.execution_backend === 'local_codex' ? p.reviewer_backend === 'local_codex' && p.reviewer_session_id === null &&
-          p.reviewer_thread_id === ref.local?.thread_id : p.reviewer_session_id === ref?.session_id);
-      if (task.automatic?.corrective_publication) confirmed &&= this.correctivePublicationSummary(task).confirmed === true;
-      else if (task.automatic) confirmed &&= task.automatic.status === 'succeeded' &&
-        task.automatic.reconciliation?.confirmed !== false && this.confirmedAutomaticPublication(task);
+      // Check storage observationally; storageAuthority() may latch uncertainty.
+      require(!this.transactionUnresolved && !this.db.isTransaction && !this.transactionOwner);
+      if (task.automatic?.correction && !task.correction) {
+        const parent = task, lineage = parent.automatic.correction;
+        require(typed(reportTaskId, lineage.task_id) && lineage.parent_task_id === parent.id);
+        task = this.task(lineage.task_id); p = task.publication;
+        require(task.correction?.parent_task_id === parent.id && task.correction.task_id === task.id &&
+          digest(lineage) === digest(task.correction) && task.automatic?.corrective_publication &&
+          !this.persistenceFailures.has(parent.id) && !parent.publication_error);
+      }
+      if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
+      require(!this.persistenceFailures.has(task.id) && !task.publication_error);
+      const ref = await reviewProof(task, 'PASS');
+      require(typed(reportTaskId, task.id) && p.task_id === task.id && task.publication_frozen === true &&
+        p.phase === 'complete' && p.push_attempted === true && p.pr_attempted === true && p.commit_tree_matches_reviewed_tree === true &&
+        git(p.commit_sha) && git(p.reviewed_tree_sha) && git(ref?.reviewed_git_state?.tree_sha) &&
+        p.reviewed_tree_sha === ref.reviewed_git_state.tree_sha && hash(p.review_packet_sha256) &&
+        hash(ref.packet_hash) && p.review_packet_sha256 === ref.packet_hash && hash(p.input_sha256) &&
+        git(task.baseline) && task.baseline === task.repository?.baseline_commit &&
+        typeof p.pushed_branch === 'string' && p.pushed_branch === `bridge/${task.id}` && p.pushed_branch === task.repository?.branch &&
+        Number.isSafeInteger(p.pr_number) && p.pr_number > 0 && typeof p.target?.repository === 'string' &&
+        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(p.target.repository) && identity(p.target.base) && p.target.base !== p.pushed_branch &&
+        p.pr_url === `https://github.com/${p.target.repository}/pull/${p.pr_number}` &&
+        typeof p.prepared_at === 'string' && typeof p.completed_at === 'string' &&
+        Number.isFinite(Date.parse(p.prepared_at)) && Date.parse(p.completed_at) >= Date.parse(p.prepared_at) && Date.parse(p.completed_at) <= Date.now() &&
+        identity(p.reviewer_turn_id) && p.reviewer_turn_id === ref.review_result?.turn_id &&
+        p.review_overall === 'PASS');
+      if (task.execution_backend === 'local_codex') {
+        require(p.reviewer_backend === 'local_codex' && p.reviewer_session_id === null && identity(p.reviewer_thread_id) &&
+          p.reviewer_thread_id === ref.local.thread_id && p.reviewer_turn_id === ref.local.turn_id);
+      } else {
+        require(identity(p.reviewer_session_id) && p.reviewer_session_id === ref.session_id);
+      }
+      if (task.automatic) {
+        const a = task.automatic;
+        require(a.status === 'succeeded' && a.reconciliation?.confirmed !== false &&
+          p.input_sha256 === digest({ title: a.authorization.publish.title, body: a.authorization.publish.body, draft: true }));
+        const expected = this.automaticOperationBinding(a.publish_request_id); require(expected && expected.task_id === task.id);
+        operation(a.publish_request_id, task.id, expected.fingerprint);
+        if (task.correction || a.corrective_publication) {
+          require(task.correction && a.corrective_publication);
+          const parent = this.correctiveReviewAuthority(task);
+          require(!this.persistenceFailures.has(parent.id) && !parent.publication_error && parent.automatic.status === 'succeeded' &&
+            parent.automatic.reconciliation?.confirmed !== false);
+          await reviewProof(parent, 'FAIL');
+          this.verifyCorrectionEvidence(task); this.verifyCorrectivePublicationEvidence(task);
+        }
+      }
+      confirmed = true;
     } catch { confirmed = false; }
+    if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
     return typed(reportPublication, { ...p, phase: p.phase === 'complete' && !confirmed ? 'confirmation_pending' : p.phase,
-      draft: confirmed ? true : p.draft, confirmed,
+      draft: confirmed ? true : p.draft, confirmed, live_github_verified: false,
       uncertain: !!task.publication_error || this.persistenceFailures.has(task.id) || this.transactionUnresolved === true ||
+        typeof p.push_attempted !== 'boolean' || typeof p.pr_attempted !== 'boolean' ||
         p.phase === 'complete' && !confirmed });
   }
+  disclosePublication(task) { return this.qualifyPublicationEvidence(task); }
   async reportTask(id) {
     // Internal get() remains available to execution paths. The reporting call
     // never refreshes sessions, captures diagnostics or updates repository evidence.
-    const raw = await this.get(id, false), task = this.task(id);
+    const raw = await this.get(id, false, true), task = this.task(id);
     const result = taskReportSchema.omit({ explanation: true, evidence: true, next_steps: true, disclosure: true, remaining_authority: true }).parse(raw);
-    if (raw.publication || task.publication) {
-      result.publication = this.disclosePublication(task);
+    if (raw.publication || task.publication || task.automatic?.correction) {
+      result.publication = await this.disclosePublication(task);
       if (result.correction?.publication) result.correction.publication = result.publication;
+      if (result.automatic?.status === 'succeeded' && !result.publication?.confirmed) {
+        Object.assign(result.automatic, { status: 'uncertain', reason: 'AUTOMATIC_PUBLICATION_UNCONFIRMED', human_attention_required: true });
+        if (!task.cleaned) result.state = 'uncertain';
+      }
+      const progress = result.automatic?.progress;
+      if (progress && !result.publication?.confirmed) {
+        if (progress.attempts.publication.status === 'confirmed_completed') progress.attempts.publication.status = 'attempted_unconfirmed';
+        if (progress.last_confirmed_stage === 'publication') progress.last_confirmed_stage = null;
+      }
     }
     const contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
     const review = this.discloseReview(task.reviewer, contract);
+    if (result.reviewer) result.reviewer.overall = review.overall;
     result.explanation = { provenance: 'controller_summary_of_retained_evidence', state: result.state,
       reason: typed(reportCode, raw.automatic?.reason || raw.correction?.reason || raw.implementer?.error || raw.reviewer?.error),
       failed_requirements: review.findings.filter(finding => finding.status === 'FAIL').map(finding => finding.id),
@@ -2436,7 +2561,8 @@ export class Controller {
           const record = JSON.parse(row.value);
           if (record.task_id !== id || digest(record) !== row.observation_sha256 || record.review_packet?.sha256 !== packet_sha256) continue;
           ref = { packet_hash: packet_sha256, reviewed_git_state: record.reviewed_git_state, review_result: record.review_result,
-            findings_sha256: record.findings_sha256, received_review_output: record.received_review_output, received_output_sha256: record.received_output_sha256 };
+            findings_sha256: record.findings_sha256, received_review_output: record.received_review_output, received_output_sha256: record.received_output_sha256,
+            ...(record.reviewer ? { local: { thread_id: record.reviewer.thread_id, turn_id: record.reviewer.turn_id } } : {}) };
           retainedValidation = record.independent_validation; break;
         } catch { /* Only verified owner-task observations may select an attempt. */ }
       }
@@ -2445,7 +2571,7 @@ export class Controller {
         local_validation: ref === task.reviewer ? task.local_validation : retainedValidation || ref.independent_validation };
     }
     const ref = task.reviewer, contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
-    const cleanup = typed(reportCleanup, task.cleanup), publication = this.disclosePublication(task);
+    const cleanup = typed(reportCleanup, task.cleanup), publication = await this.disclosePublication(task);
     const correction = value => value ? { parent_task_id: typed(reportTaskId, value.parent_task_id), task_id: typed(reportTaskId, value.task_id),
       rejected_tree_sha: typed(reportGit, value.rejected_tree_sha), baseline_commit: typed(reportGit, value.baseline_commit),
       execution_authorized: false } : null;
@@ -2461,6 +2587,11 @@ export class Controller {
       publication, publication_error: typed(reportCode, task.publication_error), cleanup,
       workspace_deleted: task.workspace_deleted === true, execution_authorized: false,
       retention_uncertain: this.persistenceFailures.has(id) || this.transactionUnresolved === true };
+    if (section === 'outcome' && task.automatic?.status === 'succeeded' && !publication?.confirmed) {
+      if (!task.cleaned) data.state = 'uncertain';
+      data.reason = 'AUTOMATIC_PUBLICATION_UNCONFIRMED';
+      Object.assign(data.automatic, { status: 'uncertain', human_attention_required: true });
+    }
     if (section === 'implementer') {
       const role = task.implementer, ledger = task.local_execution_evidence;
       data = { provenance: 'retained_model_statements_and_adapter_observations', state: typed(reportState, role.state),
@@ -2680,7 +2811,10 @@ export class Controller {
       clarification_required: view.clarification_required, human_attention_required: view.human_attention_required });
     if (view.error) fresh[role].error = view.error; else delete fresh[role].error;
     this.retainAPIItems(fresh, role, [...page.data].reverse(), view.turn_id);
-    if (role === 'reviewer') fresh[role].review_result = view.overall ? { overall: view.overall, findings: view.findings, packet_hash: ref.packet_hash, turn_id: view.turn_id } : null;
+    if (role === 'reviewer') {
+      fresh[role].review_result = view.overall ? { overall: view.overall, findings: view.findings, packet_hash: ref.packet_hash, turn_id: view.turn_id } : null;
+      fresh[role].findings_sha256 = fresh[role].review_result ? digest(fresh[role].review_result) : null;
+    }
     this.save(fresh);
     return view;
   }
@@ -2759,9 +2893,12 @@ export class Controller {
           completion_confirmed: completion(record) })),
         commands_truncated: results.length > 10 }, review, publication } };
   }
-  async get(id, refresh = true) {
+  async get(id, refresh = true, retainedReporting = false) {
     let storageDiagnostic;
-    try { this.storageAuthority(); }
+    try {
+      if (!retainedReporting) this.storageAuthority();
+      else if (this.transactionUnresolved || this.db.isTransaction || this.transactionOwner) throw new BridgeError('STORAGE_TRANSACTION_UNRESOLVED');
+    }
     catch (error) { refresh = false; storageDiagnostic = error instanceof BridgeError ? error.code : 'STORAGE_UNAVAILABLE'; }
     let t = this.task(id);
     const versioned = !!t.correction || !!t.automatic;
@@ -2816,7 +2953,7 @@ export class Controller {
         usage: { implementer_turn_submissions_attempted: t.implementer.local.turn_submission_attempted === true ? 1 : t.implementer.local.turn_submission_attempted === false ? 0 : null,
           reviewer_turn_submissions_attempted: !t.reviewer ? this.db.prepare('SELECT id FROM operations WHERE id=? AND task_id=?').get(t.automatic.review_request_id, id) ? null : 0 : t.reviewer.local.turn_submission_attempted === true ? 1 : t.reviewer.local.turn_submission_attempted === false ? 0 : null, correction_turns: t.automatic.correction ? null : 0,
           token_usage: null, subscription_billing_attribution: 'unverified' } };
-      result.automatic.review = await this.automaticReviewSummary(t);
+      result.automatic.review = await this.automaticReviewSummary(t, retainedReporting);
       if (t.automatic.reconciliation) result.automatic.reconciliation = {
         outcome: this.bounded(t.automatic.reconciliation.outcome, 64), confirmed: t.automatic.reconciliation.confirmed === true,
         attempt_id: this.bounded(t.automatic.reconciliation.attempt_id, 100), publication_id: this.bounded(t.automatic.reconciliation.publication_id, 100),
@@ -2873,7 +3010,7 @@ export class Controller {
         result.state = 'needs_attention'; result.implementer.local.turn_submission_attempted = result.correction.execution.turn_submission_attempted;
       }
       if (child.automatic) {
-        const review = await this.correctiveReviewSummary(child);
+        const review = await this.correctiveReviewSummary(child, retainedReporting);
         result.correction.review = review;
         result.correction.state = review.qualified ? 'reviewed' : review.uncertain ? 'needs_attention' : 'validation_and_review';
         result.correction.terminal_confirmed = !uncertain && review.qualified;
@@ -2893,7 +3030,7 @@ export class Controller {
             potentially_correctable: false, execution_authorized: false };
         }
         if (child.automatic.corrective_publication) {
-          const publication = this.correctivePublicationSummary(child);
+          const publication = retainedReporting ? await this.qualifyPublicationEvidence(child) : this.correctivePublicationSummary(child);
           result.correction.publication = publication;
           result.publication = publication.confirmed ? publicationResult(child.publication) : publication;
           if (publication.uncertain) {

@@ -124,6 +124,140 @@ async function reportingPublication(c, id, client) {
   return status.publication;
 }
 
+test('shared publication proof rejects SSH B historical matched-absence reproduction', async context => {
+  const { c, id, work, input, review } = await setup(context);
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); await c.publish(input);
+  const task = c.task(id), p = task.publication, ref = task.reviewer;
+  delete p.reviewed_tree_sha; delete ref.reviewed_git_state.tree_sha;
+  delete p.review_packet_sha256; delete ref.packet_hash; delete ref.review_result.packet_hash;
+  delete p.reviewer_session_id; delete ref.session_id;
+  delete p.reviewer_turn_id; delete ref.turn_id; delete ref.review_result.turn_id;
+  delete p.pushed_branch; delete task.repository.branch; delete ref.findings_sha256;
+  // Simulate an incomplete retained historical record without asking the
+  // Controller mutation/validation path to endorse it.
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const before = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value;
+  assert.equal((await reportingPublication(c, id)).confirmed, false);
+  assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, before);
+});
+
+for (const mode of ['agents_api', 'local_manual', 'automatic', 'versioned', 'corrective'])
+test(`shared publication proof independently rejects absent, paired and conflicting ${mode} evidence`, async context => {
+  const automatic = ['automatic', 'versioned', 'corrective'].includes(mode);
+  const value = await setup(context, ['one.txt'], mode !== 'agents_api', automatic ? ['cat one.txt'] : [], automatic ?
+    { ...(mode !== 'automatic' ? { versioned: true } : {}), ...(mode === 'corrective' ? { corrective: true, publishCorrection: true } : {}) } : undefined);
+  const { c, publisher, api } = value;
+  if (automatic) await automaticSettled(value);
+  else { await fs.writeFile(path.join(value.work, 'one.txt'), 'exact\n'); await value.review(); await c.publish(value.input); }
+  clearInterval(c.sweeper);
+  const original = c.task(value.id), target = mode === 'corrective' ? c.task(original.automatic.correction.task_id) : original;
+  const ids = mode === 'corrective' ? [original.id, target.id] : [target.id];
+  const originals = ids.map(id => [id, c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value]);
+  const operations = c.db.prepare('SELECT * FROM operations ORDER BY id').all();
+  const server = createServer(c, async () => {}), client = new Client({ name: 'publication-proof', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  const forbidden = [], methods = new Map();
+  for (const method of ['save', 'observe', 'viewRole', 'publish', 'continue', 'review', 'currentReviewPacket', 'verifyLocalReviewPacket',
+    'repositoryEvidence', 'reconcileAutomaticEvidence', 'reconcileAutomaticPublication']) {
+    methods.set(method, c[method]); c[method] = () => { forbidden.push(method); throw Error(`Reporting invoked ${method}`); };
+  }
+  const apiMethods = [api.retrieve, api.items.list, api.turns.list];
+  api.retrieve = api.items.list = api.turns.list = () => { forbidden.push('API'); throw Error('API forbidden'); };
+  const ledger = () => JSON.stringify(['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'].map(table => c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const files = await publicationFiles(c.workspaceRoot), source = await publicationFiles(value.normal), calls = [...publisher.calls];
+  const authority = JSON.stringify([c.transactionUnresolved, [...c.persistenceFailures], [...c.jobs.keys()], value.localCalls, api.sent, api.created]);
+  const cases = [];
+  const remove = paths => row => { for (const name of paths) { const parts = name.split('.'), key = parts.pop(); const parent = parts.reduce((value, part) => value?.[part], row); if (parent) delete parent[key]; } };
+  const fields = ['publication_frozen', 'publication.task_id', 'publication.reviewed_tree_sha', 'publication.review_packet_sha256', 'publication.commit_sha',
+    'publication.pushed_branch', 'publication.reviewer_turn_id', 'publication.input_sha256', 'publication.push_attempted', 'publication.pr_attempted',
+    'publication.commit_tree_matches_reviewed_tree', 'publication.review_overall', 'publication.pr_number', 'publication.pr_url',
+    'publication.prepared_at', 'publication.completed_at', 'publication.target.repository', 'publication.target.base', 'baseline',
+    'repository.baseline_commit', 'repository.branch', 'reviewer.packet_hash', 'reviewer.findings_sha256', 'reviewer.review_result',
+    'reviewer.review_result.packet_hash', 'reviewer.review_result.turn_id', 'reviewer.review_result.findings', 'reviewer.review_result.overall',
+    'reviewer.reviewed_git_state.tree_sha', automatic ? 'automatic.contract_binding.sha256' : 'evidence_contract.sha256',
+    automatic ? 'automatic.contract_binding.contract' : 'evidence_contract.contract'];
+  if (mode === 'agents_api') fields.push('publication.reviewer_session_id', 'reviewer.session_id', 'reviewer.turn_id', 'implementer.session_id');
+  else fields.push('publication.reviewer_backend', 'publication.reviewer_session_id', 'publication.reviewer_thread_id', 'reviewer.local.thread_id', 'reviewer.local.turn_id', 'reviewer.local.model',
+    'reviewer.review_result.thread_id', 'reviewer.review_result.reviewed_git_state.tree_sha', 'reviewer.received_output_sha256',
+    'reviewer.received_review_output', 'reviewer.received_review_output.output_sha256');
+  for (const field of fields) cases.push({ name: `missing ${field}`, mutate: remove([field]) });
+  for (const paths of [
+    ['publication.reviewed_tree_sha', 'reviewer.reviewed_git_state.tree_sha', 'reviewer.review_result.reviewed_git_state.tree_sha'],
+    ['publication.review_packet_sha256', 'reviewer.packet_hash', 'reviewer.review_result.packet_hash'],
+    ['publication.reviewer_turn_id', mode === 'agents_api' ? 'reviewer.turn_id' : 'reviewer.local.turn_id', 'reviewer.review_result.turn_id'],
+    ['publication.pushed_branch', 'repository.branch'], ['reviewer.findings_sha256', 'reviewer.review_result'],
+    mode === 'agents_api' ? ['publication.reviewer_session_id', 'reviewer.session_id'] :
+      ['publication.reviewer_thread_id', 'reviewer.local.thread_id', 'reviewer.review_result.thread_id'],
+  ]) cases.push({ name: `matched absence ${paths.join(', ')}`, mutate: remove(paths) });
+  cases.push({ name: 'mismatched findings identity', mutate(row) { row.reviewer.findings_sha256 = 'a'.repeat(64); } },
+    { name: 'invalid findings with matching digest', mutate(row) { row.reviewer.review_result.findings = []; row.reviewer.findings_sha256 = digest(row.reviewer.review_result); } },
+    { name: 'wrong tree type on both sides', mutate(row) { row.publication.reviewed_tree_sha = row.reviewer.reviewed_git_state.tree_sha = {}; } },
+    { name: 'unknown attempt flags', mutate(row) { row.publication.push_attempted = 'unknown'; row.publication.pr_attempted = null; }, unknown: true });
+  for (const operation of operations) for (const fault of ['missing', 'pending', 'uncertain', 'conflicting']) cases.push({
+    name: `${fault} operation ${operation.id}`, operation, fault });
+  if (automatic) cases.push({ name: 'publication input conflicts with original authorization', mutate(row) { row.publication.input_sha256 = 'a'.repeat(64); } });
+  if (mode === 'corrective') {
+    for (const field of ['automatic.corrective_publication', 'automatic.corrective_publication_result', 'reviewer.packet_hash',
+      'reviewer.findings_sha256', 'reviewer.reviewed_git_state.tree_sha', 'reviewer.local.thread_id', 'reviewer.local.turn_id',
+      'repository.branch', 'repository.baseline_commit', 'automatic.contract_binding.sha256']) {
+      cases.push({ name: `missing original ${field}`, parent: remove([field]) });
+    }
+    cases.push({ name: 'both corrective publication bindings absent', parent: remove(['automatic.corrective_publication']), mutate: remove(['automatic.corrective_publication']) },
+      { name: 'inconsistent parent/child lineage', parent(row) { row.automatic.correction.rejected_tree_sha = 'a'.repeat(40); } });
+  }
+  const restore = () => {
+    for (const [id, text] of originals) c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(text, id);
+    for (const operation of operations) c.db.prepare('INSERT OR REPLACE INTO operations(id,fingerprint,task_id,status) VALUES(?,?,?,?)')
+      .run(operation.id, operation.fingerprint, operation.task_id, operation.status);
+  };
+  try {
+    for (const id of ids) assert.equal((await reportingPublication(c, id, client)).confirmed, true);
+    for (const item of cases) {
+      restore();
+      const row = structuredClone(target), parent = structuredClone(original);
+      item.mutate?.(row); item.parent?.(parent);
+      c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(row), target.id);
+      if (mode === 'corrective') c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(parent), original.id);
+      if (item.operation) {
+        if (item.fault === 'missing') c.db.prepare('DELETE FROM operations WHERE id=?').run(item.operation.id);
+        else c.db.prepare('UPDATE operations SET status=?,fingerprint=? WHERE id=?').run(
+          item.fault === 'conflicting' ? 'accepted' : item.fault, item.fault === 'conflicting' ? 'a'.repeat(64) : item.operation.fingerprint, item.operation.id);
+      }
+      const before = ledger(); let writes = 0;
+      c.db.setAuthorizer(action => {
+        if ([sqlite.SQLITE_INSERT, sqlite.SQLITE_UPDATE, sqlite.SQLITE_DELETE].includes(action)) { writes++; return sqlite.SQLITE_DENY; }
+        return sqlite.SQLITE_OK;
+      });
+      try {
+        for (const id of ids) for (let count = 0; count < 2; count++) {
+          const result = await reportingPublication(c, id, client);
+          assert.equal(result.confirmed, false, item.name); assert.equal(result.live_github_verified, false);
+          if (item.unknown || item.name.endsWith('publication.push_attempted')) assert.equal(result.push_attempted, null, item.name);
+          if (item.unknown || item.name.endsWith('publication.pr_attempted')) assert.equal(result.pr_attempted, null, item.name);
+        }
+        assert.equal(writes, 0, item.name); assert.equal(ledger(), before, item.name);
+      } finally { c.db.setAuthorizer(null); }
+    }
+    context.diagnostic(`${mode}: ${cases.length} independently varied negative records; both paginated interfaces, repeated reads.`);
+    assert.deepEqual(forbidden, []); assert.deepEqual(publisher.calls, calls);
+    assert.equal(await publicationFiles(c.workspaceRoot), files); assert.equal(await publicationFiles(value.normal), source);
+    assert.equal(JSON.stringify([c.transactionUnresolved, [...c.persistenceFailures], [...c.jobs.keys()], value.localCalls, api.sent, api.created]), authority);
+  } finally {
+    restore(); for (const [method, original] of methods) c[method] = original;
+    [api.retrieve, api.items.list, api.turns.list] = apiMethods;
+  }
+  for (const id of ids) await c.cleanup({ task_id: id, delete_workspace: true });
+  await c.close();
+  const recovered = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, api, executor: value.executor,
+    publisher, secrets: [], localBackendFactory: () => assert.fail('Historical reporting cannot execute a model') }).init();
+  try {
+    const before = JSON.stringify(recovered.db.prepare('SELECT * FROM tasks ORDER BY id').all()), calls = [...publisher.calls];
+    for (const id of ids) for (let count = 0; count < 2; count++) assert.equal((await reportingPublication(recovered, id)).confirmed, true);
+    assert.equal(JSON.stringify(recovered.db.prepare('SELECT * FROM tasks ORDER BY id').all()), before); assert.deepEqual(publisher.calls, calls);
+  } finally { await recovered.close(); }
+});
+
 for (const local of [false, true]) test(`reporting publication preserves confirmed ${local ? 'local' : 'Agents API'} completion and attempt flags on both read-only surfaces`, async context => {
   const { c, id, work, input, review, publisher, api } = await setup(context, ['one.txt'], local);
   await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); await c.publish(input);
@@ -592,8 +726,11 @@ for (const uncertain of [false, true]) test(`corrective publication parent and c
       const missing = await publicationFiles(c.workspaceRoot);
       for (const id of [parent.id, child.id]) {
         const response = await client.callTool({ name: 'get_task', arguments: { task_id: id } }); assert.notEqual(response.isError, true);
-        assert.equal(response.structuredContent.correction.review.qualified, false);
-        assert.equal(response.structuredContent.correction.review.overall, null);
+        assert.equal(response.structuredContent.correction.review.qualified, true);
+        assert.equal(response.structuredContent.correction.review.current_authority_verified, false);
+        assert.equal(response.structuredContent.correction.review.overall, 'PASS');
+        assert.equal(response.structuredContent.correction.publication.confirmed, true);
+        assert.equal((await c.correctiveReviewSummary(child)).qualified, false);
         assert.equal(response.structuredContent.correction.publication.execution_authorized, false);
       }
       await assert.rejects(fs.stat(object), { code: 'ENOENT' });
