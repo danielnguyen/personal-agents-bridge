@@ -2,6 +2,8 @@ import { reviewerInstructions } from './reviewer-instructions.mjs';
 import { budgetPacket, packetSizeDiagnostic } from './packet-budget.mjs';
 import { captureFileRpcEvidence } from './file-rpc-evidence.mjs';
 import OpenAI from 'openai';
+import { deepRedact } from '@hackylabs/deep-redact';
+import { z } from 'zod';
 import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
 import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
@@ -37,70 +39,175 @@ async function settledWithin(promise, timeout = 3000) {
 }
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export class BridgeError extends Error { constructor(code) { super(code); this.code = code; } }
-function redactAuthorizationHeaders(text, depth = 0, headers = false) {
-  if (depth > 64) throw new Error('AUTHORIZATION_REDACTION_DEPTH');
-  // Header values end at the physical line boundary, including quoted Digest
-  // parameters. Do not let generic whitespace/token filters split credentials.
-  const lines = value => value.replace(/((?<![\w-])(?:Proxy-)?Authorization[\t ]*["']?[\t ]*:[\t ]*)[^\r\n\u2028\u2029]*/gi, '$1[REDACTED]');
-  let parsed;
-  try { parsed = JSON.parse(text); } catch {
-    // Malformed/truncated JSON can hide a header name behind escapes. Do not
-    // project it using a raw-text shortcut that cannot interpret those keys.
-    return /^\s*[\[{"]/.test(text) ? '[REDACTED]' : lines(text);
-  }
-  const object = value => value && typeof value === 'object' && !Array.isArray(value);
-  const keysWithin = (value, keys) => Object.keys(value).every(key => keys.includes(key));
-  const optional = (value, key, test) => !Object.hasOwn(value, key) || test(value[key]);
-  const config = value => object(value) && [2, 3, 4].includes(value.max_codex_turns) &&
-    object(value.publish) && value.publish.draft === true && keysWithin(value.publish, ['title', 'body', 'draft']) &&
-    ['title', 'body'].every(key => optional(value.publish, key, item => typeof item === 'string')) &&
-    keysWithin(value, ['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol', 'publish_after_correction']) &&
-    ['max_duration_seconds', 'max_corrections'].every(key => optional(value, key, Number.isInteger)) &&
-    optional(value, 'review_protocol', item => item === LOCAL_ACTIONABILITY_REVIEW_VERSION) &&
-    optional(value, 'publish_after_correction', item => typeof item === 'boolean');
-  // Lowercase `authorization` is also Controller task authority data. Preserve
-  // only its known object shapes, never arbitrary header objects/arrays. This
-  // classification grants no authority; the existing binding checks still do.
-  const authority = value => object(value) && (
-    config(value) ||
-    (/^[a-f0-9]{64}$/.test(value.authorization_sha256 || '') &&
-      keysWithin(value, ['task_id', 'authorization_sha256', 'contract_sha256', 'baseline_commit', 'deadline', 'owner_instance',
-        'review_request_id', 'publish_request_id', 'request_fingerprint', 'parent_task_id', 'lineage_sha256',
-        'parent_review_authorization_sha256', 'operation_id', 'original_request_id', 'original_request_fingerprint', 'lineage',
-        'rejected_tree_sha', 'rejected_packet_sha256', 'rejected_findings_sha256', 'reviewed_tree_sha', 'packet_sha256',
-        'findings_sha256', 'reviewer_thread_id', 'reviewer_turn_id', 'validation_attempt_id', 'validation_sha256', 'branch', 'input']) &&
-      Object.entries(value).every(([key, item]) => key === 'deadline' ? Number.isFinite(item) :
-        ['lineage', 'input'].includes(key) ? object(item) : typeof item === 'string')) ||
-    (config(value.authorization) &&
-      keysWithin(value, ['authorization', 'contract_binding', 'review_authorization', 'deadline', 'owner_instance', 'review_request_id', 'publish_request_id'])));
-  // Receipts and packets may contain JSON-encoded headers or model messages.
-  // Sanitize their string values without consuming JSON delimiters/other fields.
-  let changed = false, keys = 0;
-  const visit = (value, level, inHeaders) => {
-    if (level > 64) throw new Error('AUTHORIZATION_REDACTION_DEPTH');
-    if (typeof value === 'string') {
-      const safe = redactAuthorizationHeaders(value, level + 1, inHeaders); changed ||= safe !== value; return safe;
-    }
-    if (Array.isArray(value)) return value.map(item => visit(item, level + 1, inHeaders));
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => {
-      keys++;
-      if (/^(?:Proxy-)?Authorization$/i.test(key.trim()) && !(key === 'authorization' && !inHeaders && (item === null || authority(item)))) {
-        changed ||= item !== '[REDACTED]'; return [key, '[REDACTED]'];
-      }
-      return [key, visit(item, level + 1, inHeaders || /^headers$/i.test(key.trim()))];
-    }));
-    return value;
-  };
-  const sanitized = visit(parsed, depth, headers);
-  // JSON.parse discards duplicate keys. Never return raw text containing hidden
-  // values that traversal could not inspect, even if the surviving value is safe.
-  const rawKeys = [...text.matchAll(/"(?:\\.|[^"\\])*"(\s*:)?/g)].filter(match => match[1]).length;
-  return changed || rawKeys !== keys ? JSON.stringify(sanitized) : text;
+// Reporting is a disclosure boundary, not a sanitizer for arbitrary text. Every
+// string admitted below is a fixed vocabulary or a narrowly typed identity.
+const reportState = z.enum(['starting', 'running', 'finishing', 'completed', 'failed', 'cancelled', 'interrupted', 'uncertain',
+  'stopped', 'expired', 'needs_attention', 'waiting_for_clarification', 'waiting_for_approval', 'resolved', 'responding', 'cleaned', 'progressing', 'succeeded', 'awaiting_review',
+  'validation_and_review', 'reviewed', 'reserved', 'pending', 'passed', 'validating', 'malformed_or_uncertain', 'HOLD', 'not_started', 'unavailable']).catch('unavailable');
+const reportPhase = z.enum(['implementation', 'independent_validation', 'independent_review', 'validation_and_review', 'correction',
+  'publication', 'provisioning', 'preflight', 'finished', 'restart_attention', 'model_selected', 'thread_acknowledged',
+  'turn_submitting', 'turn_acknowledged', 'turn_running', 'terminal', 'complete', 'frozen', 'push_attempted', 'pushed', 'pr_attempted']).catch('unavailable');
+const reportCode = z.enum(['TASK_EXPIRED', 'LOCAL_HUMAN_ATTENTION_REQUIRED', 'HUMAN_ATTENTION_REQUIRED', 'LOCAL_TURN_INTERRUPTED',
+  'LOCAL_TURN_UNCERTAIN', 'LOCAL_TURN_FAILED', 'LOCAL_CLOSE_UNCONFIRMED', 'LOCAL_RESULT_UNVERIFIED', 'LOCAL_REVIEW_INVALID',
+  'AUTOMATIC_REVIEW_FAIL', 'AUTOMATIC_TASK_STOPPED', 'AUTOMATIC_RESTART_NO_REPLAY', 'AUTOMATIC_OWNER_UNAVAILABLE',
+  'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', 'AUTOMATIC_PUBLICATION_UNCONFIRMED', 'PR_RESPONSE_UNCONFIRMED',
+  'REVIEW_EVIDENCE_UNVERIFIED', 'REVIEW_RESULT_UNAVAILABLE', 'CORRECTIVE_EVIDENCE_UNVERIFIED', 'CORRECTIVE_REVIEW_NOT_AUTHORIZED',
+  'CORRECTION_EXECUTION_DISABLED', 'CORRECTION_BUDGET_RESERVED', 'CORRECTION_BUDGET_EXHAUSTED', 'QUALIFIED_REVIEW_FAIL_REQUIRED',
+  'SCOPE_UNQUALIFIED', 'TEST_EVIDENCE_UNQUALIFIED', 'EXECUTION_UNQUALIFIED', 'ORIGINAL_AUTHORITY_UNCONFIRMED',
+  'ACTIONABILITY_EVIDENCE_UNAVAILABLE', 'CONTROLLER_REVIEW_DISAGREEMENT', 'INDEPENDENT_REVIEW_UNCONFIRMED',
+  'PUBLICATION_REQUIRES_PASS_REVIEW', 'AUTOMATIC_HUMAN_ATTENTION_REQUIRED', 'AUTOMATIC_CANCELLED',
+  'AUTOMATIC_SHUTDOWN_NO_REPLAY', 'AUTOMATIC_EXECUTION_UNCONFIRMED', 'AUTOMATIC_OPERATION_UNCONFIRMED',
+  'AUTOMATIC_VALIDATION_FAILED', 'AUTOMATIC_IMPLEMENTATION_UNQUALIFIED', 'CORRECTIVE_REVIEW_RETAINED', 'CORRECTIVE_REVIEW_UNCONFIRMED',
+  'CORRECTION_REQUIRES_INDEPENDENT_REVIEW',
+  'UNCERTAINTY_UNRESOLVED', 'NON_IMPLEMENTATION_FINDING', 'HUMAN_APPROVAL_REQUIRED', 'STORAGE_UNAVAILABLE',
+  'UNCLASSIFIED_WITHHELD']).catch('UNCLASSIFIED_WITHHELD').nullable();
+const reportHash = z.string().regex(/^[a-f0-9]{64}$/).nullable().catch(null);
+const reportGit = z.string().regex(/^[a-f0-9]{40}$/).nullable().catch(null);
+const reportTaskId = z.string().regex(/^task_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).nullable().catch(null);
+const reportNumber = z.number().finite().safe().nullable().catch(null);
+const reportInteger = z.number().int().safe().nullable().catch(null);
+const reportBool = z.boolean().catch(false);
+const reportVerdict = z.enum(['PASS', 'FAIL']).nullable().catch(null);
+const reportFindingId = z.string().regex(/^(?:R[1-9][0-9]{0,2}|I[1-9][0-9]{0,2}|SCOPE|TEST_EVIDENCE)$/).nullable().catch(null);
+const reportKind = z.enum(['implementation_defect', 'missing_evidence', 'scope_or_security_failure', 'human_decision_required', 'unknown_cause']).nullable().catch(null);
+const list = (value, max) => Array.isArray(value) ? value.slice(0, max) : [];
+const typed = (schema, value) => schema.parse(value ?? null);
+const reportTree = value => ({ tree_sha: typed(reportGit, value?.tree_sha), baseline_commit: typed(reportGit, value?.baseline_commit) });
+const reportReference = value => { try { return value == null ? null : digest(value); } catch { return null; } };
+const withheld = (value, reason = 'UNSTRUCTURED_WITHHELD') => ({ unavailable: value == null, withheld: value != null,
+  reason, retained_reference: reportReference(value) });
+const reportFlags = value => Object.fromEntries(['truncated', 'redacted', 'missing', 'unavailable', 'start_observed', 'completion_observed',
+  'termination_confirmed', 'independently_observed', 'timeout', 'cancelled'].map(key => [key, value?.[key] === true]));
+
+// Approved decoded subtrees: retained stream/command observation envelopes only.
+// Text/value fields are opaque and always removed in full; they are never parsed
+// as JSON, Markdown, logs or encoded strings. The library is not an admission rule.
+const redactObservation = deepRedact({ keys: ['authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'password', 'secret',
+  'token', 'api-key', 'text', 'value', 'command', 'output', 'stdout', 'stderr'], caseSensitiveKeyMatch: false,
+  types: ['string', 'object', 'number', 'boolean', 'undefined'], maxDepth: 16, maxNodes: 2048,
+  onBudgetExceeded: 'throw', retainStructure: false, serialise: true });
+export function discloseObservation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...reportFlags(null), ...withheld(value) };
+  try {
+    // Only this existing envelope is approved for decoded traversal. No arbitrary
+    // library result, dynamic key or string becomes a disclosure field.
+    const safe = JSON.parse(redactObservation(value));
+    return { ...withheld(value), ...reportFlags(safe), redacted: true,
+      exit_code: typed(reportInteger, safe.exit_code), command_index: typed(reportInteger, safe.command_index),
+      status: typed(reportState, safe.status), bytes_observed: typed(reportInteger, safe.bytes_observed) };
+  } catch { return { ...withheld(value, 'UNSUPPORTED_OR_EXCESSIVE_WITHHELD'), redacted: true }; }
 }
+const reportLimits = z.object({ max_duration_seconds: reportInteger, max_codex_turns: reportInteger, max_corrections: reportInteger,
+  review_protocol: z.enum(['pab.local-review.v2', LOCAL_ACTIONABILITY_REVIEW_VERSION]).nullable().catch(null),
+  publish_after_correction: reportBool }).nullable().catch(null);
+const reportLocal = z.object({ phase: reportPhase, execution_state: reportState, turn_submission_attempted: reportBool,
+  turn_submission_acknowledged: reportBool, terminal_observed: reportBool, result_received: reportBool,
+  server_closed: reportBool, human_attention_required: reportBool }).nullable().catch(null);
+const reportCleanup = z.object(Object.fromEntries(['executor_stopped', 'remote_session_deleted', 'server_closed', 'cancellation_confirmed',
+  'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted'].map(key => [key, reportBool]))).nullable().catch(null);
+const reportPublication = z.object({ phase: reportPhase, reviewed_tree_sha: reportGit, commit_sha: reportGit,
+  commit_tree_matches_reviewed_tree: reportBool, push_attempted: reportBool, pr_attempted: reportBool, pr_number: reportInteger,
+  draft: reportBool, confirmed: reportBool, uncertain: reportBool }).nullable().catch(null);
+const reportReviewSummary = z.object({ state: z.enum(['not_started', 'pass', 'fail', 'potentially_correctable_fail', 'non_correctable_fail',
+  'malformed_or_uncertain']).catch('malformed_or_uncertain'), potentially_correctable: reportBool,
+  execution_authorized: z.literal(false).catch(false), blockers: z.array(reportCode).max(16).catch([]) }).nullable().catch(null);
+const reportRole = z.object({ state: reportState, local: reportLocal, overall: reportVerdict,
+  human_attention_required: reportBool, clarification_required: reportBool, error: reportCode,
+  packet_hash: reportHash, reviewed_git_state: z.object({ tree_sha: reportGit, baseline_commit: reportGit }).optional() }).nullable().catch(null);
+const reportAttemptStatus = z.enum(['not_attempted', 'attempted_unconfirmed', 'confirmed_completed', 'confirmed_failed', 'unknown']).catch('unknown');
+const reportAttempt = z.object({ status: reportAttemptStatus, result: reportVerdict.optional(),
+  commands: z.array(z.object({ command_index: reportInteger, completion_confirmed: reportBool })).max(10).optional(),
+  commands_truncated: reportBool.optional() });
+const reportProgress = z.object({ stage: reportPhase.nullable(), last_confirmed_stage: reportPhase.nullable(),
+  interrupted: reportBool, resume_authorized: z.literal(false).catch(false), attempts: z.object({ implementation: reportAttempt,
+    validation: reportAttempt, review: reportAttempt, publication: reportAttempt }) }).optional();
+const reportCorrectiveReview = z.object({ state: reportState, overall: reportVerdict, qualified: reportBool, uncertain: reportBool,
+  reason: reportCode, corrected_tree_sha: reportGit, attempted_turns: reportInteger, reserved_turns: reportInteger,
+  execution_authorized: z.literal(false).catch(false), publication_authorized: z.literal(false).catch(false),
+  validation: z.object({ status: reportState, qualified: reportBool, termination_confirmed: reportBool,
+    results: z.array(z.object({ command_index: reportInteger, status: reportState, exit_code: reportInteger,
+      start_observed: reportBool, completion_observed: reportBool, termination_confirmed: reportBool })).max(10) }) }).optional();
+const reportWithheld = z.object({ unavailable: reportBool, withheld: reportBool, reason: z.enum(['UNSTRUCTURED_WITHHELD',
+  'UNSUPPORTED_OR_EXCESSIVE_WITHHELD']), retained_reference: reportHash });
+export const taskReportSchema = z.object({ task_id: reportTaskId, state: reportState,
+  execution_backend: z.enum(['agents_api', 'local_codex']).catch('agents_api'), implementer: reportRole, reviewer: reportRole,
+  cleanup: reportCleanup, expires_at: z.string().datetime().nullable().catch(null),
+  automatic: z.object({ status: reportState, phase: reportPhase, reason: reportCode, human_attention_required: reportBool,
+    limits: reportLimits, review: reportReviewSummary, progress: reportProgress,
+    reconciliation: z.object({ confirmed: reportBool, outcome: z.enum(['completed', 'evidence_unconfirmed', 'publication_unconfirmed']).catch('evidence_unconfirmed'), reason: reportCode }).optional(),
+    evidence_retention: z.object({ packet: z.enum(['retained', 'pending', 'unavailable']).catch('unavailable'),
+      review: z.enum(['retained', 'pending', 'awaiting_receipt', 'unavailable']).catch('unavailable'),
+      received_output: z.enum(['durable', 'volatile_only', 'unavailable']).catch('unavailable'),
+      received_output_complete: reportBool, reconciliation_required: reportBool }).optional(),
+    usage: z.object({ implementer_turn_submissions_attempted: reportInteger, reviewer_turn_submissions_attempted: reportInteger,
+      correction_turns: reportInteger, token_usage: z.null().catch(null), corrective_reviewer_turn_submissions_attempted: reportInteger.optional(),
+      total_codex_turn_submissions_attempted: reportInteger.optional() }).optional() }).optional(),
+  correction: z.object({ parent_task_id: reportTaskId, task_id: reportTaskId, state: reportState, reason: reportCode,
+    rejected_tree_sha: reportGit, baseline_commit: reportGit, remaining_codex_turns: reportInteger, remaining_corrections: reportInteger,
+    execution_authorized: z.literal(false).catch(false), retention_uncertain: reportBool, attempted_corrections: reportInteger,
+    reserved_corrections: reportInteger, terminal_confirmed: reportBool, codex_turns_attempted: reportInteger.optional(),
+    review: reportCorrectiveReview, execution: reportLocal.optional(), publication: reportPublication.optional() }).optional(),
+  repository: z.object({ baseline_commit: reportGit }).optional(), publication: reportPublication.optional(),
+  storage_diagnostic: reportCode.optional(), disclosure: z.literal('typed_metadata_only').optional(),
+  explanation: z.object({ provenance: z.literal('controller_summary_of_retained_evidence'), state: reportState, reason: reportCode,
+    failed_requirements: z.array(reportFindingId).max(52), failed_validation_commands: z.array(z.object({ index: reportInteger,
+      exit_code: reportInteger, status: reportState })).max(10), details: reportWithheld, execution_authorized: z.literal(false) }).optional(),
+  evidence: z.object({ operation: z.literal('get_task_evidence'), task_id: reportTaskId,
+    sections: z.array(z.enum(['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'])).max(6) }).optional(),
+  remaining_authority: z.object({ remaining_codex_turns: reportInteger, remaining_corrections: reportInteger,
+    execution_authorized: z.literal(false), publication_authorized: z.literal(false) }).optional(),
+  next_steps: z.array(z.enum(['owner_inspect_withheld_evidence', 'consider_authorized_correction', 'request_new_task', 'owner_resolve_attention', 'no_automatic_replay'])).max(4).optional() });
+const reportTreeSchema = z.object({ tree_sha: reportGit, baseline_commit: reportGit });
+const reportFlagsSchema = z.object(Object.fromEntries(['truncated', 'redacted', 'missing', 'unavailable', 'start_observed', 'completion_observed',
+  'termination_confirmed', 'independently_observed', 'timeout', 'cancelled'].map(key => [key, reportBool.optional()])));
+const reportStream = reportWithheld.merge(reportFlagsSchema).extend({ exit_code: reportInteger.optional(), command_index: reportInteger.optional(),
+  status: reportState.optional(), bytes_observed: reportInteger.optional() });
+const reportCorrection = z.object({ parent_task_id: reportTaskId, task_id: reportTaskId, rejected_tree_sha: reportGit,
+  baseline_commit: reportGit, execution_authorized: z.literal(false) }).nullable();
+const reportValidation = z.object({ provenance: z.literal('controller_process_observation'), unavailable: reportBool, status: reportState,
+  diagnostic: reportCode, reviewed_git_state: reportTreeSchema, termination_confirmed: reportBool, original_unchanged: reportBool,
+  results: z.array(reportFlagsSchema.extend({ index: reportInteger, command_index: reportInteger, command: reportWithheld,
+    candidate_tree: reportGit, status: reportState, diagnostic: reportCode, exit_code: reportInteger, stdout: reportStream, stderr: reportStream })).max(10), truncated: reportBool });
+const reportReview = z.object({ provenance: z.literal('independent_reviewer_with_controller_qualification'), unavailable: reportBool,
+  qualification: z.literal('retained_result_binding_only'), current_authority_verified: z.literal(false), execution_authorized: z.literal(false),
+  packet_sha256: reportHash, reviewed_git_state: reportTreeSchema, overall: reportVerdict, model_overall: reportVerdict,
+  controller_overrides: z.array(reportFindingId).max(52), findings: z.array(z.object({ index: reportInteger, id: reportFindingId,
+    obligation_index: reportInteger, id_sha256: reportHash, status: reportVerdict, evidence: reportWithheld,
+    classification: z.object({ kind: reportKind, target_files: z.array(z.object({ file_index: reportInteger, path_sha256: reportHash })).max(8),
+      remedy: z.object({ kind: z.literal('edit_files').nullable(), requires_human_approval: reportBool, description: reportWithheld }) }) })).max(52),
+  findings_truncated: reportBool, model_output: reportWithheld.extend({ provenance: z.literal('model_statement'), complete: reportBool,
+    qualified: z.literal(false) }), retained_reference: reportHash });
+const evidenceSchemas = {
+  outcome: z.object({ provenance: z.literal('controller_retained_task_state'), state: reportState, reason: reportCode, reason_details: reportWithheld,
+    expires_at: reportNumber, expired_now: reportBool, automatic: z.object({ status: reportState, phase: reportPhase,
+      human_attention_required: reportBool, limits: reportLimits }).nullable(), correction: reportCorrection, correction_state: reportState,
+    publication: reportPublication, publication_error: reportCode, cleanup: reportCleanup, workspace_deleted: reportBool,
+    execution_authorized: z.literal(false), retention_uncertain: reportBool }),
+  implementer: z.object({ provenance: z.literal('retained_model_statements_and_adapter_observations'), state: reportState, local: reportLocal,
+    error: reportCode, diagnostics: z.array(reportCode).max(12), messages: z.array(reportWithheld.extend({ provenance: z.literal('model_statement'),
+      truncated: reportBool, redacted: reportBool })).max(16), latest_model_output: reportWithheld, messages_unavailable: reportBool,
+    messages_omitted: reportInteger, commands: z.array(reportFlagsSchema.extend({ index: reportInteger, provenance: z.literal('codex_app_server_notification'),
+      exit_code: reportInteger, command: reportStream, output: reportStream })).max(64), retained_api_commands: z.array(reportStream.extend({
+      index: reportInteger, provenance: z.literal('agents_api_command_execution'), command: reportStream, output: reportStream,
+      stdout: reportStream, stderr: reportStream })).max(64), commands_unavailable: reportBool,
+    human_requests: z.array(z.object({ status: reportState, details: reportWithheld, expected_response: z.enum(['approval', 'clarification', 'unavailable']) })).max(32),
+    exhaustive: z.literal(false), historical_messages_complete: z.literal(false) }),
+  validation: reportValidation,
+  review: reportReview,
+  candidate: z.object({ unavailable: reportBool, withheld: z.literal(true), reason: z.literal('SOURCE_AND_DIFF_WITHHELD'),
+    provenance: z.literal('controller_frozen_review_packet'), packet_sha256: reportHash, reviewed_git_state: reportTreeSchema,
+    historical_snapshot: z.literal(true), current_tree_verified: z.literal(false), execution_authorized: z.literal(false),
+    files: z.array(z.object({ index: reportInteger, path_sha256: reportHash, deleted: reportBool,
+      git_mode: z.enum(['100644', '100755', '120000']).nullable(), byte_length: reportInteger, sha256: reportHash, content: reportWithheld })).max(30) }),
+  history: z.object({ provenance: z.literal('controller_retained_history'), truncated: reportBool, observations: z.array(z.union([
+    z.object({ unavailable: z.literal(true), reason: z.literal('INTEGRITY_UNVERIFIED') }),
+    z.object({ observation_sha256: reportHash, kind: z.enum(['review_packet', 'review_output', 'review_result', 'outcome', 'corrective_execution', 'unavailable']),
+      outcome: reportState, state: reportState, reason: reportCode, reviewed_git_state: reportTreeSchema, review: z.object({ overall: reportVerdict, model_overall: reportVerdict }),
+      packet_sha256: reportHash, findings_sha256: reportHash, correction: reportCorrection })])).max(64),
+    previous_reviewers: z.array(reportReview.extend({ independent_validation: reportValidation })).max(16), correction: reportCorrection }),
+};
 export function redact(text, secrets = []) {
-  let s;
-  try { s = redactAuthorizationHeaders(String(text)); }
-  catch { s = '[REDACTED]'; } // Unsafe depth/interpretation never returns raw input.
+  let s = String(text);
   for (const secret of secrets.filter(Boolean)) s = s.split(secret).join('[REDACTED]');
   return s.replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
@@ -675,21 +782,14 @@ export class Controller {
   bounded(value, limit = 256) {
     if (typeof value !== 'string' && typeof value !== 'number') return null;
     return this.safe(String(value)).replace(/https?:\/\/[^\s<>"']+/gi, '[URL REDACTED]')
-      .replace(/((?:api[_-]?key|token|secret|password|authorization(?=\s*=))\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
+      .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]').slice(0, limit);
   }
   async invoke(name, input, extra, handler) {
     if (name === 'get_task_evidence') {
       this.task(input.task_id); // Same owner-scoped task lookup; never an audit write.
       return this.context.run(undefined, () => handler(input));
     }
-    if (name === 'get_task') {
-      const task = this.task(input.task_id);
-      if (task.correction || task.automatic) {
-        // Server authorization still precedes invoke. This status contract also
-        // excludes audit inserts/final task saves, including inherited audit context.
-        return this.context.run(undefined, () => handler(input));
-      }
-    }
+    if (name === 'get_task') return this.context.run(undefined, () => this.reportTask(input.task_id));
     // Diagnostics and cancellation remain available without writing an audit
     // transition into a connection whose committed authority cannot be trusted.
     try { this.storageAuthority(); }
@@ -2139,7 +2239,7 @@ export class Controller {
   }
   retainTaskMessage(task, role, text) {
     if (typeof text !== 'string') return;
-    const ref = task[role], sanitized = this.evidenceText(text), content = [...sanitized].slice(0, 4096).join('');
+    const ref = task[role], sanitized = this.bounded(text, Number.MAX_SAFE_INTEGER), content = [...sanitized].slice(0, 4096).join('');
     const record = { provenance: 'model_statement', text: content, redacted: sanitized !== text,
       truncated: content !== sanitized, turn_id: ref.local?.turn_id || ref.turn_id || null };
     ref.evidence_messages ||= [];
@@ -2158,10 +2258,10 @@ export class Controller {
       if (role !== 'implementer' || item.type !== 'command_execution' || typeof item.id !== 'string') continue;
       const stream = value => {
         if (typeof value !== 'string') return { unavailable: true };
-        const text = this.evidenceText(value);
+        const text = this.bounded(value, Number.MAX_SAFE_INTEGER);
         return { text: [...text].slice(0, 2048).join(''), redacted: text !== value, truncated: [...text].length > 2048, completeness: 'unverified' };
       };
-      const record = { provenance: 'agents_api_command_execution', item_id: this.evidenceText(item.id).slice(0, 200), turn_id: this.evidenceText(item.turn_id || '').slice(0, 200),
+      const record = { provenance: 'agents_api_command_execution', item_id: this.bounded(item.id).slice(0, 200), turn_id: this.bounded(item.turn_id || '').slice(0, 200),
         command: stream(item.command), output: stream(item.output), stdout: stream(item.stdout), stderr: stream(item.stderr),
         exit_code: Number.isInteger(item.exit_code) ? item.exit_code : null, source_truncated: item.truncated === true || item.output_truncated === true };
       ref.evidence_commands ||= [];
@@ -2171,16 +2271,6 @@ export class Controller {
         ref.evidence_commands.shift(); ref.evidence_commands_omitted = (ref.evidence_commands_omitted || 0) + 1;
       }
     }
-  }
-  evidenceText(value) {
-    // Remove complete quoted values before the older unquoted diagnostic filter.
-    const quoted = this.safe(value).replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization(?=["']?\s*=)|cookie)["']?)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gi, '$1[REDACTED]')
-      .replace(/\b(?:Cookie|Set-Cookie):[^\r\n]*/gi, '[REDACTED COOKIE]');
-    return this.bounded(quoted, Number.MAX_SAFE_INTEGER)
-      .replace(/-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END [^-]+-----/g, '[REDACTED AUTHENTICATION MATERIAL]')
-      .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g, '[REDACTED]')
-      .replace(/((?:["']?(?:access_token|refresh_token|id_token|api[_-]?key|token|secret|password|authorization(?=["']?\s*=)|cookie)["']?)\s*[=:]\s*)["']?[^\s,;"'}]+["']?/gi, '$1[REDACTED]')
-      .replace(/(^|[\s"'`=(])\/(?:[^\s"'`<>),;]+\/?)+/gm, '$1[PATH REDACTED]');
   }
   async retainedEvidencePacket(task) {
     const ref = task.reviewer;
@@ -2224,6 +2314,76 @@ export class Controller {
       return { packet, contract: binding.contract };
     } catch { return null; }
   }
+  discloseReview(ref, contract) {
+    const result = ref?.review_result;
+    const verified = !!result && result.packet_hash === ref.packet_hash &&
+      (!ref.findings_sha256 || digest(result) === ref.findings_sha256) && ref.received_review_output?.complete !== false;
+    const obligations = [...(contract?.requirements || []), ...(contract?.invariants || [])].map(item => item.id);
+    return { provenance: 'independent_reviewer_with_controller_qualification', unavailable: !verified,
+      qualification: 'retained_result_binding_only', current_authority_verified: false, execution_authorized: false,
+      packet_sha256: typed(reportHash, ref?.packet_hash), reviewed_git_state: reportTree(ref?.reviewed_git_state),
+      overall: verified ? typed(reportVerdict, result.overall) : null, model_overall: verified ? typed(reportVerdict, result.model_overall) : null,
+      controller_overrides: verified ? list(result.controller_overrides, 52).map(id => typed(reportFindingId, id)) : [],
+      findings: verified ? list(result.findings, 52).map((finding, index) => ({ index,
+        id: obligations.includes(finding.id) || ['SCOPE', 'TEST_EVIDENCE'].includes(finding.id) ? typed(reportFindingId, finding.id) : null,
+        obligation_index: obligations.indexOf(finding.id), id_sha256: reportReference(finding.id),
+        status: typed(reportVerdict, finding.status), evidence: withheld(finding.evidence),
+        classification: { kind: typed(reportKind, finding.classification?.kind),
+          target_files: list(finding.classification?.target_files, 8).map(name => ({
+            file_index: contract?.allowed_files?.indexOf(name) ?? -1, path_sha256: reportReference(name) })),
+          remedy: { kind: finding.classification?.remedy?.kind === 'edit_files' ? 'edit_files' : null,
+            requires_human_approval: finding.classification?.remedy?.requires_human_approval === true,
+            description: withheld(finding.classification?.remedy?.description) } } })) : [],
+      findings_truncated: Array.isArray(result?.findings) && result.findings.length > 52,
+      model_output: { ...withheld(ref?.received_review_output?.output), provenance: 'model_statement',
+        complete: ref?.received_review_output?.complete === true, qualified: false },
+      retained_reference: typed(reportHash, ref?.findings_sha256) };
+  }
+  discloseValidation(value) {
+    return { provenance: 'controller_process_observation', unavailable: !value, status: typed(reportState, value?.status),
+      diagnostic: typed(reportCode, value?.diagnostic), reviewed_git_state: reportTree(value?.reviewed_git_state),
+      termination_confirmed: value?.termination_confirmed === true, original_unchanged: value?.original_unchanged === true,
+      results: list(value?.results, 10).map((record, index) => ({ index, command_index: typed(reportInteger, record.command_index),
+        command: withheld(record.command), candidate_tree: typed(reportGit, record.candidate_tree),
+        status: typed(reportState, record.status), diagnostic: typed(reportCode, record.diagnostic),
+        exit_code: typed(reportInteger, record.exit_code), ...reportFlags(record),
+        stdout: discloseObservation(record.stdout), stderr: discloseObservation(record.stderr) })),
+      truncated: Array.isArray(value?.results) && value.results.length > 10 };
+  }
+  async reportTask(id) {
+    // Internal get() remains available to execution paths. The reporting call
+    // never refreshes sessions, captures diagnostics or updates repository evidence.
+    const raw = await this.get(id, false), task = this.task(id);
+    const result = taskReportSchema.omit({ explanation: true, evidence: true, next_steps: true, disclosure: true, remaining_authority: true }).parse(raw);
+    const contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
+    const review = this.discloseReview(task.reviewer, contract);
+    result.explanation = { provenance: 'controller_summary_of_retained_evidence', state: result.state,
+      reason: typed(reportCode, raw.automatic?.reason || raw.correction?.reason || raw.implementer?.error || raw.reviewer?.error),
+      failed_requirements: review.findings.filter(finding => finding.status === 'FAIL').map(finding => finding.id),
+      failed_validation_commands: list(task.local_validation?.results, 10).map((record, index) => ({ index,
+        exit_code: typed(reportInteger, record.exit_code), status: typed(reportState, record.status) })).filter(record =>
+        record.exit_code !== null && record.exit_code !== 0 || record.status === 'failed'),
+      details: withheld(task.reviewer?.review_result?.findings), execution_authorized: false };
+    result.evidence = { operation: 'get_task_evidence', task_id: id,
+      sections: ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'] };
+    const limits = result.automatic?.limits, usage = result.automatic?.usage;
+    const attempts = [usage?.implementer_turn_submissions_attempted, usage?.reviewer_turn_submissions_attempted,
+      usage?.correction_turns, usage?.corrective_reviewer_turn_submissions_attempted ?? 0];
+    const expired = task.cleaned || Date.now() >= task.deadline || (task.automatic && task.automatic.owner_instance !== this.instanceId) ||
+      ['uncertain', 'interrupted', 'expired'].includes(result.state);
+    result.remaining_authority = { remaining_codex_turns: expired ? 0 : limits && attempts.every(Number.isInteger) ?
+      Math.max(0, limits.max_codex_turns - attempts.reduce((sum, count) => sum + count, 0)) : null,
+      remaining_corrections: expired ? 0 : limits && Number.isInteger(limits.max_corrections) ?
+        Math.max(0, limits.max_corrections - (task.correction || task.automatic?.correction ? 1 : 0)) : null,
+      execution_authorized: false, publication_authorized: false };
+    result.next_steps = ['owner_inspect_withheld_evidence'];
+    if (raw.automatic?.review?.potentially_correctable === true) result.next_steps.push(
+      result.remaining_authority.remaining_corrections > 0 ? 'consider_authorized_correction' : 'request_new_task');
+    if (result.implementer?.human_attention_required || result.automatic?.human_attention_required) result.next_steps.push('owner_resolve_attention');
+    if (['uncertain', 'interrupted', 'expired', 'stopped'].includes(result.state)) result.next_steps.push('no_automatic_replay');
+    result.disclosure = 'typed_metadata_only';
+    return taskReportSchema.parse(result);
+  }
   async taskEvidence({ task_id: id, section = 'outcome', packet_sha256, cursor, limit = 12000, ...extra }) {
     const sections = ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'];
     if (Object.keys(extra).length || !sections.includes(section) || !Number.isInteger(limit) || limit < 256 || limit > 16000 ||
@@ -2246,81 +2406,50 @@ export class Controller {
       task = { ...task, reviewer: ref, retained_packet: ref.retained_packet,
         local_validation: ref === task.reviewer ? task.local_validation : retainedValidation || ref.independent_validation };
     }
-    const pick = (value, keys) => Object.fromEntries(keys.filter(key => value?.[key] !== undefined).map(key => [key, value[key]]));
-    const tree = value => pick(value, ['tree_sha', 'baseline_commit']);
-    const stream = value => value == null ? { unavailable: true, reason: 'This stream was not retained.' } : typeof value === 'string' ? { text: value, completeness: 'unverified' } :
-      pick(value, ['text', 'value', 'available', 'availability', 'unavailable', 'reason', 'missing', 'truncated', 'redacted', 'source_truncated', 'completeness', 'encoding_error', 'bytes_observed']);
-    const validation = value => value ? { ...pick(value, ['provenance', 'version', 'task_id', 'attempt_id', 'request_id', 'status', 'diagnostic', 'termination_confirmed', 'original_unchanged']),
-      reviewed_git_state: tree(value.reviewed_git_state), results: (value.results || []).slice(0, 10).map(record => ({
-        ...pick(record, ['provenance', 'attempt_id', 'validation_attempt_id', 'command_index', 'command', 'candidate_tree', 'status', 'diagnostic', 'exit_code', 'signal', 'timeout', 'cancelled', 'start_attempted', 'start_observed', 'completion_observed', 'termination_confirmed', 'independently_observed']),
-        stdout: stream(record.stdout), stderr: stream(record.stderr) })), truncated: (value.results || []).length > 10 } :
-      { unavailable: true, reason: 'No independent validation was retained.' };
-    const review = ref => {
-      const result = ref?.review_result, received = ref?.received_review_output;
-      const verified = !!result && (!ref.findings_sha256 || digest(result) === ref.findings_sha256) && result.packet_hash === ref.packet_hash;
-      return { provenance: 'independent_reviewer_with_controller_qualification', unavailable: !verified,
-        qualification: 'retained_result_binding_only', current_authority_verified: false,
-        reason: verified ? null : 'Qualified findings are missing or their retained binding is invalid.',
-        packet_sha256: ref?.packet_hash || null, reviewed_git_state: tree(ref?.reviewed_git_state),
-        ...(verified ? { ...pick(result, ['overall', 'model_overall', 'controller_overrides', 'controller_context', 'validation_contract', 'actionability_qualification']),
-          findings: (result.findings || []).slice(0, 52).map(finding => ({ ...pick(finding, ['id', 'status', 'evidence']),
-            classification: finding.classification ? { ...pick(finding.classification, ['kind', 'target_files']),
-              remedy: pick(finding.classification.remedy, ['kind', 'description', 'requires_human_approval']) } : null })),
-          findings_truncated: (result.findings || []).length > 52 } : {}),
-        model_output: received && digest(received) === ref.received_output_sha256 ? { provenance: 'model_statement',
-          text: received.output, complete: received.complete === true, truncated: received.complete !== true,
-          qualified: verified, notice: 'Model output alone does not establish independent findings or executed tests.' } :
-          { unavailable: true, reason: 'No verified retained reviewer output.' },
-        messages: (ref?.evidence_messages || []).map(message => pick(message, ['provenance', 'text', 'redacted', 'truncated', 'turn_id'])),
-        messages_omitted: ref?.evidence_messages_omitted || 0,
-        error: ref?.error || null };
-    };
+    const ref = task.reviewer, contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
+    const cleanup = typed(reportCleanup, task.cleanup), publication = typed(reportPublication, task.publication);
+    const correction = value => value ? { parent_task_id: typed(reportTaskId, value.parent_task_id), task_id: typed(reportTaskId, value.task_id),
+      rejected_tree_sha: typed(reportGit, value.rejected_tree_sha), baseline_commit: typed(reportGit, value.baseline_commit),
+      execution_authorized: false } : null;
     let data;
-    if (section === 'outcome') data = { provenance: 'controller_retained_task_state', state: task.cleaned ? 'cleaned' : task.automatic?.status || task.implementer.state,
-      reason: task.automatic?.reason || task.correction_reason || task.implementer.error || null,
-      expires_at: task.deadline, expired_now: Date.now() >= task.deadline,
-      automatic: pick(task.automatic, ['status', 'phase', 'reason', 'human_attention_required', 'reconciliation', 'expiry_stop']),
-      correction: pick(task.correction || task.automatic?.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_attempt_id', 'rejected_tree_sha', 'baseline_commit']),
-      correction_state: task.correction_state || null, correction_reason: task.correction_reason || null,
-      publication: pick(task.publication, ['phase', 'reviewed_tree_sha', 'commit_sha', 'commit_tree_matches_reviewed_tree', 'push_attempted', 'pr_attempted', 'pr_number', 'draft']),
-      publication_error: task.publication_error || null, publication_frozen: task.publication_frozen === true,
-      cleanup: pick(task.cleanup, ['executor_stopped', 'remote_session_deleted', 'server_closed', 'cancellation_confirmed', 'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted', 'cleanup_diagnostic']),
+    if (section === 'outcome') data = { provenance: 'controller_retained_task_state',
+      state: typed(reportState, task.cleaned ? 'cleaned' : task.automatic?.status || task.implementer.state),
+      reason: typed(reportCode, task.automatic?.reason || task.correction_reason || task.implementer.error),
+      reason_details: withheld(task.automatic?.reason || task.correction_reason || task.implementer.error),
+      expires_at: typed(reportNumber, task.deadline), expired_now: Date.now() >= task.deadline,
+      automatic: task.automatic ? { status: typed(reportState, task.automatic.status), phase: typed(reportPhase, task.automatic.phase),
+        human_attention_required: task.automatic.human_attention_required === true, limits: typed(reportLimits, task.automatic.authorization) } : null,
+      correction: correction(task.correction || task.automatic?.correction), correction_state: typed(reportState, task.correction_state),
+      publication, publication_error: typed(reportCode, task.publication_error), cleanup,
       workspace_deleted: task.workspace_deleted === true, execution_authorized: false,
       retention_uncertain: this.persistenceFailures.has(id) || this.transactionUnresolved === true };
     if (section === 'implementer') {
-      const ref = task.implementer, local = ref.local, ledger = task.local_execution_evidence;
-      const retained = !ledger ? await this.retainedEvidencePacket(task) : null;
-      const apiCommands = retained?.packet.command_execution_evidence;
-      data = { provenance: 'retained_model_statements_and_adapter_observations',
-        state: ref.state, error: ref.error || null, diagnostics: local?.diagnostics || [],
-        failure: pick(this.diagnostic(ref), ['status', 'reason', 'api_error', 'terminal_event_type', 'latest_output']),
-        messages: ref.evidence_messages?.map(message => pick(message, ['provenance', 'text', 'redacted', 'truncated', 'turn_id'])) || (local?.latest_model_output ? [{ provenance: 'model_statement', text: local.latest_model_output,
-          truncated: local.output_truncated === true, redaction_status: 'unknown_historical', completeness: 'historical_latest_only' }] : []),
-        messages_unavailable: !ref.evidence_messages?.length && !local?.latest_model_output,
-        messages_omitted: ref.evidence_messages_omitted || 0, historical_messages_complete: false,
-        human_requests: (local?.human_requests || []).slice(-32).map(request => pick(request, ['request_ref', 'method', 'status', 'summary', 'questions', 'expected_response', 'diagnostic', 'delivery'])),
-        human_requests_truncated: (local?.human_requests || []).length > 32,
-        commands: (ledger?.commands || []).slice(0, 64).map(record => ({
-          ...pick(record, ['provenance', 'item_id', 'start_observed', 'completion_observed', 'exit_code', 'missing', 'start_completion_conflict']),
-          command: stream(record.command), output: stream(record.output) })),
-        commands_unavailable: !ledger?.commands?.length && !apiCommands?.records?.length && !ref.evidence_commands?.length, exhaustive: false,
-        retained_api_commands: (ref.evidence_commands || []).slice(0, 64).map(record => ({ ...pick(record, ['provenance', 'item_id', 'turn_id', 'exit_code', 'source_truncated']),
-          command: stream(record.command), output: stream(record.output), stdout: stream(record.stdout), stderr: stream(record.stderr) })),
-        retained_api_commands_omitted: ref.evidence_commands_omitted || 0,
-        agents_api_commands: (apiCommands?.records || []).slice(0, 64).map(record => ({
-          ...pick(record, ['provenance', 'item_id', 'turn_id', 'command', 'exit_code', 'truncated', 'stdout_truncated', 'stderr_truncated']),
-          output: stream(record.output), stdout: stream(record.stdout), stderr: stream(record.stderr) })),
-        agents_api_coverage: pick(apiCommands, ['items_scan_complete', 'omitted_command_records', 'required_test_commands_missing']),
-        omitted_events: ledger?.omitted_events || 0, rejected_events: ledger?.rejected_events || 0,
-        notice: 'Adapter notifications and model statements do not certify execution or test PASS. Private reasoning is excluded.' };
+      const role = task.implementer, ledger = task.local_execution_evidence;
+      data = { provenance: 'retained_model_statements_and_adapter_observations', state: typed(reportState, role.state),
+        local: typed(reportLocal, role.local), error: typed(reportCode, role.error),
+        diagnostics: list(role.local?.diagnostics, 12).map(code => typed(reportCode, code)),
+        messages: list(role.evidence_messages, 16).map(message => ({ ...withheld(message.text), provenance: 'model_statement',
+          truncated: message.truncated === true, redacted: message.redacted === true })),
+        latest_model_output: withheld(role.local?.latest_model_output),
+        messages_unavailable: !role.evidence_messages?.length && !role.local?.latest_model_output,
+        messages_omitted: typed(reportInteger, role.evidence_messages_omitted),
+        commands: list(ledger?.commands, 64).map((record, index) => ({ index, provenance: 'codex_app_server_notification',
+          exit_code: typed(reportInteger, record.exit_code), ...reportFlags(record),
+          command: discloseObservation(record.command), output: discloseObservation(record.output) })),
+        retained_api_commands: list(role.evidence_commands, 64).map((record, index) => ({ index, provenance: 'agents_api_command_execution',
+          ...discloseObservation(record), command: discloseObservation(record.command), output: discloseObservation(record.output),
+          stdout: discloseObservation(record.stdout), stderr: discloseObservation(record.stderr) })),
+        commands_unavailable: !ledger?.commands?.length && !role.evidence_commands?.length,
+        human_requests: list(role.local?.human_requests, 32).map(request => ({
+          status: typed(reportState, request.status), details: withheld(request), expected_response:
+            ['approval', 'clarification'].includes(request.expected_response) ? request.expected_response : 'unavailable' })),
+        exhaustive: false, historical_messages_complete: false };
     }
     if (section === 'validation') {
       const retained = !task.local_validation ? await this.retainedEvidencePacket(task) : null;
-      data = validation(task.local_validation || retained?.packet.independent_validation);
-      if (retained?.packet.test_execution_evidence) data.implementer_test_observations = retained.packet.test_execution_evidence.slice(0, 10).map(record =>
-        pick(record, ['command', 'exit_code', 'output', 'truncated', 'provenance']));
+      data = this.discloseValidation(task.local_validation || retained?.packet.independent_validation);
     }
-    if (section === 'review') data = review(task.reviewer);
+    if (section === 'review') data = this.discloseReview(ref, contract);
     if (section === 'history') {
       const rows = this.db.prepare('SELECT observation_sha256,value FROM automatic_attempts WHERE task_id=? ORDER BY rowid DESC LIMIT 65').all(id);
       data = { provenance: 'controller_retained_history', truncated: rows.length > 64,
@@ -2328,59 +2457,36 @@ export class Controller {
           try {
             const record = JSON.parse(row.value);
             if (record.task_id !== id || digest(record) !== row.observation_sha256) throw Error();
-            return { observation_sha256: row.observation_sha256, ...pick(record, ['attempt_id', 'kind', 'outcome', 'stop_reason', 'state', 'reason']),
-              reviewed_git_state: tree(record.reviewed_git_state),
-              review: pick(record.review_result, ['overall', 'model_overall', 'controller_overrides']),
-              packet_sha256: record.review_packet?.sha256 || null, findings_sha256: record.findings_sha256 || null,
-              evidence: record.review_packet?.sha256 ? { operation: 'get_task_evidence', task_id: id, packet_sha256: record.review_packet.sha256,
-                sections: ['review', 'validation', 'candidate'] } : null,
-              correction: pick(record.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_tree_sha']) };
-          } catch { return { unavailable: true, reason: 'Retained observation integrity check failed.' }; }
-        }), previous_reviewers: (task.previous_reviewers || []).slice(-16).map(ref => ({ ...review(ref), independent_validation: validation(ref.independent_validation) })),
-        previous_reviewers_truncated: (task.previous_reviewers || []).length > 16,
-        correction: pick(task.correction || task.automatic?.correction, ['parent_task_id', 'task_id', 'request_id', 'rejected_attempt_id', 'rejected_tree_sha']) };
+            return { observation_sha256: typed(reportHash, row.observation_sha256),
+              kind: ['review_packet', 'review_output', 'review_result', 'outcome', 'corrective_execution'].includes(record.kind) ? record.kind : 'unavailable',
+              outcome: typed(reportState, record.outcome), state: typed(reportState, record.state), reason: typed(reportCode, record.stop_reason || record.reason),
+              reviewed_git_state: reportTree(record.reviewed_git_state), review: { overall: typed(reportVerdict, record.review_result?.overall),
+                model_overall: typed(reportVerdict, record.review_result?.model_overall) },
+              packet_sha256: typed(reportHash, record.review_packet?.sha256), findings_sha256: typed(reportHash, record.findings_sha256),
+              correction: correction(record.correction) };
+          } catch { return { unavailable: true, reason: 'INTEGRITY_UNVERIFIED' }; }
+        }), previous_reviewers: list(task.previous_reviewers, 16).map(previous => ({ ...this.discloseReview(previous, contract),
+          independent_validation: this.discloseValidation(previous.independent_validation) })), correction: correction(task.correction || task.automatic?.correction) };
     }
     if (section === 'candidate') {
-      data = { unavailable: true, reason: 'No verified frozen packet and authorized file scope were retained.' };
       const retained = await this.retainedEvidencePacket(task);
-      if (retained) {
-        const { packet, contract } = retained, ref = task.reviewer;
-        const files = contract.allowed_files.filter(name => {
-          try { safeRelative(name); } catch { return false; }
-          return !name.split('/').some(part => /^(?:\.codex|\.agents|\.aws|\.ssh|\.env(?:\..*)?|auth\.json|credentials(?:\.json)?|id_rsa|id_ed25519)$/i.test(part));
-        });
-        data = { provenance: 'controller_frozen_review_packet', packet_sha256: ref.packet_hash,
-          reviewed_git_state: tree(ref.reviewed_git_state), baseline_commit: task.baseline,
-          historical_snapshot: true, current_tree_verified: false, execution_authorized: false, source_redaction_status: 'unknown_historical', content_representation: 'sanitized_text',
-          notice: 'Retained content belongs to the recorded tree, not the current worktree; it grants no publication or correction authority.',
-          files: files.map(name => ({ path: name,
-            baseline: typeof packet.baseline?.[name] === 'string' ? packet.baseline[name] : null,
-            candidate: typeof packet.current?.[name] === 'string' ? packet.current[name] : null,
-            unavailable: packet.current?.[name] !== undefined && typeof packet.current[name] !== 'string',
-            deleted: packet.current?.[name] === undefined,
-            byte_evidence: pick(packet.file_byte_evidence?.[name], ['git_mode', 'byte_length', 'sha256', 'hex_omitted_reason']) })),
-          redacted_files: contract.allowed_files.length - files.length,
-          // A whole patch may contain unauthorized changes. Source pairs above
-          // provide the bounded per-file comparison in that case.
-          diff: (packet.changed_files || []).every(name => files.includes(name)) ? packet.diff : null,
-          diff_unavailable: !(packet.changed_files || []).every(name => files.includes(name)),
-          truncation: packet.packet_budget || packet.truncation || packet.completeness || null };
-      }
+      data = { unavailable: !retained, withheld: true, reason: 'SOURCE_AND_DIFF_WITHHELD', provenance: 'controller_frozen_review_packet',
+        packet_sha256: typed(reportHash, ref?.packet_hash), reviewed_git_state: reportTree(ref?.reviewed_git_state),
+        historical_snapshot: true, current_tree_verified: false, execution_authorized: false,
+        files: retained ? retained.contract.allowed_files.slice(0, 30).map((name, index) => ({ index, path_sha256: digest(name),
+          deleted: retained.packet.current?.[name] === undefined,
+          git_mode: ['100644', '100755', '120000'].includes(retained.packet.file_byte_evidence?.[name]?.git_mode) ? retained.packet.file_byte_evidence[name].git_mode : null,
+          byte_length: typed(reportInteger, retained.packet.file_byte_evidence?.[name]?.byte_length),
+          sha256: typed(reportHash, retained.packet.file_byte_evidence?.[name]?.sha256), content: withheld(retained.packet.current?.[name]) })) : [] };
     }
-    if (this.db.isTransaction || this.transactionUnresolved) data = { unavailable: true, retention_uncertain: true,
-      reason: 'Storage has an unresolved transaction; committed evidence cannot be confirmed on this connection.' };
-    let redacted = false;
-    const sanitize = value => {
-      if (typeof value === 'string') { const text = this.evidenceText(value); redacted ||= text !== value; return text; }
-      if (Array.isArray(value)) return value.map(sanitize);
-      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => {
-        if (key === 'redacted' && item === true) redacted = true;
-        const safeKey = this.evidenceText(key); redacted ||= safeKey !== key; return [safeKey, sanitize(item)];
-      }));
-      return value;
-    };
-    let content = JSON.stringify(sanitize(data));
-    if (Buffer.byteLength(content) > 512 * 1024) content = JSON.stringify({ unavailable: true, truncated: true, reason: 'Evidence projection exceeds the 512 KiB section limit.' });
+    const projected = evidenceSchemas[section].safeParse(data);
+    data = projected.success ? projected.data : { unavailable: true, withheld: true, reason: 'UNSUPPORTED_OR_EXCESSIVE_WITHHELD' };
+    if (this.db.isTransaction || this.transactionUnresolved) data = { unavailable: true, retention_uncertain: true, reason: 'STORAGE_UNCONFIRMED' };
+    // No recursive text filter here. Data was constructed exclusively from typed
+    // metadata and fixed markers; original private records remain unchanged.
+    const redacted = true;
+    let content = JSON.stringify({ ...data, disclosure: 'typed_metadata_only' });
+    if (Buffer.byteLength(content) > 512 * 1024) content = JSON.stringify({ unavailable: true, truncated: true, reason: 'SECTION_LIMIT_EXCEEDED' });
     const snapshot = digest(content), bytes = Buffer.from(content);
     let offset = 0;
     if (cursor !== undefined) {
@@ -2622,13 +2728,13 @@ export class Controller {
             failure_diagnostic: d, latest_output: d?.latest_output?.text || null };
         }
       } else {
-        if (!versioned && !storageDiagnostic && t[role].state === 'failed' && !this.diagnostic(t[role])) this.recordFailure(id, role, { reason: t[role].deleted ? 'Remote session already deleted; original diagnostic was not retained' : 'No retained API diagnostic' });
+        if (refresh && !versioned && !storageDiagnostic && t[role].state === 'failed' && !this.diagnostic(t[role])) this.recordFailure(id, role, { reason: t[role].deleted ? 'Remote session already deleted; original diagnostic was not retained' : 'No retained API diagnostic' });
         const d = this.diagnostic(t[role]);
         result[role] = { state: t[role].state, session_id: t[role].session_id || null, turn_id: t[role].turn_id || null, environment_id: t[role].environment_id || null, error: d ? d.api_error?.code || d.status : t[role].error || null, failure_diagnostic: d, latest_output: d?.latest_output?.text || null };
       }
     }
     if (t.repository) {
-      if (!storageDiagnostic && !t.workspace_deleted && !t.automatic && !t.correction) {
+      if (refresh && !storageDiagnostic && !t.workspace_deleted && !t.automatic && !t.correction) {
         try { await this.repositoryEvidence(id); }
         catch { const fresh = this.task(id); fresh.repository_evidence_error = 'REPOSITORY_EVIDENCE_UNAVAILABLE'; this.save(fresh); }
       }
@@ -2750,14 +2856,7 @@ export class Controller {
     }
     if (storageDiagnostic) result.storage_diagnostic = storageDiagnostic;
     if (versioned && result.cleanup) { result.cleanup = { ...result.cleanup }; delete result.cleanup.workspace_path; }
-    const reason = result.automatic?.reason || result.correction?.reason || result.implementer?.error || result.reviewer?.error;
-    const failedFinding = t.reviewer?.review_result?.findings?.find(finding => finding.status === 'FAIL');
-    result.explanation = { provenance: 'controller_summary_of_retained_evidence', state: result.state,
-      reason: reason ? this.evidenceText(String(reason)) : null,
-      detail: failedFinding ? this.evidenceText(failedFinding.evidence).slice(0, 1000) :
-        t.implementer.local?.diagnostics?.length ? this.evidenceText(t.implementer.local.diagnostics.join('; ')).slice(0, 1000) :
-        'Read retained evidence for available output and supporting details; missing evidence is reported explicitly.',
-      finding_id: failedFinding?.id || null, execution_authorized: false };
+    result.explanation = { provenance: 'controller_summary_of_retained_evidence', execution_authorized: false };
     result.evidence = { operation: 'get_task_evidence', task_id: id,
       sections: ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history'],
       notice: 'Read-only retained evidence. Does not execute, correct, publish or restore authority.' };

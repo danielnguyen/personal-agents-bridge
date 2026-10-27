@@ -11,6 +11,7 @@
     "test:live": "node test/live.mjs"
   },
   "dependencies": {
+    "@hackylabs/deep-redact": "4.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "openai": ">=7.15.0 <8",
     "ws": "^8.21.3",

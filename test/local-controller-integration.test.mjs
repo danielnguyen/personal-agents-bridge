@@ -1057,21 +1057,22 @@ test('unconfirmed reviewer closure prevents workspace deletion and remains expli
   assert.equal(result.reviewer.review_result, null);
 });
 
-test('task evidence captures bounded model messages from native completion and keeps them after cleanup', async context => {
+test('typed task evidence withholds native messages and preserves private completion records after cleanup', async context => {
   const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-evidence-' }), started = await value.start(), backend = await value.running();
   backend.finish('completed', true, 'Final task result: synthetic greeting mismatch.'); await value.drain();
   const read = async () => JSON.parse((await value.controller.invoke('get_task_evidence', { task_id: started.task_id, section: 'implementer' }, {},
     input => value.controller.taskEvidence(input))).content);
   const before = await read();
   assert.equal(before.messages.at(-1).provenance, 'model_statement');
-  assert.equal(before.messages.at(-1).text, 'Final task result: synthetic greeting mismatch.');
+  assert.equal(before.messages.at(-1).text, undefined); assert(before.messages.at(-1).withheld);
+  assert.equal(value.controller.task(started.task_id).implementer.evidence_messages.at(-1).text, 'Final task result: synthetic greeting mismatch.');
   assert.equal(before.commands_unavailable, true);
   assert.equal((await value.controller.cleanup({ task_id: started.task_id, delete_workspace: true })).cleanup.workspace_deleted, true);
   assert.deepEqual((await read()).messages, before.messages);
   assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
 });
 
-test('Authorization credential redaction covers native messages and command output before durable retention', async context => {
+test('typed disclosure withholds native messages and command output while retaining private evidence', async context => {
   const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-authorization-' });
   const started = await value.start(), backend = await value.running();
   const payload = JSON.stringify({ headers: { Authorization: ['Basic SYNTHETIC_NATIVE_ARRAY'],
@@ -1085,11 +1086,15 @@ test('Authorization credential redaction covers native messages and command outp
       cwd: backend.options.cwd, exitCode: 7, aggregatedOutput: payload } } });
   backend.finish('completed', true, payload); await value.drain();
   const task = value.controller.task(started.task_id);
-  assert(!JSON.stringify(task).includes('SYNTHETIC_'));
+  assert(JSON.stringify(task).includes('SYNTHETIC_'));
   assert(task.implementer.local.latest_model_output.includes('useful evidence'));
-  assert.equal(task.local_execution_evidence.commands[0].output.redacted, true);
   assert.equal(task.local_execution_evidence.commands[0].exit_code, 7);
-  assert.equal(task.implementer.evidence_messages.at(-1).redacted, true);
+  for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+    const result = await value.controller.taskEvidence({ task_id: started.task_id, section });
+    assert(!result.content.includes('SYNTHETIC_'));
+  }
+  const report = await value.controller.reportTask(started.task_id);
+  assert(!JSON.stringify(report).includes('SYNTHETIC_'));
   assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
 });
 

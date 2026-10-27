@@ -63,6 +63,27 @@ can still expose paths, account/session IDs, source content and operational hist
 Known credentials and common patterns are redacted, but unknown secrets may escape
 pattern matching. Do not publish raw diagnostics or investigation bundles.
 
+The `get_task` and `get_task_evidence` reporting boundary does not rely on those
+patterns to authorize disclosure. Explicit output schemas admit fixed vocabularies,
+typed numeric/boolean metadata and validated hash/Git/task identities. Raw messages,
+command text/output, reviewer prose, source/diffs, encoded/fenced/malformed JSON and
+unknown fields remain withheld, including previously retained `redacted:true`
+records. Withheld hash references identify retained evidence; they grant no path
+access or authority. Custom requirement/file identifiers use indices and hash
+references where the public ID type cannot represent them safely.
+
+Only decoded retained observation envelopes enter `@hackylabs/deep-redact@4.1.0`,
+using case-insensitive keys, applicable primitive/object types, depth/node budgets
+and fail-closed errors. Its result still passes through a metadata allowlist; raw
+text is never decoded or admitted by a pattern match. Controller authority objects
+are projected separately. Reporting leaves private packets, receipts and validation
+bindings unchanged and performs no persistent writes, session refresh or execution.
+Existing private operational retention/redaction limits still apply. Withholding
+also covers native questions/callback identities: an owner must inspect private
+evidence under separate authorization to provide an explicit human response.
+Neither a historical verdict nor a reported remaining budget grants execution,
+correction or publication authority.
+
 Use scoped credentials and spending limits. Revoke/rotate an exposed credential
 before addressing Git history. Removing a file in a later commit does not remove
 its earlier contents. `.gitignore` also does not protect tracked files or history.
