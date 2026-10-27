@@ -2408,17 +2408,29 @@ export class Controller {
           digest(packet.independent_validation) === digest(value.local_validation));
         const versioned = this.reviewProtocol(value) === LOCAL_ACTIONABILITY_REVIEW_VERSION;
         if (versioned) this.verifyVersionedReviewBinding(value, packet, ref.review_result, ref.findings_sha256, false);
-        const assessed = versioned ? validateLocalActionabilityReview(ref.review_result.review_output, contract, packet,
+        const output = ref.received_review_output.output;
+        const assessed = versioned ? validateLocalActionabilityReview(output, contract, packet,
           this.bounded.bind(this), ref.review_result.controller_context) :
-          validateLocalReview(JSON.stringify({ overall: ref.review_result.overall, findings: ref.review_result.findings }), contract, packet, this.bounded.bind(this));
+          validateLocalReview(output, contract, packet, this.bounded.bind(this));
         require(assessed.overall === overall && ['overall', 'findings', 'model_overall', 'controller_overrides', 'scope_qualification', 'validation_contract']
           .every(key => digest(assessed[key]) === digest(ref.review_result[key])));
         if (versioned) require(Object.keys(ref.review_result.controller_context || {}).sort().join() === 'authorityValid,executionQualified,reviewerIndependent,uncertaintyFree' &&
           Object.values(ref.review_result.controller_context).every(confirmed => confirmed === true));
       } else {
         require(identity(ref.session_id) && identity(value.implementer.session_id) && ref.session_id !== value.implementer.session_id);
+        // Use the independently retained original message, never a serialized
+        // qualification. Older, omitted, sanitized or incomplete messages cannot
+        // supply this proof. The latest message must belong to the reviewed turn.
+        require(Array.isArray(ref.evidence_messages) && ref.evidence_messages.length > 0 &&
+          ref.evidence_messages.length <= 16 && !ref.evidence_messages_omitted);
+        const received = ref.evidence_messages.at(-1);
+        require(received?.provenance === 'model_statement' && received.turn_id === ref.turn_id &&
+          received.redacted === false && received.truncated === false && typeof received.text === 'string' && received.text.length <= 16000);
+        const raw = JSON.parse(received.text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+        require(raw && digest({ overall: raw.overall, findings: raw.findings, packet_hash: ref.packet_hash,
+          turn_id: received.turn_id }) === ref.findings_sha256);
         const required = [...contract.requirements, ...contract.invariants].map(item => item.id).concat(['SCOPE', 'TEST_EVIDENCE']);
-        const findings = ref.review_result.findings;
+        const findings = raw.findings;
         require(Array.isArray(findings) && findings.length === required.length && required.every(id => findings.filter(finding =>
           finding.id === id && ['PASS', 'FAIL'].includes(finding.status) && typeof finding.evidence === 'string' && finding.evidence.trim()).length === 1) &&
           overall === (findings.every(finding => finding.status === 'PASS') ? 'PASS' : 'FAIL'));

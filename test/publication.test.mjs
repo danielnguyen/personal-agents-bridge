@@ -141,6 +141,32 @@ test('shared publication proof rejects SSH B historical matched-absence reproduc
   assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, before);
 });
 
+test('original reviewer receipt rejects SSH B hash-valid contradictory local responses', async context => {
+  const { c, id, work, input, review } = await setup(context, ['one.txt'], true);
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); await c.publish(input);
+  clearInterval(c.sweeper);
+  const original = c.task(id);
+  const findings = original.reviewer.review_result.findings;
+  const outputs = [
+    ['original FAIL with stored PASS', JSON.stringify({ overall: 'FAIL', findings: findings.map(finding => ({ ...finding, status: 'FAIL' })) })],
+    ['malformed original receipt', '{malformed synthetic reviewer response'],
+    ['incomplete original PASS', JSON.stringify({ overall: 'PASS', findings: findings.slice(0, 1) })],
+  ];
+  for (const [name, output] of outputs) await context.test(name, async () => {
+    const task = structuredClone(original), ref = task.reviewer;
+    ref.received_review_output.output = output;
+    ref.received_review_output.output_sha256 = digest(output);
+    ref.received_output_sha256 = digest(ref.received_review_output);
+    c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+    // The original execution/receipt bindings and all hashes remain valid.
+    const { packet } = await c.retainedEvidencePacket(task);
+    c.verifyReceivedReview(task, ref.received_review_output, ref.received_output_sha256, packet);
+    const before = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value;
+    assert.equal((await reportingPublication(c, id)).confirmed, false);
+    assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, before);
+  });
+});
+
 for (const mode of ['agents_api', 'local_manual', 'automatic', 'versioned', 'corrective'])
 test(`shared publication proof independently rejects absent, paired and conflicting ${mode} evidence`, async context => {
   const automatic = ['automatic', 'versioned', 'corrective'].includes(mode);
@@ -192,8 +218,40 @@ test(`shared publication proof independently rejects absent, paired and conflict
   ]) cases.push({ name: `matched absence ${paths.join(', ')}`, mutate: remove(paths) });
   cases.push({ name: 'mismatched findings identity', mutate(row) { row.reviewer.findings_sha256 = 'a'.repeat(64); } },
     { name: 'invalid findings with matching digest', mutate(row) { row.reviewer.review_result.findings = []; row.reviewer.findings_sha256 = digest(row.reviewer.review_result); } },
+    { name: 'qualification contradicts original response with matching digest', mutate(row) {
+      row.reviewer.review_result.findings[0].evidence = 'Synthetic substituted qualification; absent from original response.';
+      row.reviewer.findings_sha256 = digest(row.reviewer.review_result);
+    } },
     { name: 'wrong tree type on both sides', mutate(row) { row.publication.reviewed_tree_sha = row.reviewer.reviewed_git_state.tree_sha = {}; } },
     { name: 'unknown attempt flags', mutate(row) { row.publication.push_attempted = 'unknown'; row.publication.pr_attempted = null; }, unknown: true });
+  for (const fault of ['FAIL', 'malformed', 'incomplete PASS']) cases.push({ name: `original ${fault} contradicts stored PASS`, mutate(row) {
+    const ref = row.reviewer, message = mode === 'agents_api' ? ref.evidence_messages.at(-1) : null;
+    const raw = JSON.parse(message ? message.text : ref.received_review_output.output);
+    if (fault === 'FAIL') { raw.overall = 'FAIL'; raw.findings[0].status = 'FAIL'; }
+    if (fault === 'incomplete PASS') raw.findings.pop();
+    const output = fault === 'malformed' ? '{malformed synthetic response' : JSON.stringify(raw);
+    if (message) message.text = output;
+    else {
+      ref.received_review_output.output = output; ref.received_review_output.output_sha256 = digest(output);
+      ref.received_output_sha256 = digest(ref.received_review_output);
+    }
+  } });
+  if (mode === 'agents_api') {
+    for (const fault of ['missing', 'wrong turn', 'unknown redaction', 'redacted', 'unknown truncation', 'truncated', 'omitted', 'wrong provenance', 'oversized', 'trailing unqualified message'])
+      cases.push({ name: `original Agents API response ${fault}`, mutate(row) {
+        const ref = row.reviewer, message = ref.evidence_messages.at(-1);
+        if (fault === 'missing') delete ref.evidence_messages;
+        if (fault === 'wrong turn') message.turn_id = 'unqualified-turn';
+        if (fault === 'unknown redaction') delete message.redacted;
+        if (fault === 'redacted') message.redacted = true;
+        if (fault === 'unknown truncation') delete message.truncated;
+        if (fault === 'truncated') message.truncated = true;
+        if (fault === 'omitted') ref.evidence_messages_omitted = 1;
+        if (fault === 'wrong provenance') message.provenance = 'unverified_statement';
+        if (fault === 'oversized') message.text += ' '.repeat(16001);
+        if (fault === 'trailing unqualified message') ref.evidence_messages.push({ ...message, text: 'Not a qualified reviewer response.' });
+      } });
+  }
   for (const operation of operations) for (const fault of ['missing', 'pending', 'uncertain', 'conflicting']) cases.push({
     name: `${fault} operation ${operation.id}`, operation, fault });
   if (automatic) cases.push({ name: 'publication input conflicts with original authorization', mutate(row) { row.publication.input_sha256 = 'a'.repeat(64); } });
