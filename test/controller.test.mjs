@@ -68,6 +68,134 @@ const disclosureCases = [
   'ARBITRARY_RAW_LITERAL without any sensitive key or credential pattern',
 ];
 
+// Drive the existing Agents API event stream, acknowledging only after the
+// Controller has finished processing each event. No status read drives it.
+function reportingEvents(api) {
+  const streams = new Map();
+  api.events.stream = async id => {
+    let wake, ended = false;
+    const queue = [];
+    const stream = { controller: { abort() { ended = true; wake?.(); } },
+      async *[Symbol.asyncIterator]() {
+        while (!ended) {
+          if (!queue.length) await new Promise(resolve => { wake = resolve; });
+          if (ended) break;
+          const item = queue.shift(); yield item.event; item.done();
+        }
+      } };
+    streams.set(id, { queue, wake: () => wake?.() }); return stream;
+  };
+  return (id, event) => new Promise(resolve => {
+    const stream = streams.get(id); assert(stream, 'Owned session must already have an event stream');
+    stream.queue.push({ event, done: resolve }); stream.wake();
+  });
+}
+
+test('reporting lifecycle persists Agents API pending clarification before observational MCP reads', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.pending(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action', session: api.rows.get(x.implementer.session_id) });
+  const { get } = await statusClient(t, c), before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  const calls = [api.created.length, api.sent.length];
+  for (let read = 0; read < 2; read++) {
+    const response = await get(x.task_id); assert.notEqual(response.isError, true);
+    const status = response.structuredContent;
+    assert.equal(status.state, 'waiting_for_clarification');
+    assert.equal(status.implementer.clarification_required, true); assert.equal(status.implementer.human_attention_required, true);
+    assert(status.next_steps.includes('owner_resolve_attention'));
+    assert.equal((await readEvidence(c, x.task_id, 'outcome', 256)).data.state, status.state);
+    assert(!JSON.stringify(response).includes('Which name?'));
+  }
+  assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+  assert.deepEqual([api.created.length, api.sent.length], calls);
+});
+
+test('reporting lifecycle retains qualified Agents API reviewer FAIL without a refreshing status read', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.completed(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.turn.completed', turn_id: api.rows.get(x.implementer.session_id).turns[0].id });
+  await c.review({ task_id: x.task_id, request_id: 'reporting_review' }); await Promise.all([...c.jobs.values()]);
+  const sid = c.task(x.task_id).reviewer.session_id;
+  api.completed(sid, JSON.stringify({ overall: 'FAIL', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id =>
+    ({ id, status: id === 'R2' ? 'FAIL' : 'PASS', evidence: 'ARBITRARY_RAW_LITERAL Authorization: Basic SYNTHETIC_CREDENTIAL' })) }));
+  await emit(sid, { type: 'agent.session.turn.completed', turn_id: api.rows.get(sid).turns[0].id });
+  const { get } = await statusClient(t, c), before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  const calls = [api.created.length, api.sent.length];
+  for (const method of ['save', 'observe', 'publish', 'continue', 'review', 'repositoryEvidence']) c[method] = () => assert.fail(`Reporting cannot invoke ${method}`);
+  api.retrieve = api.items.list = api.turns.list = () => assert.fail('Reporting cannot refresh API facts');
+  for (let read = 0; read < 2; read++) {
+    const response = await get(x.task_id); assert.notEqual(response.isError, true); noRaw(response);
+    assert.equal(response.structuredContent.reviewer.overall, 'FAIL');
+    assert.deepEqual(response.structuredContent.explanation.failed_requirements, ['R2']);
+    for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+      const result = await readEvidence(c, x.task_id, section, 256); noRaw(result.text);
+      if (section === 'review') { assert.equal(result.data.overall, 'FAIL'); assert.equal(result.data.findings[1].id, 'R2'); }
+    }
+  }
+  assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+  assert.deepEqual([api.created.length, api.sent.length], calls);
+});
+
+for (const mode of ['missing_findings', 'contradictory', 'truncated', 'packet_changed', 'unverified_event'])
+test(`reporting lifecycle does not qualify Agents API ${mode} reviewer output`, { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.completed(x.implementer.session_id);
+  await c.review({ task_id: x.task_id, request_id: 'reporting_invalid_review' }); await Promise.all([...c.jobs.values()]);
+  const ref = c.task(x.task_id).reviewer;
+  const output = { overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id =>
+    ({ id, status: 'PASS', evidence: 'ARBITRARY_RAW_LITERAL' })) };
+  if (mode === 'missing_findings') output.findings.pop();
+  if (mode === 'contradictory') output.findings[0].status = 'FAIL';
+  if (mode === 'packet_changed') {
+    const file = path.join(c.workspaceRoot, x.task_id, ref.packet_directory, 'evidence.json');
+    await fs.chmod(file, 0o600); await fs.appendFile(file, ' ');
+  }
+  if (mode !== 'unverified_event') api.completed(ref.session_id, (mode === 'truncated' ? ' '.repeat(16001) : '') + JSON.stringify(output));
+  await emit(ref.session_id, { type: 'agent.session.turn.completed', turn_id: api.rows.get(ref.session_id).turns[0].id,
+    turn: { status: 'completed' }, output: JSON.stringify(output) });
+  const before = statusLedger(c.db), status = await c.reportTask(x.task_id), review = (await readEvidence(c, x.task_id, 'review', 256)).data;
+  noRaw(status); noRaw(review);
+  assert.equal(status.reviewer.overall, null); assert.equal(review.overall, null); assert.equal(review.unavailable, true);
+  assert.deepEqual(status.explanation.failed_requirements, []); assert.equal(status.remaining_authority.execution_authorized, false);
+  if (mode === 'unverified_event') assert.equal(status.reviewer.state, 'running');
+  else { assert.equal(status.reviewer.state, 'needs_attention'); assert.equal(status.reviewer.error, 'INVALID_REVIEW_OUTPUT');
+    assert.equal(status.reviewer.human_attention_required, true); assert(status.next_steps.includes('owner_resolve_attention')); }
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('reporting lifecycle takes clarification from verified API state rather than an event claim', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action', session: { status: 'requires_action',
+    required_actions: [{ type: 'function_call', name: 'request_clarification', arguments: { question: 'ARBITRARY_RAW_LITERAL' } }] } });
+  assert.equal((await c.reportTask(x.task_id)).implementer.clarification_required, false);
+  api.pending(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action' });
+  await c.continue({ task_id: x.task_id, instruction: 'Example', request_id: 'reporting_answer' });
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action' });
+  const status = await c.reportTask(x.task_id);
+  assert.equal(status.state, 'running'); assert.equal(status.implementer.clarification_required, false);
+  assert.equal(status.implementer.human_attention_required, false); assert(!status.next_steps.includes('owner_resolve_attention'));
+});
+
+test('reporting lifecycle stream attachment reconciles pending API state after restart before status reads', { timeout: 30000 }, async t => {
+  const { c, api, executor } = await setup(t), x = await started(c);
+  api.pending(x.implementer.session_id); await c.close();
+  const emit = reportingEvents(api);
+  const recovered = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, api, executor, secrets: [] }).init();
+  t.after(() => recovered.close());
+  // A non-lifecycle event is only a stream-consumption barrier. It cannot
+  // trigger viewRole: attachment itself must have persisted the API snapshot.
+  await emit(x.implementer.session_id, { type: 'agent.session.output_text.delta', delta: 'ARBITRARY_RAW_LITERAL' });
+  const before = statusLedger(recovered.db), files = await statusFiles(recovered.stateRoot, recovered.workspaceRoot);
+  api.retrieve = api.items.list = api.turns.list = () => assert.fail('Reporting cannot refresh after restart');
+  const status = await recovered.reportTask(x.task_id);
+  assert.equal(status.state, 'waiting_for_clarification'); assert.equal(status.implementer.human_attention_required, true); noRaw(status);
+  assert.equal((await readEvidence(recovered, x.task_id, 'outcome', 256)).data.state, status.state);
+  assert.equal(statusLedger(recovered.db), before); assert.equal(await statusFiles(recovered.stateRoot, recovered.workspaceRoot), files);
+  assert.equal(api.created.length, 1); assert.equal(api.sent.length, 1);
+  await recovered.close();
+});
+
 function noRaw(value) {
   const text = JSON.stringify(value);
   for (const fragment of ['SYNTHETIC_', 'CREDENTIAL', 'ARBITRARY_RAW_LITERAL']) assert(!text.includes(fragment), `Raw content escaped disclosure: ${fragment}`);

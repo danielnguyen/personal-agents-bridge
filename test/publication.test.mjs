@@ -106,6 +106,87 @@ async function setup(t, allowed = ['one.txt'], local = false, commands = [], aut
   return { c, root, normal, remote, baseline, api, executor, publisher, id, work, input, review, contract, startInput, localCalls, localPrompts };
 }
 
+async function reportingPublication(c, id, client) {
+  let cursor, text = '';
+  do {
+    const input = { task_id: id, section: 'outcome', limit: 256, ...(cursor ? { cursor } : {}) };
+    const response = client ? await client.callTool({ name: 'get_task_evidence', arguments: input }) : null;
+    if (response) assert.notEqual(response.isError, true);
+    const page = response ? response.structuredContent : await c.taskEvidence(input);
+    text += page.content; cursor = page.next_cursor;
+  } while (cursor);
+  const response = client ? await client.callTool({ name: 'get_task', arguments: { task_id: id } }) : null;
+  if (response) assert.notEqual(response.isError, true);
+  const status = response ? response.structuredContent : await c.reportTask(id);
+  assert.deepEqual(status.publication, JSON.parse(text).publication);
+  assert.equal(status.remaining_authority.publication_authorized, false);
+  assert.equal(status.publication.execution_authorized, false);
+  return status.publication;
+}
+
+for (const local of [false, true]) test(`reporting publication preserves confirmed ${local ? 'local' : 'Agents API'} completion and attempt flags on both read-only surfaces`, async context => {
+  const { c, id, work, input, review, publisher, api } = await setup(context, ['one.txt'], local);
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); await c.publish(input);
+  const server = createServer(c, async () => {}), client = new Client({ name: 'publication-reporting', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  const ledger = () => JSON.stringify(['tasks', 'audit', 'operations', 'automatic_attempts', 'failures'].map(table =>
+    c.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+  const before = ledger(), calls = [publisher.pushes, publisher.creates, api.created.length, api.sent.length];
+  const files = await publicationFiles(c.workspaceRoot), databaseFiles = await publicationFiles(c.stateRoot);
+  for (let read = 0; read < 2; read++) {
+    const publication = await reportingPublication(c, id, client);
+    assert.equal(publication.phase, 'complete');
+    assert.equal(publication.push_attempted, true); assert.equal(publication.pr_attempted, true);
+    assert.equal(publication.confirmed, true); assert.equal(publication.uncertain, false);
+  }
+  assert.equal(ledger(), before); assert.deepEqual([publisher.pushes, publisher.creates, api.created.length, api.sent.length], calls);
+  assert.equal(await publicationFiles(c.workspaceRoot), files); assert.equal(await publicationFiles(c.stateRoot), databaseFiles);
+  await c.cleanup({ task_id: id, delete_workspace: true });
+  assert.equal((await reportingPublication(c, id)).confirmed, true);
+});
+
+test('reporting publication distinguishes retained pending, uncertain and incomplete completion records', async context => {
+  const { c, id, work, input, review, publisher } = await setup(context);
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); await c.publish(input);
+  const completed = c.task(id), calls = [...publisher.calls];
+  for (const mutate of [
+    task => { task.publication.phase = 'prepared'; task.publication.push_attempted = false; task.publication.pr_attempted = false; },
+    task => { task.publication.phase = 'pushed'; task.publication.pr_attempted = false; },
+    task => { task.publication.phase = 'pushed'; task.publication_error = 'PR_RESPONSE_UNCONFIRMED'; },
+    task => { task.publication.pr_attempted = false; },
+    task => { delete task.publication.pr_number; },
+    task => { task.publication.reviewed_tree_sha = 'a'.repeat(40); },
+    task => { task.publication.review_packet_sha256 = 'a'.repeat(64); },
+    task => { task.reviewer.review_result.overall = 'FAIL'; },
+    task => { task.reviewer.received_review_output = { complete: false, output: 'ARBITRARY_RAW_LITERAL' }; },
+    task => { task.publication_error = 'PR_RESPONSE_UNCONFIRMED'; },
+  ]) {
+    const task = structuredClone(completed); mutate(task); c.save(task);
+    const before = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value;
+    for (let read = 0; read < 2; read++) {
+      const p = await reportingPublication(c, id);
+      assert.equal(p.confirmed, false); assert.equal(p.push_attempted, task.publication.push_attempted);
+      assert.equal(p.pr_attempted, task.publication.pr_attempted);
+      if (task.publication.phase === 'complete') { assert.equal(p.phase, 'confirmation_pending'); assert.equal(p.uncertain, true); }
+      else assert.equal(p.phase, task.publication.phase);
+    }
+    assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, before);
+  }
+  c.save(completed); assert.deepEqual(publisher.calls, calls);
+});
+
+test('reporting publication does not turn a lost PR response into confirmed publication', async context => {
+  const { c, id, work, input, review, publisher } = await setup(context);
+  await fs.writeFile(path.join(work, 'one.txt'), 'exact\n'); await review(); publisher.losePRResponse = true;
+  await assert.rejects(c.publish(input));
+  const calls = [...publisher.calls], before = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value;
+  const p = await reportingPublication(c, id);
+  assert.equal(p.phase, 'pushed'); assert.equal(p.push_attempted, true); assert.equal(p.pr_attempted, true);
+  assert.equal(p.confirmed, false); assert.equal(p.uncertain, true);
+  assert.deepEqual(publisher.calls, calls); assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(id).value, before);
+});
+
 test('authorized corrective publication uses the exact fourth-reviewed tree and original baseline once', async context => {
   const value = await setup(context, ['one.txt'], true, ['cat one.txt'], { versioned: true, corrective: true, publishCorrection: true });
   const parent = await automaticSettled(value), child = value.c.task(parent.automatic.correction.task_id);
@@ -132,6 +213,7 @@ test('authorized corrective publication uses the exact fourth-reviewed tree and 
     assert.equal(status.correction.publication.confirmed, true);
     assert.equal(status.correction.review.qualified, true); assert.equal(status.correction.review.overall, 'PASS');
     assert.equal(status.correction.codex_turns_attempted, 4);
+    assert.equal((await reportingPublication(value.c, id)).confirmed, true);
   }
   await assert.rejects(value.c.publish({ task_id: child.id, title: 'Public denial' }), /CORRECTIVE_PUBLICATION_NOT_AUTHORIZED/);
   await value.c.start(value.startInput); value.c.scheduleAutomatic(parent.id); await Promise.all([...value.c.automaticJobs.values()]);
@@ -573,6 +655,7 @@ test('explicit versioned automatic PASS uses authenticated findings and exact-tr
   assert.equal(repoGit(remote, 'rev-parse', `${task.publication.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
   assert.equal(repoGit(remote, 'rev-parse', 'main').trim(), value.baseline); assert.equal(value.api.created.length, 0);
   assert.equal(task.deadline, task.automatic.review_authorization.deadline);
+  assert.equal((await reportingPublication(c, id)).confirmed, true);
   for (const view of [await c.get(id), await c.start(value.startInput)]) {
     assert.equal(view.automatic.review.state, 'pass'); assert.equal(view.automatic.usage.correction_turns, 0); assert.equal(view.automatic.review.execution_authorized, false);
   }

@@ -46,12 +46,13 @@ const reportState = z.enum(['starting', 'running', 'finishing', 'completed', 'fa
   'validation_and_review', 'reviewed', 'reserved', 'pending', 'passed', 'validating', 'malformed_or_uncertain', 'HOLD', 'not_started', 'unavailable']).catch('unavailable');
 const reportPhase = z.enum(['implementation', 'independent_validation', 'independent_review', 'validation_and_review', 'correction',
   'publication', 'provisioning', 'preflight', 'finished', 'restart_attention', 'model_selected', 'thread_acknowledged',
-  'turn_submitting', 'turn_acknowledged', 'turn_running', 'terminal', 'complete', 'frozen', 'push_attempted', 'pushed', 'pr_attempted']).catch('unavailable');
+  'turn_submitting', 'turn_acknowledged', 'turn_running', 'terminal', 'prepared', 'confirmation_pending', 'complete', 'frozen', 'push_attempted', 'pushed', 'pr_attempted']).catch('unavailable');
 const reportCode = z.enum(['TASK_EXPIRED', 'LOCAL_HUMAN_ATTENTION_REQUIRED', 'HUMAN_ATTENTION_REQUIRED', 'LOCAL_TURN_INTERRUPTED',
   'LOCAL_TURN_UNCERTAIN', 'LOCAL_TURN_FAILED', 'LOCAL_CLOSE_UNCONFIRMED', 'LOCAL_RESULT_UNVERIFIED', 'LOCAL_REVIEW_INVALID',
   'AUTOMATIC_REVIEW_FAIL', 'AUTOMATIC_TASK_STOPPED', 'AUTOMATIC_RESTART_NO_REPLAY', 'AUTOMATIC_OWNER_UNAVAILABLE',
   'AUTOMATIC_EVIDENCE_PERSISTENCE_UNCONFIRMED', 'AUTOMATIC_PUBLICATION_UNCONFIRMED', 'PR_RESPONSE_UNCONFIRMED',
-  'REVIEW_EVIDENCE_UNVERIFIED', 'REVIEW_RESULT_UNAVAILABLE', 'CORRECTIVE_EVIDENCE_UNVERIFIED', 'CORRECTIVE_REVIEW_NOT_AUTHORIZED',
+  'REVIEW_EVIDENCE_UNVERIFIED', 'REVIEW_RESULT_UNAVAILABLE', 'INVALID_REVIEW_OUTPUT', 'INVALID_CLARIFICATION', 'UNSUPPORTED_REQUIRED_ACTION', 'API_RECONCILIATION_FAILED',
+  'CORRECTIVE_EVIDENCE_UNVERIFIED', 'CORRECTIVE_REVIEW_NOT_AUTHORIZED',
   'CORRECTION_EXECUTION_DISABLED', 'CORRECTION_BUDGET_RESERVED', 'CORRECTION_BUDGET_EXHAUSTED', 'QUALIFIED_REVIEW_FAIL_REQUIRED',
   'SCOPE_UNQUALIFIED', 'TEST_EVIDENCE_UNQUALIFIED', 'EXECUTION_UNQUALIFIED', 'ORIGINAL_AUTHORITY_UNCONFIRMED',
   'ACTIONABILITY_EVIDENCE_UNAVAILABLE', 'CONTROLLER_REVIEW_DISAGREEMENT', 'INDEPENDENT_REVIEW_UNCONFIRMED',
@@ -107,7 +108,8 @@ const reportCleanup = z.object(Object.fromEntries(['executor_stopped', 'remote_s
   'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted'].map(key => [key, reportBool]))).nullable().catch(null);
 const reportPublication = z.object({ phase: reportPhase, reviewed_tree_sha: reportGit, commit_sha: reportGit,
   commit_tree_matches_reviewed_tree: reportBool, push_attempted: reportBool, pr_attempted: reportBool, pr_number: reportInteger,
-  draft: reportBool, confirmed: reportBool, uncertain: reportBool }).nullable().catch(null);
+  draft: reportBool, confirmed: reportBool, uncertain: reportBool,
+  execution_authorized: z.literal(false).catch(false) }).nullable().catch(null);
 const reportReviewSummary = z.object({ state: z.enum(['not_started', 'pass', 'fail', 'potentially_correctable_fail', 'non_correctable_fail',
   'malformed_or_uncertain']).catch('malformed_or_uncertain'), potentially_correctable: reportBool,
   execution_authorized: z.literal(false).catch(false), blockers: z.array(reportCode).max(16).catch([]) }).nullable().catch(null);
@@ -2350,11 +2352,47 @@ export class Controller {
         stdout: discloseObservation(record.stdout), stderr: discloseObservation(record.stderr) })),
       truncated: Array.isArray(value?.results) && value.results.length > 10 };
   }
+  disclosePublication(task) {
+    // A historical Controller completion is not fresh publication authority.
+    // Use the same retained projection on both reporting surfaces; never query
+    // Git/GitHub or try to reconcile a publication during a read.
+    if (task.automatic?.correction && !task.correction) {
+      const child = this.task(task.automatic.correction.task_id);
+      if (child.correction?.parent_task_id === task.id && child.automatic?.corrective_publication) task = child;
+    }
+    const p = task.publication;
+    if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
+    let confirmed = false;
+    try {
+      this.storageAuthority();
+      if (this.persistenceFailures.has(task.id) || task.publication_error) throw Error();
+      const ref = task.reviewer, contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
+      confirmed = p.phase === 'complete' && p.task_id === task.id && p.push_attempted === true && p.pr_attempted === true &&
+        p.commit_tree_matches_reviewed_tree === true && /^[a-f0-9]{40}$/.test(p.commit_sha || '') &&
+        Number.isSafeInteger(p.pr_number) && p.pr_number > 0 && Number.isFinite(Date.parse(p.completed_at)) &&
+        p.pushed_branch === task.repository?.branch && p.review_overall === 'PASS' &&
+        p.reviewed_tree_sha === ref?.reviewed_git_state?.tree_sha && p.review_packet_sha256 === ref?.packet_hash &&
+        p.reviewer_turn_id === ref?.review_result?.turn_id && this.discloseReview(ref, contract).overall === 'PASS' &&
+        (task.execution_backend === 'local_codex' ? p.reviewer_backend === 'local_codex' && p.reviewer_session_id === null &&
+          p.reviewer_thread_id === ref.local?.thread_id : p.reviewer_session_id === ref?.session_id);
+      if (task.automatic?.corrective_publication) confirmed &&= this.correctivePublicationSummary(task).confirmed === true;
+      else if (task.automatic) confirmed &&= task.automatic.status === 'succeeded' &&
+        task.automatic.reconciliation?.confirmed !== false && this.confirmedAutomaticPublication(task);
+    } catch { confirmed = false; }
+    return typed(reportPublication, { ...p, phase: p.phase === 'complete' && !confirmed ? 'confirmation_pending' : p.phase,
+      draft: confirmed ? true : p.draft, confirmed,
+      uncertain: !!task.publication_error || this.persistenceFailures.has(task.id) || this.transactionUnresolved === true ||
+        p.phase === 'complete' && !confirmed });
+  }
   async reportTask(id) {
     // Internal get() remains available to execution paths. The reporting call
     // never refreshes sessions, captures diagnostics or updates repository evidence.
     const raw = await this.get(id, false), task = this.task(id);
     const result = taskReportSchema.omit({ explanation: true, evidence: true, next_steps: true, disclosure: true, remaining_authority: true }).parse(raw);
+    if (raw.publication || task.publication) {
+      result.publication = this.disclosePublication(task);
+      if (result.correction?.publication) result.correction.publication = result.publication;
+    }
     const contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
     const review = this.discloseReview(task.reviewer, contract);
     result.explanation = { provenance: 'controller_summary_of_retained_evidence', state: result.state,
@@ -2379,7 +2417,7 @@ export class Controller {
     result.next_steps = ['owner_inspect_withheld_evidence'];
     if (raw.automatic?.review?.potentially_correctable === true) result.next_steps.push(
       result.remaining_authority.remaining_corrections > 0 ? 'consider_authorized_correction' : 'request_new_task');
-    if (result.implementer?.human_attention_required || result.automatic?.human_attention_required) result.next_steps.push('owner_resolve_attention');
+    if (result.implementer?.human_attention_required || result.reviewer?.human_attention_required || result.automatic?.human_attention_required) result.next_steps.push('owner_resolve_attention');
     if (['uncertain', 'interrupted', 'expired', 'stopped'].includes(result.state)) result.next_steps.push('no_automatic_replay');
     result.disclosure = 'typed_metadata_only';
     return taskReportSchema.parse(result);
@@ -2407,7 +2445,7 @@ export class Controller {
         local_validation: ref === task.reviewer ? task.local_validation : retainedValidation || ref.independent_validation };
     }
     const ref = task.reviewer, contract = task.automatic?.contract_binding?.contract || task.evidence_contract?.contract;
-    const cleanup = typed(reportCleanup, task.cleanup), publication = typed(reportPublication, task.publication);
+    const cleanup = typed(reportCleanup, task.cleanup), publication = this.disclosePublication(task);
     const correction = value => value ? { parent_task_id: typed(reportTaskId, value.parent_task_id), task_id: typed(reportTaskId, value.task_id),
       rejected_tree_sha: typed(reportGit, value.rejected_tree_sha), baseline_commit: typed(reportGit, value.baseline_commit),
       execution_authorized: false } : null;
@@ -2562,8 +2600,14 @@ export class Controller {
     try {
       const stream = await this.api.events.stream(ref.session_id, { timeout: 30000 }); this.streams.set(key, stream);
       (async () => {
-        try { for await (const event of stream) {
+        try {
+          // Stream attachment (including restart) and lifecycle events own API
+          // reconciliation. Reporting only observes the facts persisted here.
+          await this.viewRole(this.task(id), role);
+          for await (const event of stream) {
           if (this.closed) break;
+          const current = this.task(id);
+          if (current.cleaned || current[role]?.session_id !== ref.session_id || current[role].deleted || current[role].stale) break;
           if (event.turn?.subagent_id) continue;
           if (event.environment?.status) {
             this.cache.set(`${id}:${role}:environment`, event.environment.status);
@@ -2573,16 +2617,24 @@ export class Controller {
           if (event.type === 'agent.session.turn.failed' || event.type === 'agent.session.failed' || event.type === 'error') {
             this.recordFailure(id, role, { event, turn: event.turn, session: event.session });
             await this.reconcileFailure(id, role);
-          } else if (/\.turn\.(completed|cancelled)$/.test(event.type)) {
-            const t = this.task(id); t[role].state = event.turn?.status || event.type.split('.').at(-1); this.save(t);
-            try {
-              const page = await this.api.items.list(t[role].session_id, { order: 'desc', limit: 100 });
-              const current = this.task(id); this.retainAPIItems(current, role, [...(page.data || [])].reverse(), current[role].turn_id); this.save(current);
-            } catch { /* Retained output remains explicitly incomplete if unavailable. */ }
+          } else if (event.type === 'agent.session.requires_action' || /\.turn\.(completed|cancelled)$/.test(event.type)) {
+            // Events are triggers, not verdicts. Reuse the authoritative API
+            // snapshot and existing packet/contract qualification in viewRole.
+            await this.viewRole(this.task(id), role);
           }
-        } } catch { /* get_task reconciles from persisted API state */ }
+        } } catch {
+          // Failure to obtain a verified snapshot cannot look like completion.
+          if (!this.closed) {
+            const current = this.task(id);
+            if (!current.cleaned && current[role]?.session_id === ref.session_id && !current[role].deleted && !current[role].stale) {
+              Object.assign(current[role], { state: 'needs_attention', error: 'API_RECONCILIATION_FAILED', human_attention_required: true });
+              if (role === 'reviewer') current[role].review_result = null;
+              this.save(current);
+            }
+          }
+        }
         finally { if (this.streams.get(key) === stream) this.streams.delete(key); }
-      })();
+      })().catch(() => { this.persistenceFailures.add(id); });
     } catch (e) { this.streams.delete(key); throw e; }
   }
   async viewRole(t, role) {
@@ -2597,6 +2649,7 @@ export class Controller {
     if (turn) { view.turn_id = turn.id; view.state = turn.status === 'in_progress' ? 'running' : turn.status; }
     if (s.status === 'failed') view.state = 'failed';
     if (view.state !== 'failed') { view.error = ref.error || null; view.latest_output = null; }
+    if (!failure && ['API_RECONCILIATION_FAILED', 'INVALID_REVIEW_OUTPUT', 'INVALID_CLARIFICATION', 'UNSUPPORTED_REQUIRED_ACTION'].includes(view.error)) view.error = null;
     const actions = s.required_actions || [];
     const pending = actions.find(x => x.type === 'function_call' && x.name === 'request_clarification');
     if (pending) {
@@ -2612,6 +2665,7 @@ export class Controller {
     if (role === 'reviewer' && view.state === 'completed') {
       try {
         if (digest(await fs.readFile(path.join(this.workspaceRoot, t.id, ref.packet_directory || 'review', 'evidence.json'), 'utf8')) !== ref.packet_hash) throw Error('packet changed');
+        if (view.output_truncated) throw Error('incomplete review output');
         const raw = JSON.parse(view.latest_output?.replace(/^```(?:json)?\s*|\s*```$/g, ''));
         const c = JSON.parse(await fs.readFile(path.join(this.workspaceRoot, t.id, 'contract.json'), 'utf8'));
         const required = [...c.requirements, ...c.invariants].map(x => x.id).concat(['SCOPE', 'TEST_EVIDENCE']);
@@ -2619,7 +2673,12 @@ export class Controller {
         view.findings = raw.findings; view.overall = raw.overall;
       } catch { view.state = 'needs_attention'; view.error = 'INVALID_REVIEW_OUTPUT'; }
     }
-    const fresh = this.task(t.id); fresh[role].state = view.state; fresh[role].turn_id = view.turn_id;
+    const fresh = this.task(t.id);
+    if (this.closed || fresh.cleaned || fresh[role]?.session_id !== ref.session_id || fresh[role].deleted || fresh[role].stale) return view;
+    view.human_attention_required = ['waiting_for_clarification', 'needs_attention'].includes(view.state);
+    Object.assign(fresh[role], { state: view.state, turn_id: view.turn_id,
+      clarification_required: view.clarification_required, human_attention_required: view.human_attention_required });
+    if (view.error) fresh[role].error = view.error; else delete fresh[role].error;
     this.retainAPIItems(fresh, role, [...page.data].reverse(), view.turn_id);
     if (role === 'reviewer') fresh[role].review_result = view.overall ? { overall: view.overall, findings: view.findings, packet_hash: ref.packet_hash, turn_id: view.turn_id } : null;
     this.save(fresh);
@@ -2730,7 +2789,10 @@ export class Controller {
       } else {
         if (refresh && !versioned && !storageDiagnostic && t[role].state === 'failed' && !this.diagnostic(t[role])) this.recordFailure(id, role, { reason: t[role].deleted ? 'Remote session already deleted; original diagnostic was not retained' : 'No retained API diagnostic' });
         const d = this.diagnostic(t[role]);
-        result[role] = { state: t[role].state, session_id: t[role].session_id || null, turn_id: t[role].turn_id || null, environment_id: t[role].environment_id || null, error: d ? d.api_error?.code || d.status : t[role].error || null, failure_diagnostic: d, latest_output: d?.latest_output?.text || null };
+        result[role] = { state: t[role].state, session_id: t[role].session_id || null, turn_id: t[role].turn_id || null, environment_id: t[role].environment_id || null, error: d ? d.api_error?.code || d.status : t[role].error || null, failure_diagnostic: d, latest_output: d?.latest_output?.text || null,
+          clarification_required: t[role].clarification_required === true, human_attention_required: t[role].human_attention_required === true,
+          ...(role === 'reviewer' ? { overall: this.discloseReview(t[role], t.evidence_contract?.contract).overall,
+            packet_hash: t[role].packet_hash, ...(t[role].reviewed_git_state ? { reviewed_git_state: t[role].reviewed_git_state } : {}) } : {}) };
       }
     }
     if (t.repository) {
