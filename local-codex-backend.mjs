@@ -65,6 +65,38 @@ export function validateRoute(config, response, reviewOnly = false) {
   return JSON.stringify([account.type, account.email, account.planType]);
 }
 
+function parseFrame(frame) {
+  // Check raw member names before JSON.parse can discard duplicates. Only
+  // string tokens followed by ':' are keys; JSON.parse still owns syntax
+  // validation. Track each object separately, including objects in arrays.
+  const containers = [];
+  for (let index = 0; index < frame.length; index++) {
+    const character = frame[index];
+    if (character === '{') containers.push(new Set());
+    else if (character === '[') containers.push(null);
+    else if (character === '}' || character === ']') containers.pop();
+    else if (character === '"') {
+      const start = index++;
+      while (index < frame.length && frame[index] !== '"') {
+        if (frame[index] === '\\') index++;
+        index++;
+      }
+      if (index >= frame.length) throw error('CODEX_PROTOCOL_ERROR');
+      let next = index + 1;
+      while (next < frame.length && ' \t\r\n'.includes(frame[next])) next++;
+      if (frame[next] === ':') {
+        const keys = containers.at(-1);
+        if (!keys) throw error('CODEX_PROTOCOL_ERROR');
+        // Decode a single string token, never an object whose keys are lost.
+        const key = JSON.parse(frame.slice(start, index + 1));
+        if (keys.has(key)) throw error('CODEX_DUPLICATE_JSON_KEY');
+        keys.add(key);
+      }
+    }
+  }
+  return JSON.parse(frame);
+}
+
 class Rpc {
   constructor(binary, args, options, receive, failed, spawnProcess) {
     this.nextId = 0; this.pending = new Map(); this.buffer = ''; this.failed = failed;
@@ -80,7 +112,7 @@ class Rpc {
         let newline;
         while ((newline = this.buffer.indexOf('\n')) >= 0) {
           if (newline > limit) throw error('CODEX_FRAME_TOO_LARGE');
-          const message = JSON.parse(this.buffer.slice(0, newline)); this.buffer = this.buffer.slice(newline + 1);
+          const message = parseFrame(this.buffer.slice(0, newline)); this.buffer = this.buffer.slice(newline + 1);
           if (message.method) receive(message);
           else {
             const pending = this.pending.get(message.id);

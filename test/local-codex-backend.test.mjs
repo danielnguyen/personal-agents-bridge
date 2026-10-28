@@ -340,6 +340,149 @@ test('global thread status exception never admits foreign execution, terminal or
   });
 });
 
+// Literal wire frames: object construction/stringification would erase the defect.
+test('raw duplicate JSON keys cannot enter the global thread status exception', async context => {
+  const frames = [
+    ['method', String.raw`{"method":"turn/completed","method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped method', String.raw`{"method":"turn/completed","metho\u0064":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['params', String.raw`{"method":"thread/status/changed","params":null,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped params', String.raw`{"method":"thread/status/changed","params":null,"param\u0073":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['threadId', String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped threadId', String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","thread\u0049d":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['status', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed"},"status":{"type":"idle"}}}`],
+    ['escaped status', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed"},"statu\u0073":{"type":"idle"}}}`],
+    ['status.type', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed","type":"idle"}}}`],
+    ['escaped status.type', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed","typ\u0065":"idle"}}}`],
+    ['status.activeFlags', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"active","activeFlags":["unknown"],"activeFlags":[]}}}`],
+    ['escaped status.activeFlags', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"active","activeFlags":["unknown"],"active\u0046lags":[]}}}`],
+    ['emittedAtMs', String.raw`{"method":"thread/status/changed","emittedAtMs":null,"emittedAtMs":123,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped emittedAtMs', String.raw`{"method":"thread/status/changed","emittedAtMs":null,"emittedAtM\u0073":123,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+  ];
+  assert.equal(frames.length, 14);
+  for (const early of [true, false]) for (const [name, frame] of frames) await context.test(`${name}; early=${early}`, async t => {
+    const progress = [], lifecycle = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, items, complete }) => {
+      nextTurn();
+      const emit = () => { child.stdout.write(frame + '\n'); items(); complete(); };
+      if (early) emit(); else setImmediate(emit);
+      return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); }, onLifecycle: event => { lifecycle.push(event); },
+      onApproval: () => assert.fail('Ambiguous frame cannot approve'), onQuestion: () => assert.fail('Ambiguous frame cannot request input') });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_DUPLICATE_JSON_KEY'));
+    assert.deepEqual(progress, []); assert.deepEqual(result.commands, []); assert.deepEqual(result.messages, []); assert.deepEqual(result.files, []);
+    assert(!lifecycle.some(event => event.phase === 'terminal_observed' || event.phase === 'human_request'));
+    assert.equal(value.replies.length, 0); assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw admission rejects duplicate keys in active metadata and RPC responses too', async context => {
+  const frames = [
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"type":"idle","type":"idle"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"typ\u0065":"idle","type":"idle"}}}`,
+    String.raw`{"id":0,"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"}}}`,
+    String.raw`{"id":REQUEST_ID,"result":null,"result":{"turn":{"id":"turn-1"}}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":[{"key":1,"key":2}]}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":[{"__proto__":1,"\u005f_proto__":2}]}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":{"\ud83d\ude80":1,"🚀":2}}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":{"a\\b":1,"a\u005cb":2}}}`,
+  ];
+  for (const [index, frame] of frames.entries()) await context.test(String(index), async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, requests, complete }) => {
+      nextTurn(); child.stdout.write(frame.replace('REQUEST_ID', requests.at(-1).id) + '\n'); complete();
+      return undefined;
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_DUPLICATE_JSON_KEY')); assert.deepEqual(progress, []);
+    assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw admission preserves legal keys, strings, arrays, nesting and fragmented frames', async context => {
+  const extra = String.raw`{"same":1,"Same":2,"__proto__":3,"constructor":4,"type":5,"typ\\u0065":6,"a\"b":7,"a\\b":8,"":9,"☃":10,"🚀":11,"array":[{"key":1},{"key":2},null,true,false,-2.5e+3,[],{}],"text":"{\"type\":1,\"type\":2}: [] \\ \" \b \f \n \r \t \u0061"}`;
+  for (const fragmented of [false, true]) await context.test('fragmented=' + fragmented, async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, requests, items, complete }) => {
+      nextTurn();
+      const response = '{"id":' + requests.at(-1).id + ',"result":{"turn":{"id":"turn-1","status":"inProgress"},"extra":' + extra + ',"deep":' + '['.repeat(12000) + '0' + ']'.repeat(12000) + '}}\r\n';
+      child.stdout.write(response);
+      setImmediate(() => {
+        const frames = String.raw`{"metho\u0064":"thread/status/changed","params":{"thread\u0049d":"unrelated-thread","status":{"typ\u0065":"active","activeFlags":["waitingOnApproval","waitingOnUserInput"]}},"emittedAtMs":123,"jsonrpc":"2.0"}` + '\n' +
+          String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"type":"idle"}}}` + '\n';
+        if (fragmented) for (const character of frames) child.stdout.write(character);
+        else child.stdout.write(frames);
+        items(); complete();
+      });
+      return undefined;
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'completed'); assert.equal(result.terminalObserved, true);
+    assert.equal(result.commands.length, 1); assert.equal(result.messages.length, 1);
+    assert.equal(progress.filter(event => event.method === 'thread/status/changed').length, 1);
+    assert(!JSON.stringify(progress).includes('unrelated-thread'));
+  });
+});
+
+test('raw foreign execution, terminal, approval and human requests retain identity rejection', async context => {
+  const frames = [
+    String.raw`{"method":"item/completed","params":{"threadId":"foreign-thread","turnId":"turn-1","item":{"id":"foreign-command","type":"commandExecution","command":"FOREIGN_OUTPUT","status":"completed","exitCode":0}}}`,
+    String.raw`{"method":"turn/completed","params":{"threadId":"foreign-thread","turn":{"id":"turn-1","status":"completed"}}}`,
+    String.raw`{"id":0,"method":"item/commandExecution/requestApproval","params":{"threadId":"foreign-thread","turnId":"turn-1"}}`,
+    String.raw`{"id":0,"method":"item/tool/requestUserInput","params":{"threadId":"foreign-thread","turnId":"turn-1"}}`,
+  ];
+  for (const early of [true, false]) for (const [index, frame] of frames.entries()) await context.test(`${index}; early=${early}`, async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); const emit = () => { child.stdout.write(frame + '\n'); complete(); };
+      if (early) emit(); else setImmediate(emit);
+      return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); },
+      onApproval: () => assert.fail('Foreign approval'), onQuestion: () => assert.fail('Foreign human request') });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('EVENT_THREAD_MISMATCH'));
+    assert.deepEqual(result.commands, []); assert.deepEqual(result.messages, []); assert.deepEqual(result.files, []);
+    assert.deepEqual(progress, []); assert.deepEqual(value.replies, []);
+    assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw malformed JSON remains rejected without dispatch or completion', async context => {
+  const frames = [
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}},}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle\q"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle\u00ZZ"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}},"unterminated":"` + '\\',
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}} {}`,
+  ];
+  for (const [index, frame] of frames.entries()) await context.test(String(index), async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); setImmediate(() => { child.stdout.write(frame + '\n'); complete(); }); return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_PROTOCOL_ERROR')); assert.deepEqual(progress, []);
+  });
+});
+
+test('raw admission preserves the existing complete and partial frame size limits', async context => {
+  for (const terminated of [false, true]) await context.test('terminated=' + terminated, async t => {
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); setImmediate(() => {
+        child.stdout.write(' '.repeat(1024 * 1024 + 1) + (terminated ? '\n' : '')); complete();
+      }); return { turn: { id: 'turn-1' } };
+    } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_FRAME_TOO_LARGE'));
+  });
+});
+
 test('global thread status rejects malformed or ambiguous notifications', async context => {
   const valid = { threadId: 'unrelated-thread', status: { type: 'idle' } };
   const malformed = [null, [], {}, { status: valid.status }, { ...valid, threadId: '' }, { ...valid, threadId: 42 },
