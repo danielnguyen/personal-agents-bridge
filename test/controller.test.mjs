@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, constants as sqlite } from 'node:sqlite';
-import { Controller, safeRelative, redact, digest } from '../controller.mjs';
+import { Controller, safeRelative, redact, digest, discloseObservation, taskReportSchema } from '../controller.mjs';
 import { authorizePersonalTunnel, createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -30,6 +30,16 @@ async function statusClient(t, c, authorize = async () => {}) {
   t.after(async () => { await client.close(); await server.close(); });
   return { client, get: id => client.callTool({ name: 'get_task', arguments: { task_id: id } }) };
 }
+async function currentReviewStillRejected(c, id, response) {
+  // Reporting now checks retained evidence without Git. Keep the original
+  // live qualification negatives independently asserted on the unchanged
+  // Controller qualifier, rather than treating historical findings as authority.
+  assert.equal(response.structuredContent.automatic.review.current_authority_verified, false);
+  assert.equal(response.structuredContent.automatic.review.execution_authorized, false);
+  const current = await c.automaticReviewSummary(c.task(id));
+  assert.equal(current.potentially_correctable, false);
+  return current;
+}
 async function statusFiles(...roots) {
   const entries = [];
   async function walk(file) {
@@ -41,6 +51,487 @@ async function statusFiles(...roots) {
   for (const root of roots) await walk(root);
   return JSON.stringify(entries);
 }
+async function readEvidence(c, id, section, limit = 16000) {
+  let cursor, text = '', redacted = false, snapshot;
+  do {
+    const page = await c.invoke('get_task_evidence', { task_id: id, section, cursor, limit }, {}, input => c.taskEvidence(input));
+    assert(Buffer.byteLength(page.content) <= limit);
+    assert.equal(page.offset, Buffer.byteLength(text));
+    snapshot ||= page.snapshot_sha256; assert.equal(page.snapshot_sha256, snapshot);
+    text += page.content; redacted ||= page.redacted; cursor = page.next_cursor || undefined;
+  } while (cursor);
+  return { data: JSON.parse(text), text, redacted };
+}
+const disclosureCases = [
+  'Authorization: Basic SYNTHETIC_BASIC_CREDENTIAL\r\nX-Trace: ARBITRARY_RAW_LITERAL',
+  'Authorization: Digest username="SYNTHETIC_USER", response="SYNTHETIC_RESPONSE"',
+  'Proxy-Authorization: Basic SYNTHETIC_PROXY_CREDENTIAL',
+  '{"Authorization":["Basic SYNTHETIC_ARRAY_CREDENTIAL"]}',
+  '{"Authorizatio\\u006e":"Basic SYNTHETIC_ESCAPED_CREDENTIAL"}',
+  '{"nested":[{"pRoXy-AuThOrIzAtIoN":{"credential":"SYNTHETIC_OBJECT_CREDENTIAL"}}]}',
+  JSON.stringify(JSON.stringify('{"Authorization":"Basic SYNTHETIC_ENCODED_CREDENTIAL"}')),
+  '```json\n{"Authorization":"Basic SYNTHETIC_FENCED_CREDENTIAL"}\n```',
+  '{"Authorizatio\\u006e":["Basic SYNTHETIC_MALFORMED_CREDENTIAL"]',
+  '{"Authorization":"Basic SYNTHETIC_DUPLICATE_CREDENTIAL","Authorization":"[REDACTED]"}',
+  '['.repeat(80) + '"SYNTHETIC_DEEP_CREDENTIAL"' + ']'.repeat(80),
+  'SYNTHETIC_OVERSIZED_CREDENTIAL ' + 'x'.repeat(20000),
+  'ARBITRARY_RAW_LITERAL without any sensitive key or credential pattern',
+];
+
+// Drive the existing Agents API event stream, acknowledging only after the
+// Controller has finished processing each event. No status read drives it.
+function reportingEvents(api) {
+  const streams = new Map();
+  api.events.stream = async id => {
+    let wake, ended = false;
+    const queue = [];
+    const stream = { controller: { abort() { ended = true; wake?.(); } },
+      async *[Symbol.asyncIterator]() {
+        while (!ended) {
+          if (!queue.length) await new Promise(resolve => { wake = resolve; });
+          if (ended) break;
+          const item = queue.shift(); yield item.event; item.done();
+        }
+      } };
+    streams.set(id, { queue, wake: () => wake?.() }); return stream;
+  };
+  return (id, event) => new Promise(resolve => {
+    const stream = streams.get(id); assert(stream, 'Owned session must already have an event stream');
+    stream.queue.push({ event, done: resolve }); stream.wake();
+  });
+}
+
+test('reporting lifecycle persists Agents API pending clarification before observational MCP reads', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.pending(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action', session: api.rows.get(x.implementer.session_id) });
+  const { get } = await statusClient(t, c), before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  const calls = [api.created.length, api.sent.length];
+  for (let read = 0; read < 2; read++) {
+    const response = await get(x.task_id); assert.notEqual(response.isError, true);
+    const status = response.structuredContent;
+    assert.equal(status.state, 'waiting_for_clarification');
+    assert.equal(status.implementer.clarification_required, true); assert.equal(status.implementer.human_attention_required, true);
+    assert(status.next_steps.includes('owner_resolve_attention'));
+    assert.equal((await readEvidence(c, x.task_id, 'outcome', 256)).data.state, status.state);
+    assert(!JSON.stringify(response).includes('Which name?'));
+  }
+  assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+  assert.deepEqual([api.created.length, api.sent.length], calls);
+});
+
+test('reporting lifecycle retains qualified Agents API reviewer FAIL without a refreshing status read', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.completed(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.turn.completed', turn_id: api.rows.get(x.implementer.session_id).turns[0].id });
+  await c.review({ task_id: x.task_id, request_id: 'reporting_review' }); await Promise.all([...c.jobs.values()]);
+  const sid = c.task(x.task_id).reviewer.session_id;
+  api.completed(sid, JSON.stringify({ overall: 'FAIL', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id =>
+    ({ id, status: id === 'R2' ? 'FAIL' : 'PASS', evidence: 'ARBITRARY_RAW_LITERAL Authorization: Basic SYNTHETIC_CREDENTIAL' })) }));
+  await emit(sid, { type: 'agent.session.turn.completed', turn_id: api.rows.get(sid).turns[0].id });
+  const { get } = await statusClient(t, c), before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  const calls = [api.created.length, api.sent.length];
+  for (const method of ['save', 'observe', 'publish', 'continue', 'review', 'repositoryEvidence']) c[method] = () => assert.fail(`Reporting cannot invoke ${method}`);
+  api.retrieve = api.items.list = api.turns.list = () => assert.fail('Reporting cannot refresh API facts');
+  for (let read = 0; read < 2; read++) {
+    const response = await get(x.task_id); assert.notEqual(response.isError, true); noRaw(response);
+    assert.equal(response.structuredContent.reviewer.overall, 'FAIL');
+    assert.deepEqual(response.structuredContent.explanation.failed_requirements, ['R2']);
+    for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+      const result = await readEvidence(c, x.task_id, section, 256); noRaw(result.text);
+      if (section === 'review') { assert.equal(result.data.overall, 'FAIL'); assert.equal(result.data.findings[1].id, 'R2'); }
+    }
+  }
+  assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+  assert.deepEqual([api.created.length, api.sent.length], calls);
+});
+
+for (const mode of ['missing_findings', 'contradictory', 'truncated', 'packet_changed', 'unverified_event'])
+test(`reporting lifecycle does not qualify Agents API ${mode} reviewer output`, { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  api.completed(x.implementer.session_id);
+  await c.review({ task_id: x.task_id, request_id: 'reporting_invalid_review' }); await Promise.all([...c.jobs.values()]);
+  const ref = c.task(x.task_id).reviewer;
+  const output = { overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id =>
+    ({ id, status: 'PASS', evidence: 'ARBITRARY_RAW_LITERAL' })) };
+  if (mode === 'missing_findings') output.findings.pop();
+  if (mode === 'contradictory') output.findings[0].status = 'FAIL';
+  if (mode === 'packet_changed') {
+    const file = path.join(c.workspaceRoot, x.task_id, ref.packet_directory, 'evidence.json');
+    await fs.chmod(file, 0o600); await fs.appendFile(file, ' ');
+  }
+  if (mode !== 'unverified_event') api.completed(ref.session_id, (mode === 'truncated' ? ' '.repeat(16001) : '') + JSON.stringify(output));
+  await emit(ref.session_id, { type: 'agent.session.turn.completed', turn_id: api.rows.get(ref.session_id).turns[0].id,
+    turn: { status: 'completed' }, output: JSON.stringify(output) });
+  const before = statusLedger(c.db), status = await c.reportTask(x.task_id), review = (await readEvidence(c, x.task_id, 'review', 256)).data;
+  noRaw(status); noRaw(review);
+  assert.equal(status.reviewer.overall, null); assert.equal(review.overall, null); assert.equal(review.unavailable, true);
+  assert.deepEqual(status.explanation.failed_requirements, []); assert.equal(status.remaining_authority.execution_authorized, false);
+  if (mode === 'unverified_event') assert.equal(status.reviewer.state, 'running');
+  else { assert.equal(status.reviewer.state, 'needs_attention'); assert.equal(status.reviewer.error, 'INVALID_REVIEW_OUTPUT');
+    assert.equal(status.reviewer.human_attention_required, true); assert(status.next_steps.includes('owner_resolve_attention')); }
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('reporting lifecycle takes clarification from verified API state rather than an event claim', { timeout: 30000 }, async t => {
+  const { c, api } = await setup(t), emit = reportingEvents(api), x = await started(c);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action', session: { status: 'requires_action',
+    required_actions: [{ type: 'function_call', name: 'request_clarification', arguments: { question: 'ARBITRARY_RAW_LITERAL' } }] } });
+  assert.equal((await c.reportTask(x.task_id)).implementer.clarification_required, false);
+  api.pending(x.implementer.session_id);
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action' });
+  await c.continue({ task_id: x.task_id, instruction: 'Example', request_id: 'reporting_answer' });
+  await emit(x.implementer.session_id, { type: 'agent.session.requires_action' });
+  const status = await c.reportTask(x.task_id);
+  assert.equal(status.state, 'running'); assert.equal(status.implementer.clarification_required, false);
+  assert.equal(status.implementer.human_attention_required, false); assert(!status.next_steps.includes('owner_resolve_attention'));
+});
+
+test('reporting lifecycle stream attachment reconciles pending API state after restart before status reads', { timeout: 30000 }, async t => {
+  const { c, api, executor } = await setup(t), x = await started(c);
+  api.pending(x.implementer.session_id); await c.close();
+  const emit = reportingEvents(api);
+  const recovered = await new Controller({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot, api, executor, secrets: [] }).init();
+  t.after(() => recovered.close());
+  // A non-lifecycle event is only a stream-consumption barrier. It cannot
+  // trigger viewRole: attachment itself must have persisted the API snapshot.
+  await emit(x.implementer.session_id, { type: 'agent.session.output_text.delta', delta: 'ARBITRARY_RAW_LITERAL' });
+  const before = statusLedger(recovered.db), files = await statusFiles(recovered.stateRoot, recovered.workspaceRoot);
+  api.retrieve = api.items.list = api.turns.list = () => assert.fail('Reporting cannot refresh after restart');
+  const status = await recovered.reportTask(x.task_id);
+  assert.equal(status.state, 'waiting_for_clarification'); assert.equal(status.implementer.human_attention_required, true); noRaw(status);
+  assert.equal((await readEvidence(recovered, x.task_id, 'outcome', 256)).data.state, status.state);
+  assert.equal(statusLedger(recovered.db), before); assert.equal(await statusFiles(recovered.stateRoot, recovered.workspaceRoot), files);
+  assert.equal(api.created.length, 1); assert.equal(api.sent.length, 1);
+  await recovered.close();
+});
+
+function noRaw(value) {
+  const text = JSON.stringify(value);
+  for (const fragment of ['SYNTHETIC_', 'CREDENTIAL', 'ARBITRARY_RAW_LITERAL']) assert(!text.includes(fragment), `Raw content escaped disclosure: ${fragment}`);
+}
+
+test('typed disclosure uses the pinned library only for bounded decoded observation metadata', () => {
+  for (const key of ['Authorization', 'pRoXy-AuThOrIzAtIoN', 'Authorizatio\u006e']) for (const payload of
+    ['Basic SYNTHETIC_CREDENTIAL', ['SYNTHETIC_CREDENTIAL'], { nested: 'SYNTHETIC_CREDENTIAL' }]) {
+    const input = { [key]: payload, text: 'ARBITRARY_RAW_LITERAL', exit_code: 7, command_index: 2, status: 'failed' };
+    const before = JSON.stringify(input), result = discloseObservation(input);
+    noRaw(result); assert.equal(result.exit_code, 7); assert.equal(result.withheld, true); assert.equal(result.status, 'failed');
+    assert.equal(JSON.stringify(input), before, 'Library must not mutate retained input');
+  }
+  for (const payload of [{ nodes: Array(2200).fill({ x: 'SYNTHETIC_CREDENTIAL' }) },
+    JSON.parse('['.repeat(80) + '{}' + ']'.repeat(80))]) {
+    const result = discloseObservation({ metadata: payload }); noRaw(result);
+    assert.equal(result.reason, 'UNSUPPORTED_OR_EXCESSIVE_WITHHELD');
+  }
+  assert.equal(discloseObservation('ARBITRARY_RAW_LITERAL').withheld, true);
+  assert.equal(discloseObservation(null).unavailable, true);
+  // Arbitrary strings cannot masquerade as metadata, even with familiar keys.
+  noRaw(discloseObservation({ exit_code: 'SYNTHETIC_CREDENTIAL', status: 'ARBITRARY_RAW_LITERAL', redacted: 'SYNTHETIC_CREDENTIAL' }));
+});
+
+test('typed task evidence explains historical FAIL and withholds original detail through cleanup and restart', async t => {
+  const { c, id, calls, publisherCalls, root } = await automaticAttempt(t, { versioned: true });
+  const task = c.task(id); delete task.evidence_contract;
+  task.local_validation.results = [{ provenance: 'controller_process_observation', command_index: 0, command: 'ARBITRARY_RAW_LITERAL',
+    exit_code: 7, completion_observed: true, independently_observed: true, stdout: { text: 'SYNTHETIC_CREDENTIAL', truncated: true } }];
+  c.save(task);
+  const summary = await c.reportTask(id); noRaw(summary);
+  assert(summary.explanation.failed_requirements.includes('R1')); assert.equal(summary.explanation.failed_validation_commands[0].exit_code, 7);
+  const review = (await readEvidence(c, id, 'review', 256)).data;
+  assert.equal(review.overall, 'FAIL'); assert.equal(review.findings[0].id, 'R1'); assert(review.findings[0].evidence.withheld);
+  assert.equal(review.findings[0].classification.kind, 'implementation_defect');
+  const validation = (await readEvidence(c, id, 'validation')).data;
+  assert.equal(validation.results[0].exit_code, 7); assert(validation.results[0].stdout.withheld); noRaw(validation);
+  const candidate = (await readEvidence(c, id, 'candidate', 256)).data;
+  assert.equal(candidate.reviewed_git_state.tree_sha, task.reviewer.reviewed_git_state.tree_sha);
+  assert(candidate.files[0].content.withheld); assert.equal(candidate.files[0].path, undefined);
+  assert.equal(candidate.execution_authorized, false); assert.equal(candidate.files[0].candidate, undefined);
+  await c.cleanup({ task_id: id, delete_workspace: true });
+  assert.deepEqual((await readEvidence(c, id, 'candidate')).data, candidate);
+  await c.close();
+  const recovered = await new Controller({ stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'work'),
+    api: new FakeAPI(), executor: new FakeExecutor(), localBackendFactory: () => assert.fail('Read cannot execute a model') }).init();
+  try {
+    const before = statusLedger(recovered.db), files = await statusFiles(recovered.stateRoot, recovered.workspaceRoot);
+    for (let count = 0; count < 2; count++) {
+      assert.equal((await recovered.reportTask(id)).state, 'cleaned');
+      assert.deepEqual((await readEvidence(recovered, id, 'candidate')).data, candidate);
+      assert.equal((await readEvidence(recovered, id, 'review')).data.overall, 'FAIL');
+    }
+    assert.equal(statusLedger(recovered.db), before); assert.equal(await statusFiles(recovered.stateRoot, recovered.workspaceRoot), files);
+  } finally { await recovered.close(); }
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('typed disclosure withholds every raw fixture from both MCP surfaces, every section and every page without mutations', async t => {
+  const { c, id, calls, publisherCalls, normal } = await automaticAttempt(t, { versioned: true });
+  const { client, get } = await statusClient(t, c);
+  for (const payload of disclosureCases) {
+    const task = c.task(id), result = task.reviewer.review_result;
+    const packet = JSON.parse(attemptRows(c, id).map(row => JSON.parse(row.value)).find(record => record.packet_utf8).packet_utf8);
+    packet.current['greeting.txt'] = payload; packet.diff = payload;
+    const text = JSON.stringify(packet); task.reviewer.packet_hash = digest(text); task.retained_packet = { text, sha256: digest(text) };
+    result.packet_hash = task.reviewer.packet_hash; result.findings[0].evidence = payload;
+    result.findings[0].classification.remedy.description = payload;
+    task.reviewer.findings_sha256 = digest(result);
+    task.reviewer.received_review_output.output = payload; task.reviewer.received_output_sha256 = digest(task.reviewer.received_review_output);
+    task.implementer.evidence_messages = [{ provenance: 'model_statement', text: payload, redacted: true, truncated: true }];
+    task.implementer.local.latest_model_output = payload; task.implementer.error = payload; task.implementer.local.diagnostics = [payload];
+    task.local_execution_evidence.commands = [{ exit_code: 7, command: { value: payload }, output: { value: payload, redacted: true } }];
+    task.implementer.evidence_commands = [{ command: { text: payload }, output: { text: payload }, stdout: { text: payload }, stderr: { text: payload }, exit_code: 7 }];
+    task.local_validation.results = [{ command: payload, exit_code: 7, stdout: { text: payload, redacted: true }, stderr: { text: payload } }];
+    task.automatic.reason = payload; task.automatic.authorization.publish.body = payload;
+    task.previous_reviewers = [{ ...task.reviewer, independent_validation: task.local_validation }];
+    // Existing private records can contain raw output, even when marked redacted.
+    c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+    const before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot, normal);
+    for (let read = 0; read < 2; read++) {
+      const status = await get(id); assert.notEqual(status.isError, true); noRaw(status);
+      assert.equal(status.structuredContent.disclosure, 'typed_metadata_only');
+      for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+        let cursor, joined = '', pages = 0;
+        do {
+          const response = await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, section, limit: 256, ...(cursor ? { cursor } : {}) } });
+          assert.notEqual(response.isError, true); noRaw(response);
+          const page = response.structuredContent; assert(page.redacted); assert(Buffer.byteLength(page.content) <= 256);
+          joined += page.content; cursor = page.next_cursor; pages++;
+        } while (cursor);
+        noRaw(joined); const data = JSON.parse(joined); assert.equal(data.disclosure, 'typed_metadata_only');
+        assert(pages > 1); if (section === 'review') assert.equal(data.overall, 'FAIL');
+      }
+    }
+    assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot, normal), files);
+  }
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('typed disclosure preserves private raw evidence and authority without qualifying incomplete reviewer receipts', async t => {
+  const payload = 'Authorization: Basic SYNTHETIC_CREDENTIAL';
+  const { c, id, calls, publisherCalls } = await automaticAttempt(t, { versioned: true, output(output) { output.findings[0].evidence = payload; } });
+  const task = c.task(id), authority = JSON.stringify(task.automatic.authorization);
+  assert(task.reviewer.received_review_output.output.includes('SYNTHETIC_CREDENTIAL'));
+  c.retainTaskMessage(task, 'implementer', 'ARBITRARY_RAW_LITERAL'); c.save(task);
+  const before = statusLedger(c.db); noRaw(await c.reportTask(id)); noRaw(await readEvidence(c, id, 'review'));
+  assert.equal(statusLedger(c.db), before); assert.equal(JSON.stringify(c.task(id).automatic.authorization), authority);
+  assert.equal(c.task(id).implementer.evidence_messages[0].text, 'ARBITRARY_RAW_LITERAL');
+  task.reviewer.received_review_output.complete = false;
+  task.reviewer.received_output_sha256 = digest(task.reviewer.received_review_output);
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const review = (await readEvidence(c, id, 'review')).data;
+  assert.equal(review.overall, null); assert(review.unavailable); assert.equal(review.model_output.qualified, false);
+  assert.deepEqual(calls, ['implementer', 'reviewer']); assert.deepEqual(publisherCalls, []);
+});
+
+test('typed get_task reads manual and automatic tasks without saving, API observation, validation or authority changes', async t => {
+  const { c, api, executor } = await setup(t), started = await c.start({ contract: contract(), request_id: 'manual_reporting' });
+  await Promise.all([...c.jobs.values()]);
+  const id = started.task_id, task = c.task(id); task.implementer.state = 'failed';
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const { get } = await statusClient(t, c);
+  const before = statusLedger(c.db), files = await statusFiles(c.stateRoot, c.workspaceRoot);
+  const mocks = ['save', 'observe', 'recordFailure', 'repositoryEvidence', 'runLocalValidation', 'runCorrection', 'publish'].map(name =>
+    t.mock.method(c, name, () => assert.fail(`Read cannot call ${name}`)));
+  const activity = [api.created.length, api.sent.length, executor.started.length];
+  try {
+    for (let read = 0; read < 3; read++) { const result = await get(id); assert.notEqual(result.isError, true); assert.equal(result.structuredContent.state, 'failed'); }
+    assert.equal(statusLedger(c.db), before); assert.equal(await statusFiles(c.stateRoot, c.workspaceRoot), files);
+    assert.deepEqual([api.created.length, api.sent.length, executor.started.length], activity);
+  } finally { for (const mock of mocks) mock.mock.restore(); }
+});
+
+for (const state of ['PASS', 'needs_attention', 'uncertain', 'interrupted', 'expired', 'publication', 'correction'])
+test(`typed task evidence explains ${state} outcomes with no historical authority`, async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }); const task = c.task(id);
+  if (state === 'PASS') { task.reviewer.review_result.overall = 'PASS'; task.reviewer.findings_sha256 = digest(task.reviewer.review_result); }
+  else if (state === 'expired') task.deadline = 1;
+  else if (state === 'publication') { task.publication = { phase: 'pr_attempted', pr_attempted: true }; task.publication_error = 'PR_RESPONSE_UNCONFIRMED'; }
+  else if (state === 'correction') task.automatic.correction = { task_id: id, parent_task_id: id, rejected_tree_sha: task.reviewer.reviewed_git_state.tree_sha };
+  else { task.automatic.status = state; task.automatic.reason = state === 'needs_attention' ? 'LOCAL_HUMAN_ATTENTION_REQUIRED' : 'AUTOMATIC_RESTART_NO_REPLAY'; }
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  const before = statusLedger(c.db), outcome = (await readEvidence(c, id, 'outcome')).data;
+  assert.equal(outcome.execution_authorized, false);
+  if (state === 'PASS') assert.equal((await readEvidence(c, id, 'review')).data.overall, 'PASS');
+  else if (state === 'expired') assert(outcome.expired_now);
+  else if (state === 'publication') assert.equal(outcome.publication_error, 'PR_RESPONSE_UNCONFIRMED');
+  else if (state === 'correction') assert.equal(outcome.correction.task_id, id);
+  else { assert.equal(outcome.state, state); assert.equal(outcome.reason, task.automatic.reason); }
+  assert.equal(statusLedger(c.db), before);
+});
+
+test('typed task evidence keeps actionable findings separate from currently remaining authority', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }); const before = statusLedger(c.db);
+  const status = await c.reportTask(id), review = (await readEvidence(c, id, 'review')).data;
+  assert.equal(review.findings[0].classification.kind, 'implementation_defect');
+  assert.equal(status.automatic.review.potentially_correctable, true);
+  assert(status.next_steps.includes('request_new_task')); assert.equal(status.automatic.review.execution_authorized, false);
+  assert.equal(status.remaining_authority.remaining_corrections, 0); assert.equal(status.remaining_authority.execution_authorized, false);
+  assert.equal(status.automatic.limits.max_codex_turns, c.task(id).automatic.authorization.max_codex_turns);
+  assert.equal(status.automatic.limits.publish, undefined); assert.equal(statusLedger(c.db), before);
+});
+
+test('typed task evidence preserves pagination, ownership, snapshot binding and strict MCP authorization', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }); const task = c.task(id);
+  c.retainTaskMessage(task, 'implementer', 'ARBITRARY_RAW_LITERAL'); c.save(task);
+  const first = await c.taskEvidence({ task_id: id, section: 'implementer', limit: 256 }); assert(first.next_cursor);
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'review', cursor: first.next_cursor }), /INVALID_EVIDENCE_CURSOR/);
+  const other = await c.start({ contract: contract(), request_id: 'evidence_other' }); await Promise.all([...c.jobs.values()]);
+  await assert.rejects(c.taskEvidence({ task_id: other.task_id, section: 'implementer', cursor: first.next_cursor }), /INVALID_EVIDENCE_CURSOR/);
+  c.retainTaskMessage(task, 'implementer', 'Changed retained output'); c.save(task);
+  await assert.rejects(c.taskEvidence({ task_id: id, section: 'implementer', cursor: first.next_cursor }), /EVIDENCE_CHANGED_RESTART_PAGINATION/);
+  for (const limit of [0, 255, 16001, 1.5]) await assert.rejects(c.taskEvidence({ task_id: id, limit }), /INVALID_EVIDENCE_REQUEST/);
+  const { client } = await statusClient(t, c, async () => { throw Error('Denied'); });
+  assert((await client.callTool({ name: 'get_task', arguments: { task_id: id } })).isError);
+  assert((await client.callTool({ name: 'get_task_evidence', arguments: { task_id: id } })).isError);
+  const allowed = await statusClient(t, c);
+  for (const args of [{ path: '/private/auth.json' }, { command: 'true' }, { section: 'private' }, { limit: 16001 }]) {
+    assert((await allowed.client.callTool({ name: 'get_task_evidence', arguments: { task_id: id, ...args } })).isError);
+  }
+  await assert.rejects(c.taskEvidence({ task_id: id, packet_sha256: 'a'.repeat(64), section: 'review' }), /EVIDENCE_ATTEMPT_UNAVAILABLE/);
+});
+
+test('typed task evidence reports missing packets, changed Git bindings and missing historical output without reading live source', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }); const task = c.task(id);
+  const original = (await readEvidence(c, id, 'candidate')).data;
+  await fs.writeFile(path.join(c.workspaceRoot, id, 'repo/greeting.txt'), 'ARBITRARY_RAW_LITERAL');
+  assert.deepEqual((await readEvidence(c, id, 'candidate')).data, original);
+  task.reviewer.reviewed_git_state.tree_sha = 'a'.repeat(40);
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  delete task.reviewer; delete task.local_validation;
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  assert((await readEvidence(c, id, 'review')).data.unavailable);
+  assert((await readEvidence(c, id, 'validation')).data.unavailable);
+  assert((await readEvidence(c, id, 'implementer')).data.messages_unavailable);
+});
+
+test('typed task evidence fails closed on unresolved storage without repairing it', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true });
+  c.db.exec('BEGIN'); const before = statusLedger(c.db);
+  try { const result = await readEvidence(c, id, 'review'); assert(result.data.unavailable); assert(result.data.retention_uncertain); assert.equal(statusLedger(c.db), before); }
+  finally { c.db.exec('ROLLBACK'); }
+});
+
+test('typed boundary additional schemas discard unknown fields and preserve only typed authority', () => {
+  const raw = { task_id: 'task_00000000-0000-0000-0000-000000000001', state: 'failed', execution_backend: 'local_codex',
+    implementer: { state: 'failed', error: 'ARBITRARY_RAW_LITERAL', latest_output: 'SYNTHETIC_CREDENTIAL' }, reviewer: null,
+    cleanup: { workspace_path: '/private/SYNTHETIC_CREDENTIAL' }, expires_at: null, arbitrary: 'ARBITRARY_RAW_LITERAL',
+    automatic: { status: 'stopped', phase: 'implementation', limits: { max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0,
+      publish: { draft: true, title: 'SYNTHETIC_CREDENTIAL' } }, review: { state: 'pass', execution_authorized: true, blockers: ['SYNTHETIC_CREDENTIAL'] } } };
+  const before = JSON.stringify(raw), result = taskReportSchema.parse(raw);
+  noRaw(result); assert.equal(result.automatic.limits.max_codex_turns, 2); assert.equal(result.automatic.limits.publish, undefined);
+  assert.equal(result.automatic.review.execution_authorized, false); assert.equal(result.implementer.error, 'UNCLASSIFIED_WITHHELD');
+  assert.equal(JSON.stringify(raw), before);
+  const findings = { packet_hash: 'a'.repeat(64), thread_id: 'synthetic-reviewer', turn_id: 'synthetic-review-turn', overall: 'FAIL', model_overall: 'PASS', controller_overrides: ['TEST_EVIDENCE'],
+    findings: [{ id: 'TEST_EVIDENCE', status: 'FAIL', evidence: 'SYNTHETIC_CREDENTIAL' }] };
+  const review = Controller.prototype.discloseReview({ packet_hash: findings.packet_hash, review_result: findings,
+    findings_sha256: digest(findings), local: { thread_id: findings.thread_id, turn_id: findings.turn_id } }, contract());
+  assert.equal(review.overall, 'FAIL'); assert.equal(review.model_overall, 'PASS');
+  assert.deepEqual(review.controller_overrides, ['TEST_EVIDENCE']); assert.equal(review.current_authority_verified, false); noRaw(review);
+});
+
+test('typed reporting metadata admits bounded identities and fixed classifications only', async t => {
+  const { c } = await setup(t), task = progressTask(c), id = task.id;
+  task.automatic.status = 'stopped'; task.automatic.reason = 'AUTOMATIC_TASK_STOPPED';
+  task.automatic.reconciliation = { confirmed: false, outcome: 'external_effects_uncertain',
+    attempt_id: 'review-attempt', publication_id: 'publication-attempt', reason: 'AUTOMATIC_RESTART_NO_REPLAY' };
+  task.repository = { repository_id: 'fixture', base_ref: 'approved-base', baseline_commit: task.baseline,
+    branch: `bridge/${id}`, worktree_id: id, canonical_path: '/private/not-for-reporting' };
+  c.save(task);
+  const { get } = await statusClient(t, c), before = statusLedger(c.db);
+  for (let read = 0; read < 2; read++) {
+    const status = (await get(id)).structuredContent, evidence = (await readEvidence(c, id, 'implementer')).data;
+    assert.deepEqual(status.implementer.local, evidence.local);
+    assert.equal(status.implementer.local.model, 'fixture-model');
+    assert.equal(status.implementer.local.thread_id, task.implementer.local.thread_id);
+    assert.equal(status.automatic.progress.attempts.implementation.request_id, task.request_id);
+    assert.equal(status.automatic.progress.attempts.validation.attempt_id, task.local_validation.attempt_id);
+    assert.equal(status.automatic.reconciliation.attempt_id, 'review-attempt');
+    assert.equal(status.automatic.reconciliation.publication_id, 'publication-attempt');
+    assert.equal(status.automatic.reconciliation.outcome, 'external_effects_uncertain');
+    assert.deepEqual(status.repository, { repository_id: 'fixture', base_ref: 'approved-base', baseline_commit: task.baseline,
+      branch: `bridge/${id}`, worktree_id: id });
+    assert.equal(status.remaining_authority.execution_authorized, false);
+  }
+  assert.equal(statusLedger(c.db), before);
+  const raw = await c.reportTask(id);
+  for (const invalid of ['Authorization: Basic SYNTHETIC_CREDENTIAL', '/private/file', 'https://example.invalid/path',
+    '{"Authorization":["SYNTHETIC_CREDENTIAL"]}', '```encoded```', 'line\nbreak', 'x'.repeat(201), {}, ['unclassified'], 42]) {
+    const value = structuredClone(raw);
+    Object.assign(value.implementer.local, { model: invalid, thread_id: invalid, turn_id: invalid });
+    Object.assign(value.repository, { repository_id: invalid, base_ref: invalid, branch: invalid, worktree_id: invalid });
+    Object.assign(value.automatic.reconciliation, { attempt_id: invalid, publication_id: invalid });
+    Object.assign(value.automatic.progress.attempts.validation, { attempt_id: invalid, request_id: invalid });
+    const result = taskReportSchema.parse(value);
+    for (const key of ['model', 'thread_id', 'turn_id']) assert.equal(result.implementer.local[key], null);
+    for (const key of ['repository_id', 'base_ref', 'branch', 'worktree_id']) assert.equal(result.repository[key], null);
+    assert.equal(result.automatic.reconciliation.attempt_id, null); assert.equal(result.automatic.reconciliation.publication_id, null);
+    assert.equal(result.automatic.progress.attempts.validation.attempt_id, null);
+    assert.equal(result.automatic.progress.attempts.validation.request_id, null);
+  }
+  const classification = { state: 'reviewed', evidence: 'retained', received_output: 'durable', request_id: 'review-attempt',
+    validation: { attempt_id: 'validation-attempt', results: [] }, execution_authorized: true, publication_authorized: true };
+  const classified = taskReportSchema.parse({ ...raw, correction: { review: classification } }).correction.review;
+  assert.equal(classified.evidence, 'retained'); assert.equal(classified.received_output, 'durable');
+  assert.equal(classified.validation.attempt_id, 'validation-attempt');
+  assert.equal(classified.execution_authorized, false); assert.equal(classified.publication_authorized, false);
+  classification.evidence = 'arbitrary reviewer explanation';
+  assert.equal(taskReportSchema.parse({ ...raw, correction: { review: classification } }).correction.review.evidence, 'unavailable');
+});
+
+test('shared publication proof review disclosure requires present packet, findings and reviewer identities', () => {
+  const findings = { packet_hash: 'a'.repeat(64), overall: 'FAIL', thread_id: 'synthetic-reviewer', turn_id: 'synthetic-turn',
+    findings: [{ id: 'R1', status: 'FAIL', evidence: 'ARBITRARY_RAW_LITERAL' }] };
+  const original = { packet_hash: findings.packet_hash, findings_sha256: digest(findings), review_result: findings,
+    local: { thread_id: findings.thread_id, turn_id: findings.turn_id } };
+  assert.equal(Controller.prototype.discloseReview(original, contract()).overall, 'FAIL');
+  for (const paths of [['packet_hash'], ['findings_sha256'], ['local.thread_id'], ['local.turn_id'], ['review_result.packet_hash'],
+    ['review_result.thread_id'], ['review_result.turn_id'], ['packet_hash', 'review_result.packet_hash'],
+    ['local.thread_id', 'review_result.thread_id'], ['local.turn_id', 'review_result.turn_id']]) {
+    const ref = structuredClone(original);
+    for (const name of paths) { const parts = name.split('.'), key = parts.pop(); delete parts.reduce((value, part) => value[part], ref)[key]; }
+    if (!paths.includes('findings_sha256')) ref.findings_sha256 = digest(ref.review_result);
+    const before = JSON.stringify(ref), review = Controller.prototype.discloseReview(ref, contract());
+    assert.equal(review.overall, null, paths.join(', ')); assert.equal(review.unavailable, true); noRaw(review);
+    assert.equal(JSON.stringify(ref), before);
+  }
+});
+
+test('typed boundary additional candidate metadata fails closed on missing, changed and symlink packets', async t => {
+  const { c, id } = await automaticAttempt(t, { versioned: true }), task = c.task(id);
+  delete task.retained_packet; delete task.reviewer.retained_packet;
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=?').run(id);
+  assert.equal((await readEvidence(c, id, 'candidate')).data.unavailable, false);
+  const file = path.join(c.workspaceRoot, id, task.reviewer.packet_directory, 'evidence.json');
+  await fs.chmod(file, 0o600); await fs.writeFile(file, '{}');
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  await fs.unlink(file); assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  await fs.symlink(path.join(c.workspaceRoot, id, 'contract.json'), file);
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  task.reviewer.packet_directory = '../../private'; c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+});
+
+test('typed boundary additional history selects only the owning task packet without restoring authority', async t => {
+  const { c, id, calls } = await automaticAttempt(t, { versioned: true }), task = c.task(id), original = task.reviewer.packet_hash;
+  task.reviewer = { ...task.reviewer, packet_hash: 'a'.repeat(64), review_result: null };
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), id);
+  assert((await readEvidence(c, id, 'candidate')).data.unavailable);
+  const before = statusLedger(c.db);
+  for (const section of ['candidate', 'review', 'validation']) {
+    const data = JSON.parse((await c.taskEvidence({ task_id: id, section, packet_sha256: original })).content);
+    if (section === 'candidate') { assert.equal(data.unavailable, false); assert.equal(data.execution_authorized, false); }
+    if (section === 'review') { assert.equal(data.overall, 'FAIL'); assert.equal(data.current_authority_verified, false); }
+    noRaw(data);
+  }
+  assert.equal(statusLedger(c.db), before);
+  const other = await c.start({ contract: contract(), request_id: 'other_packet_owner' }); await Promise.all([...c.jobs.values()]);
+  await assert.rejects(c.taskEvidence({ task_id: other.task_id, section: 'review', packet_sha256: original }), /EVIDENCE_ATTEMPT_UNAVAILABLE/);
+  assert.deepEqual(calls, ['implementer', 'reviewer']);
+});
+
 async function automaticAttempt(t, mode = {}) {
   const value = await setup(t), { c, root } = value, normal = path.join(root, 'normal'), calls = [];
   let active;
@@ -460,9 +951,11 @@ for (const unavailable of ['packet', 'tree']) test(`corrective review MCP status
   try {
     for (const taskId of [id, child.id, id, child.id]) {
       const response = await get(taskId); assert.notEqual(response.isError, true);
-      assert.equal(response.structuredContent.correction.review.qualified, false);
-      assert.equal(response.structuredContent.correction.review.overall, null);
-      if (taskId === child.id) assert.equal(response.structuredContent.reviewer.overall, null);
+      assert.equal(response.structuredContent.correction.review.qualified, true);
+      assert.equal(response.structuredContent.correction.review.current_authority_verified, false);
+      assert.equal(response.structuredContent.correction.review.overall, child.reviewer.review_result.overall);
+      if (taskId === child.id) assert.equal(response.structuredContent.reviewer.overall, child.reviewer.review_result.overall);
+      assert.equal((await c.correctiveReviewSummary(child)).qualified, false);
     }
     assert.equal(writes, 0); assert.equal(statusLedger(c.db), ledger);
     assert.equal(await statusFiles(value.normal, c.workspaceRoot), files); assert.equal(value.calls.length, 4); assert.deepEqual(value.publisherCalls, []);
@@ -901,9 +1394,9 @@ test(`MCP versioned status cannot lazily fetch a missing ${location} ${missing}`
   try {
     for (let count = 0; count < 3; count++) {
       const result = await get(id); assert.notEqual(result.isError, true);
-      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+      await currentReviewStillRejected(c, id, result);
       assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
-      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+      assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
       assert.deepEqual(await fs.readdir(path.join(store, 'objects/pack')), packs, 'Status lazily fetched promised objects');
       await assert.rejects(fs.access(object), { code: 'ENOENT' });
       assert.equal(await statusFiles(normal, workspace, registry, remote), files);
@@ -923,8 +1416,8 @@ test('MCP versioned status denies qualification after actual registration remova
   await fs.writeFile(registry, JSON.stringify({ version: 1, repositories: {} }));
   await assert.rejects(c.start({ ...input, request_id: 'removed_registration' }), /UNKNOWN_REPOSITORY_ID/);
   const before = statusLedger(c.db), result = await get(id);
-  assert.notEqual(result.isError, true); assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
-  assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+  assert.notEqual(result.isError, true); await currentReviewStillRejected(c, id, result);
+  assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
   assert.equal(statusLedger(c.db), before); assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
   await fs.writeFile(registry, original);
   assert.equal((await get(id)).structuredContent.automatic.review.potentially_correctable, true);
@@ -946,7 +1439,7 @@ for (const location of ['source', 'candidate']) test(`MCP versioned status canno
   const ledger = statusLedger(c.db);
   for (let count = 0; count < 3; count++) {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
     await assert.rejects(fs.access(path.join(repo, 'status-filter-ran')), { code: 'ENOENT' });
     assert.equal(await statusFiles(normal, workspace, registry), before);
@@ -970,7 +1463,7 @@ for (const location of ['index', 'head']) test(`MCP versioned status rejects cur
   await assert.rejects(c.verifyLocalReviewPacket(task, { readOnly: true }), { code: 'LOCAL_REVIEW_EXECUTION_UNVERIFIED' });
   for (let count = 0; count < 3; count++) {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(result.structuredContent.automatic.review.execution_authorized, false);
     assert.equal(await statusFiles(normal, workspace, registry), before);
     assert.equal(statusLedger(c.db), ledger);
@@ -995,8 +1488,8 @@ for (const changed of ['identity', 'path', 'corrupt', 'missing', 'unsafe', 'syml
     const before = statusLedger(reader), files = await statusFiles(normal, workspace);
     for (let count = 0; count < 3; count++) {
       const result = await get(id); assert.notEqual(result.isError, true);
-      assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
-      assert(result.structuredContent.automatic.review.blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
+      await currentReviewStillRejected(c, id, result);
+      assert((await c.automaticReviewSummary(c.task(id))).blockers.includes('REVIEW_EVIDENCE_UNVERIFIED'));
     }
     assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, workspace), files);
     assert.deepEqual(c.task(id).reviewer.review_result, historical);
@@ -1042,7 +1535,7 @@ for (const changed of ['metadata removed', 'origin binding', 'baseline binding',
       const before = statusLedger(reader), files = await statusFiles(normal, path.join(c.workspaceRoot, id), file);
       for (let count = 0; count < 2; count++) {
         const result = await get(id); assert.notEqual(result.isError, true);
-        assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+        await currentReviewStillRejected(c, id, result);
       }
       assert.equal(statusLedger(reader), before); assert.equal(await statusFiles(normal, path.join(c.workspaceRoot, id), file), files);
       assert.equal(c.task(id).reviewer.review_result.actionability_qualification.potentially_correctable, true);
@@ -1080,7 +1573,7 @@ test('MCP versioned status never repairs a conflicting backend or synthesizes a 
   const before = statusLedger(c.db), fault = sqliteAbort(c, 'failures', '1');
   try {
     const result = await get(id); assert.notEqual(result.isError, true);
-    assert.equal(result.structuredContent.automatic.review.potentially_correctable, false);
+    await currentReviewStillRejected(c, id, result);
     assert.equal(fault.hits, 0); assert.equal(statusLedger(c.db), before);
   } finally {
     c.db.exec('DROP TRIGGER evidence_fault');
@@ -1088,7 +1581,7 @@ test('MCP versioned status never repairs a conflicting backend or synthesizes a 
   }
 });
 
-test('MCP automatic status exemption preserves mutation audit and manual observation behavior', async t => {
+test('MCP typed status preserves mutation audits and makes manual status observational', async t => {
   const { c, api } = await setup(t), { client, get } = await statusClient(t, c);
   const started = await client.callTool({ name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_mutation_start' } });
   assert.notEqual(started.isError, true); const id = started.structuredContent.task_id;
@@ -1096,7 +1589,7 @@ test('MCP automatic status exemption preserves mutation audit and manual observa
   assert.notEqual((await get(id)).isError, true);
   const audited = c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value));
   assert(audited.some(row => row.tool === 'start_task' && row.task_id === id && row.session_id));
-  assert(audited.some(row => row.tool === 'get_task' && row.task_id === id));
+  assert(!audited.some(row => row.tool === 'get_task'));
   assert.notEqual((await client.callTool({ name: 'cleanup_task', arguments: { task_id: id, delete_workspace: false } })).isError, true);
   assert(c.db.prepare('SELECT value FROM audit').all().map(row => JSON.parse(row.value)).some(row => row.tool === 'cleanup_task' && row.task_id === id));
   const legacy = await automaticAttempt(t), status = await statusClient(t, legacy.c);
@@ -1980,13 +2473,14 @@ test('tunnel owner confirmation accepts 30 days, rejects longer and stale claims
     /LIVE_TUNNEL_ASSOCIATION_MISMATCH/,
   );
 });
-test('MCP advertises exactly eight tools; schema/authorization failures cannot execute', async t => {
+test('MCP advertises exactly nine tools; schema/authorization failures cannot execute', async t => {
   const { c, api } = await setup(t); let allowed = false;
   const server = createServer(c, async () => { if (!allowed) throw Error('private'); });
   const client = new Client({ name: 'local-test', version: '1' }); const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
   t.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
+  const list = await client.listTools(); assert.deepEqual(list.tools.map(x => x.name).sort(), ['cleanup_task', 'continue_task', 'get_task', 'get_task_evidence', 'list_registered_repositories', 'publish_task', 'register_github_repository', 'review_task', 'start_task']);
   assert.equal(list.tools.find(x => x.name === 'get_task').annotations.readOnlyHint, true);
+  assert.equal(list.tools.find(x => x.name === 'get_task_evidence').annotations.readOnlyHint, true);
   assert.equal(list.tools.find(x => x.name === 'cleanup_task').annotations.destructiveHint, true);
   const input = { name: 'start_task', arguments: { contract: contract(), request_id: 'mcp_request' } };
   assert.equal((await client.callTool(input)).isError, true); assert.equal(api.created.length, 0);
@@ -2220,7 +2714,7 @@ test('durable progress legacy automatic MCP status is bounded sanitized and stri
     assert.equal(view.automatic.progress.attempts.validation.commands.length, 10);
     assert.equal(view.automatic.progress.attempts.validation.commands_truncated, true);
     assert.equal(view.automatic.progress.attempts.validation.status, 'unknown');
-    assert.equal(view.automatic.usage.token_usage, null); assert.equal(view.implementer.latest_output, null);
+    assert.equal(view.automatic.usage.token_usage, null); assert.equal(view.implementer.latest_output, undefined);
     assert.equal(view.state, 'cleaned');
   }
   assert.equal(statusLedger(c.db), before);
@@ -2714,9 +3208,17 @@ test(`automatic concurrent writes stale ${path} cannot overwrite committed succe
       publisher: new Proxy({}, { get() { assert.fail('Publication replay'); } }) }).init();
     try {
       for (let read = 0; read < 3; read++) {
+        // This concurrency fixture commits success without original review or
+        // complete publication proof. Preserve that durable success independently
+        // from what the public historical-evidence boundary can confirm.
+        assert.equal(recovered.task(input.taskId).automatic.status, 'succeeded');
+        assert.equal(recovered.db.prepare('SELECT status FROM operations WHERE id=?').get(input.id).status, 'accepted');
         const view = await recovered.invoke('get_task', { task_id: input.taskId }, {}, () => recovered.get(input.taskId));
-        assert.equal(view.automatic.status, 'succeeded'); assert.equal(view.automatic.human_attention_required, false);
-        assert.equal(view.automatic.progress.attempts.publication.status, 'confirmed_completed');
+        assert.equal(view.automatic.status, 'uncertain'); assert.equal(view.automatic.human_attention_required, true);
+        assert.equal(view.publication.confirmed, false); assert.equal(view.automatic.reason, 'AUTOMATIC_PUBLICATION_UNCONFIRMED');
+        assert.equal(view.automatic.progress.attempts.publication.status, 'attempted_unconfirmed');
+        assert.equal(view.remaining_authority.execution_authorized, false); assert.equal(view.remaining_authority.publication_authorized, false);
+        assert.deepEqual((await readEvidence(recovered, input.taskId, 'outcome')).data.publication, view.publication);
       }
       assert.equal(statusLedger(recovered.db), committed);
     } finally { interruptProgressController(recovered); }

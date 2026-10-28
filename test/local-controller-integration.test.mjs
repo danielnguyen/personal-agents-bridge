@@ -50,7 +50,7 @@ class FakeLocal {
 }
 
 async function setup(context, mode = {}, options = {}) {
-  const root = await fs.mkdtemp('/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
+  const root = await fs.mkdtemp(options.fixturePrefix || '/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
   await fs.mkdir(normal);
   repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n');
@@ -353,13 +353,13 @@ test('automatic restart with unfinished durable intent requires attention withou
 });
 
 test('MCP automatic authority is optional and strictly bounded without new tools', async context => {
-  const value = await setup(context), server = createServer(value.controller, async () => {});
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-schema-' }), server = createServer(value.controller, async () => {});
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'automatic-fixture', version: '1' });
   context.after(async () => { await client.close(); await server.close(); });
   await server.connect(serverTransport); await client.connect(clientTransport);
   const tools = (await client.listTools()).tools, start = tools.find(tool => tool.name === 'start_task');
-  assert.equal(tools.length, 8); assert(!start.inputSchema.required.includes('automatic'));
+  assert.equal(tools.length, 9); assert(!start.inputSchema.required.includes('automatic'));
   assert.equal(start.inputSchema.properties.automatic.additionalProperties, false);
   assert(!start.inputSchema.properties.automatic.required.includes('review_protocol'));
   assert(JSON.stringify(start.inputSchema.properties.automatic.properties.review_protocol).includes(LOCAL_ACTIONABILITY_REVIEW_VERSION));
@@ -413,7 +413,7 @@ test('MCP four-turn authority is explicit, fingerprinted, immutable and admits n
 });
 
 test('local opt-in reuses owned worktree, baseline, contract and audit without Agents API sessions', async context => {
-  const value = await setup(context);
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-opt-in-' });
   const { controller, input, normal, baseline } = value;
   const result = await controller.invoke('start_task', input, { requestId: 'mcp_start' }, params => controller.start(params));
   const backend = await value.running(), repo = path.join(controller.workspaceRoot, result.task_id, 'repo');
@@ -1057,6 +1057,47 @@ test('unconfirmed reviewer closure prevents workspace deletion and remains expli
   assert.equal(result.reviewer.review_result, null);
 });
 
+test('typed task evidence withholds native messages and preserves private completion records after cleanup', async context => {
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-evidence-' }), started = await value.start(), backend = await value.running();
+  backend.finish('completed', true, 'Final task result: synthetic greeting mismatch.'); await value.drain();
+  const read = async () => JSON.parse((await value.controller.invoke('get_task_evidence', { task_id: started.task_id, section: 'implementer' }, {},
+    input => value.controller.taskEvidence(input))).content);
+  const before = await read();
+  assert.equal(before.messages.at(-1).provenance, 'model_statement');
+  assert.equal(before.messages.at(-1).text, undefined); assert(before.messages.at(-1).withheld);
+  assert.equal(value.controller.task(started.task_id).implementer.evidence_messages.at(-1).text, 'Final task result: synthetic greeting mismatch.');
+  assert.equal(before.commands_unavailable, true);
+  assert.equal((await value.controller.cleanup({ task_id: started.task_id, delete_workspace: true })).cleanup.workspace_deleted, true);
+  assert.deepEqual((await read()).messages, before.messages);
+  assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
+});
+
+test('typed disclosure withholds native messages and command output while retaining private evidence', async context => {
+  const value = await setup(context, {}, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-authorization-' });
+  const started = await value.start(), backend = await value.running();
+  const payload = JSON.stringify({ headers: { Authorization: ['Basic SYNTHETIC_NATIVE_ARRAY'],
+    'pRoXy-AuThOrIzAtIoN': { credential: 'SYNTHETIC_NATIVE_OBJECT' } },
+    encoded: '{"Authorizatio\\u006e":"Basic SYNTHETIC_NATIVE_ESCAPED"}',
+    plain: 'Authorization: Digest username="SYNTHETIC_NATIVE_USER", response="SYNTHETIC_NATIVE_RESPONSE"\r\nX-Trace: useful evidence' });
+  const params = { threadId: backend.identity.threadId, turnId: backend.identity.turnId };
+  backend.options.onProgress({ method: 'item/agentMessage/delta', params: { ...params, delta: payload } });
+  backend.options.onProgress({ method: 'item/completed', params: { ...params,
+    item: { id: 'native-command', type: 'commandExecution', status: 'completed', command: 'synthetic check',
+      cwd: backend.options.cwd, exitCode: 7, aggregatedOutput: payload } } });
+  backend.finish('completed', true, payload); await value.drain();
+  const task = value.controller.task(started.task_id);
+  assert(JSON.stringify(task).includes('SYNTHETIC_'));
+  assert(task.implementer.local.latest_model_output.includes('useful evidence'));
+  assert.equal(task.local_execution_evidence.commands[0].exit_code, 7);
+  for (const section of ['outcome', 'implementer', 'validation', 'review', 'candidate', 'history']) {
+    const result = await value.controller.taskEvidence({ task_id: started.task_id, section });
+    assert(!result.content.includes('SYNTHETIC_'));
+  }
+  const report = await value.controller.reportTask(started.task_id);
+  assert(!JSON.stringify(report).includes('SYNTHETIC_'));
+  assert.equal(value.instances.length, 1); assert.equal(value.api.created.length, 0);
+});
+
 test('invalid backend, unsupported non-repository local tasks and protected scope fail before provisioning', async context => {
   const value = await setup(context);
   for (const execution_backend of ['other', null, 1]) await assert.rejects(value.controller.start({ ...value.input, execution_backend }), /INVALID_EXECUTION_BACKEND/);
@@ -1218,11 +1259,11 @@ test('local continue, review and publish reject explicitly without downstream AP
 });
 
 test('MCP exposes explicit local opt-in and persisted state without adding operations', async context => {
-  const value = await setup(context, { status: 'completed' }), server = createServer(value.controller, async () => {});
+  const value = await setup(context, { status: 'completed' }, { fixturePrefix: '/var/tmp/personal-agents-bridge/local-schema-' }), server = createServer(value.controller, async () => {});
   const client = new Client({ name: 'local-integration-test', version: '1' }), [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport); await client.connect(clientTransport);
   context.after(async () => { await client.close(); await server.close(); });
-  const list = await client.listTools(); assert.equal(list.tools.length, 8);
+  const list = await client.listTools(); assert.equal(list.tools.length, 9);
   assert.match(client.getInstructions(), /qualified local Codex repository tasks/);
   assert.match(client.getInstructions(), /No local post-completion continuation\./);
   assert(!client.getInstructions().includes('No local post-completion continuation, review or publication'));
@@ -1527,7 +1568,7 @@ for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real
 async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false, testCommands = ['test "$(cat greeting.txt)" = candidate'] } = {}) {
   let validations = 0;
   const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, {
-    noApi: true, localValidationFactory: options => {
+    fixturePrefix: '/var/tmp/personal-agents-bridge/local-recovery-', noApi: true, localValidationFactory: options => {
       const runner = new LocalValidation(options), run = runner.run.bind(runner);
       runner.run = input => { validations++; return run(input); }; return runner;
     },

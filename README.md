@@ -3,7 +3,7 @@
 A single-owner demonstration of **ChatGPT → MCP → Agents API → self-hosted Codex
 → sandboxed Git worktree → independent review → exact-tree draft PR publication**.
 
-ChatGPT invokes eight MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
+ChatGPT invokes nine MCP tools through Secure MCP Tunnel. By default the bridge creates Agents
 API sessions and connects a local Codex executor. For an allowlisted repository,
 implementation happens in an isolated Git worktree backed by a task-private Git
 store. Command networking is disabled; writes are confined to the task worktree
@@ -40,10 +40,10 @@ This slice supports **start → get → native human response → same turn → 
 validation/review → qualified exact-tree draft publication → cleanup**.
 `get_task` reports persisted
 `execution_backend` and `implementer.local` observations: phase/execution state,
-thread/turn IDs, model, submission-attempt/acknowledgement flags, terminal observation,
-bounded diagnostics and human-attention requirements. Codex IDs are not Agents API
-session IDs. Latest bounded output is labeled `model`; command counts are not
-certified command/test evidence. A completed turn is not a test PASS.
+submission-attempt/acknowledgement flags, terminal observation and human-attention
+requirements. The typed reporting boundary withholds raw output, provider identities
+and free-form diagnostics. Private Controller records still distinguish Codex IDs
+from Agents API IDs. A completed turn is not a test PASS.
 
 Synchronous lifecycle callbacks save identity before the next inference step.
 Submission intent is recorded before dispatch; absence of an acknowledgement is
@@ -85,7 +85,7 @@ After: explicitly authorize the bounded draft-publication path once; the Control
 advances after implementation job settlement, independently validates the exact tree,
 runs a distinct reviewer and invokes the existing publisher only on qualified PASS.
 `get_task` observes persisted automatic progress; polling is not its execution engine.
-No new MCP tools, services, queues or task stores are introduced.
+The automatic path uses the existing execution operations and task storage.
 
 All automatic fields are strictly checked and included in request fingerprinting.
 Only explicit `local_codex` repository tasks qualify. The metadata authorizes one
@@ -205,14 +205,16 @@ No recovery execution or production mutation is part of this correction PR.
 Command/file approvals and `item/tool/requestUserInput` requests remain pending in
 the original live turn. The synchronous lifecycle callback saves each request in
 the existing SQLite task record before exposing it. Raw JSON-RPC request IDs and
-accepted response contents remain private. MCP exposes an opaque `request_ref`,
-task/thread/turn IDs, request method, bounded description, expected response type,
-available decisions or exact question IDs/options, status and delivery diagnostics.
-Model prose never creates an authoritative pending request.
+accepted response contents remain private. Reporting exposes typed attention state
+and expected response type, with a withheld reference for supporting details. Raw
+questions, descriptions and callback identities require separately authorized private
+owner inspection. Model prose never creates an authoritative pending request.
 
 `get_task` returns `waiting_for_approval` or `waiting_for_clarification`, with
-`human_attention_required: true` and `implementer.pending_human_requests`.
-Obtain the human's explicit response, then call the existing `continue_task`:
+`human_attention_required: true`; the evidence section reports typed pending-request
+metadata. After owner inspection of the private request, obtain the human's explicit
+response and use the existing `continue_task` payload. The placeholders below come
+from that private inspection; reporting does not disclose raw callback identities:
 
 ```json
 {
@@ -386,9 +388,9 @@ Codex history is claimed. Read-only instructions are not themselves enforcement.
 The Controller owns the packet hash, reviewed Git tree/state, separate reviewer
 model/thread/turn identity, submission/acknowledgement and terminal observations.
 It verifies packet file type/mode/hash, task identity/contract, implementation tree
-and normal-checkout state before and after review. `get_task` rechecks integrity
-before exposing a retained result while the workspace exists. Mutations invalidate
-the result. Closing the owned server and checking sampled state is not proof of
+and normal-checkout state before and after review. Automatic status checks retain
+the existing read-only current qualification checks. Reporting never repairs a
+manual task or refreshes its API session; a retained verdict alone grants no authority. Closing the owned server and checking sampled state is not proof of
 escaped-descendant termination or an immutable freeze against external writers.
 
 The distinct local instruction contract requires all requirement/invariant IDs plus
@@ -902,10 +904,71 @@ or production acceptance. No live registration is part of implementation validat
 | `register_github_repository` | Controller-register an eligible GitHub user-owned repository; never starts execution. |
 | `start_task` | Start a contract in a disposable workspace or allowlisted repository worktree. |
 | `get_task` | Inspect bounded progress, clarification, review and publication state. |
+| `get_task_evidence` | Read paginated typed results, finding classifications, validation and frozen candidate metadata. |
 | `continue_task` | Answer clarification or explicitly request further implementation. |
 | `review_task` | Freeze evidence and request independent review in a separate session. |
 | `publish_task` | Freeze a completed PASS-reviewed repository task and create a draft PR. |
 | `cleanup_task` | Stop execution/delete remote sessions; optionally remove the worktree. |
+
+`get_task` includes a concise explanation and references to evidence sections for
+successful, failed, stopped, uncertain and interrupted outcomes. Use
+`get_task_evidence` with the same `task_id` and a `section`: `outcome`, `implementer`,
+`validation`, `review`, `candidate` or `history`. Each response contains a JSON
+fragment in `content`. Concatenate fragments in order and parse the resulting JSON;
+pass `next_cursor` back with the same task and section until it is null. `limit`
+bounds each fragment to 256–16000 UTF-8 bytes (default 12000). Cursors bind task,
+section, optional packet hash and projected snapshot; changed evidence requires
+restarting pagination. For `candidate`, `review` or `validation`, an optional
+`packet_sha256` from this task's history selects a retained earlier review attempt.
+
+Both reporting operations use the existing single-owner tunnel authorization and
+perform no reconciliation, audit/task writes, session refresh, model execution,
+validation, correction or publication. Evidence retrieval performs no Git commands;
+automatic status retains its existing read-only qualification checks. Manual status
+now also reads retained state without API observation or diagnostic writes.
+
+Reporting admits only explicit typed schemas: fixed states/reason codes, numeric
+command indices and exit results, requirement IDs/classifications, Controller
+overrides, limits and remaining budgets, Git/hash identities, file metadata,
+publication/cleanup flags and missing/withheld/truncated/uncertain indicators.
+Unrecognized reason strings become `UNCLASSIFIED_WITHHELD`. Conventional R/I IDs
+are shown only for known obligations; other identifiers use an obligation index
+and hash reference. Filenames, provider identifiers and command text are withheld.
+Validation reports can identify command index 0 exiting with code 7 without
+returning its command, stdout or stderr. Evidence provenance distinguishes model
+statements, adapter observations, independently executed tests and retained
+Controller-qualified review findings. Historical qualification never restores
+execution, correction or publication authority.
+
+Raw Codex messages, command output/logs, reviewer explanations/remedy prose,
+Markdown, encoded/fenced/malformed JSON, source and diffs are **withheld**, even if
+a retained record already claims `redacted:true`. Arbitrary strings inside JSON
+are not an admission path. The reports provide retained hash references instead;
+these references are not paths, credentials or an unrestricted retrieval tool.
+Private packets/receipts remain available to existing Controller validation and
+review qualification. Reporting never rewrites them or reconstructs missing output.
+Native human questions and callback identities also require separately authorized
+private owner inspection before an explicit response can be supplied. This reduces
+ChatGPT's ability to explain prose details; it is the approved disclosure trade-off.
+
+`@hackylabs/deep-redact` is pinned to 4.1.0 in the npm lockfile. Install with
+`npm ci --ignore-scripts`. The library is applied only to decoded retained
+observation envelopes, with case-insensitive sensitive-key matching, string/object
+(including array)/number/boolean value types, depth 16, 2048 nodes and throw on
+budget breach. Text/value/output fields are opaque and removed in full. Only
+allowlisted numeric/boolean/enum metadata survives the subsequent schema. No
+library output graph is returned directly; unsupported/excessive input is withheld.
+Trusted Controller authority objects use their own typed projections, never broad
+sensitive-key redaction.
+
+Retained packet metadata remains available after cleanup/restart where saved.
+Candidate metadata requires the existing hash-checked packet, authorized file scope
+and recorded Git tree/contract binding. Live source is never read for disclosure.
+Private future model-message retention remains bounded to 16 messages of 4096
+characters per role; command observations to 64 records/24 KiB with 2048 characters
+per stream. Reporting is bounded to 64 history observations, 16 previous reviewers
+and 512 KiB per section. These limits do not invent historical evidence or remove
+the runtime confidentiality limitations in SECURITY.md.
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
 and publication for the default Agents API path. Local execution is the limited
