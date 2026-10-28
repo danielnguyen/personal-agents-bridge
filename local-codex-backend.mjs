@@ -272,6 +272,22 @@ export class LocalCodexBackend {
       active.result.authentication = 'unverified';
       return this.rpc.fail('CHATGPT_AUTHENTICATION_CHANGED');
     }
+    // Codex 0.162.1 broadcasts thread/status/changed globally, including
+    // unrelated threads. It is metadata, never turn completion or authority.
+    if (message.method === 'thread/status/changed') {
+      const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+      const status = params.status;
+      const envelope = Object.keys(message).every(key => ['method', 'params', 'emittedAtMs', 'jsonrpc'].includes(key)) &&
+        (!Object.hasOwn(message, 'jsonrpc') || message.jsonrpc === '2.0') &&
+        (!Object.hasOwn(message, 'emittedAtMs') || Number.isSafeInteger(message.emittedAtMs) && message.emittedAtMs >= 0);
+      const validStatus = object(status) && (['notLoaded', 'idle', 'systemError'].includes(status.type) ?
+        Object.keys(status).join() === 'type' : status.type === 'active' && Object.keys(status).sort().join() === 'activeFlags,type' &&
+        Array.isArray(status.activeFlags) && status.activeFlags.length <= 2 && new Set(status.activeFlags).size === status.activeFlags.length &&
+        status.activeFlags.every(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag)));
+      if (!envelope || !object(params) || Object.keys(params).sort().join() !== 'status,threadId' ||
+          !text(params.threadId) || params.threadId.length > 200 || params.threadId.trim() !== params.threadId || !validStatus) return this.rpc.fail('INVALID_THREAD_STATUS_EVENT');
+      if (params.threadId !== active.result.threadId) return;
+    }
     if (params.threadId && params.threadId !== active.result.threadId) return this.rpc.fail('EVENT_THREAD_MISMATCH');
     if (params.turnId && params.turnId !== active.result.turnId) return this.rpc.fail('EVENT_TURN_MISMATCH');
     if (message.method === 'serverRequest/resolved') {
