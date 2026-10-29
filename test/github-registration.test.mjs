@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { Controller } from '../controller.mjs';
 import { GitHubRegistration, GitHubRegistrationTransport, bridgeGitHubRepositoryId } from '../github-registration.mjs';
@@ -9,13 +10,14 @@ import { repoGit, registrationProcess, repositoryIdentity, readRegistry, resolve
 import { synchronizeCheckout } from '../github-repository-integrity.mjs';
 import { GitHubPublisher } from '../publication.mjs';
 import { createServer } from '../server.mjs';
-import { FakeExecutor } from './helpers.mjs';
+import { FakeAPI, FakeExecutor } from './helpers.mjs';
+import { checkoutSnapshot, compareSnapshots } from '../review-evidence.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 const input = { repository: 'owner/fixture' };
 async function setup(context, changes = {}) {
-  const root = await fs.mkdtemp('/tmp/pab-registration-test-'), upstream = path.join(root, 'upstream');
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'pab-registration-test-')), upstream = path.join(root, 'upstream');
   await fs.mkdir(upstream, { mode: 0o700 });
   repoGit(upstream, 'init', '--template=', '--initial-branch=main');
   await fs.writeFile(path.join(upstream, 'answer.txt'), 'baseline\n');
@@ -31,9 +33,9 @@ async function setup(context, changes = {}) {
       if (endpoint.endsWith('/commits/main')) return { sha: repoGit(upstream, 'rev-parse', 'HEAD').trim() };
       return structuredClone(metadata);
     },
-    fetch(directory, target) {
+    fetch(directory, target, signal, commit) {
       calls.push('fetch');
-      repoGit(directory, '-c', 'protocol.file.allow=always', 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', upstream, `refs/heads/${target.default_branch}:refs/remotes/origin/${target.default_branch}`);
+      repoGit(directory, '-c', 'protocol.file.allow=always', 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', upstream, commit ?? `refs/heads/${target.default_branch}:refs/remotes/origin/${target.default_branch}`);
     },
   };
   const config = { stateRoot: path.join(root, 'state'), workspaceRoot: path.join(root, 'tasks'), secrets: [], executor: new FakeExecutor(),
@@ -585,4 +587,350 @@ test('host-side CLI preserves remote bindings and uses the same exclusive regist
   assert.match(run(), /Registered legacy/);
   const registry = await readRegistry(file);
   assert.equal(registry.github_repositories.github_1234.repository_id, 1234); assert(registry.repositories.legacy);
+});
+
+const refreshContract = { goal: 'Offline refresh fixture', allowed_files: ['answer.txt'], requirements: [{ id: 'ANSWER', text: 'fixture' }], invariants: [], test_commands: [], initial_files: {} };
+function refreshInput(request_id, base_ref = 'main') {
+  return { repository_id: 'github_1234', execution_backend: 'local_codex', request_id, base_ref, contract: refreshContract };
+}
+async function advance(value, content) {
+  await fs.writeFile(path.join(value.upstream, 'answer.txt'), content);
+  repoGit(value.upstream, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-am', content.trim());
+  return repoGit(value.upstream, 'rev-parse', 'HEAD').trim();
+}
+
+test('default-branch task refreshes stale registration and pins A/B/C across retries and restart', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  const registry = await fs.readFile(value.file, 'utf8');
+  const index = await fs.readFile(path.join(value.destination, '.git/index'));
+  const snapshot = await checkoutSnapshot(value.destination, x => x);
+  const commitB = await advance(value, 'commit B\n');
+  // Original incident: the new explicit commit is absent from the managed store.
+  await assert.rejects(value.controller.start(refreshInput('missing_commit_b', commitB)), /BASE_REF_NOT_FOUND/);
+  const selected = await value.controller.start(refreshInput('select_branch_b'));
+  await Promise.all([...value.controller.jobs.values()]);
+  const taskB = value.controller.task(selected.task_id);
+  assert.equal(taskB.baseline, commitB);
+  assert.equal(taskB.repository.base_ref, commitB);
+  assert.equal(taskB.implementer.state, 'completed');
+  const pinned = await value.controller.start(refreshInput('select_commit_a', value.baseline));
+  await Promise.all([...value.controller.jobs.values()]);
+  assert.equal(value.controller.task(pinned.task_id).baseline, value.baseline);
+  const commitC = await advance(value, 'commit C\n');
+  const current = await value.controller.start(refreshInput('select_branch_c'));
+  await Promise.all([...value.controller.jobs.values()]);
+  assert.equal(value.controller.task(current.task_id).baseline, commitC);
+  const calls = value.calls.length;
+  assert.equal((await value.controller.start(refreshInput('select_branch_b'))).task_id, selected.task_id);
+  assert.equal(value.calls.length, calls);
+  await assert.rejects(value.controller.start(refreshInput('select_branch_b', commitC)), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+  for (const [id, baseline] of [[selected.task_id, commitB], [pinned.task_id, value.baseline], [current.task_id, commitC]]) {
+    const task = value.controller.task(id), worktree = path.join(value.config.workspaceRoot, id, 'repo');
+    assert.equal(task.baseline, baseline);
+    assert.equal(repoGit(worktree, 'rev-parse', 'HEAD').trim(), baseline);
+    assert.equal(repoGit(worktree, 'remote'), '');
+    assert.equal((await resolveRepository(value.file, task.repository.repository_id, task.repository.base_ref, value.config.workspaceRoot, value.config.stateRoot)).baseline_commit, baseline);
+  }
+  assert.equal(compareSnapshots(snapshot, await checkoutSnapshot(value.destination, x => x)).status, 'unchanged');
+  assert.equal(await fs.readFile(value.file, 'utf8'), registry);
+  assert.deepEqual(await fs.readFile(path.join(value.destination, '.git/index')), index);
+  assert.equal(repoGit(value.destination, 'rev-parse', 'HEAD').trim(), value.baseline);
+  assert.equal(await fs.readFile(path.join(value.destination, 'answer.txt'), 'utf8'), 'baseline\n');
+  const networkCalls = value.calls.length;
+  assert.equal((await value.controller.listRegisteredRepositories()).repositories[0].baseline_commit, value.baseline);
+  assert.equal(value.calls.length, networkCalls);
+  await value.controller.close();
+  value.transport.api = () => { throw Error('offline after restart'); };
+  const restarted = await new Controller(value.config).init();
+  try {
+    assert.equal((await restarted.start(refreshInput('select_branch_b'))).task_id, selected.task_id);
+    assert.equal(restarted.task(selected.task_id).baseline, commitB);
+    assert.equal(restarted.task(pinned.task_id).baseline, value.baseline);
+  } finally { await restarted.close(); }
+});
+
+
+test('HEAD, explicit commits and discovery never synchronize', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  await advance(value, 'new GitHub tip\n');
+  const calls = value.calls.length;
+  value.transport.api = () => { throw Error('offline'); };
+  for (const [request, ref] of [['head_local', 'HEAD'], ['commit_local', value.baseline]]) {
+    const result = await value.controller.start(refreshInput(request, ref));
+    await Promise.all([...value.controller.jobs.values()]);
+    assert.equal(value.controller.task(result.task_id).baseline, value.baseline);
+  }
+  await value.controller.listRegisteredRepositories();
+  assert.equal(value.calls.length, calls);
+  assert.equal(value.calls.filter(call => call === 'fetch').length, 1);
+});
+
+for (const ref of ['missing-branch', 'refs/heads/other', 'refs/tags/missing', '--all', 'main~1', 'main..HEAD', 'https://github.com/other/repo']) {
+  test(`unsupported or unavailable task ref fails closed without GitHub: ${ref}`, async context => {
+    const value = await setup(context);
+    await value.controller.registerGitHubRepository(input);
+    const calls = value.calls.length;
+    await assert.rejects(value.controller.start(refreshInput('unsupported_ref', ref)), /INVALID_BASE_REF|BASE_REF_NOT_FOUND/);
+    assert.equal(value.calls.length, calls);
+    assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  });
+}
+
+for (const conflict of ['repository_id', 'owner_id', 'full_name', 'default_branch', 'private', 'origin', 'working_files']) {
+  test(`refresh rejects changed registered identity or checkout: ${conflict}`, async context => {
+    const value = await setup(context);
+    await value.controller.registerGitHubRepository(input);
+    await advance(value, 'commit B\n');
+    const fetches = value.calls.filter(call => call === 'fetch').length;
+    if (conflict === 'repository_id') value.metadata.id++;
+    if (conflict === 'owner_id') value.metadata.owner.id++;
+    if (conflict === 'full_name') value.metadata.full_name = 'owner/replacement';
+    if (conflict === 'default_branch') value.metadata.default_branch = 'other';
+    if (conflict === 'private') value.metadata.private = true;
+    if (conflict === 'origin') repoGit(value.destination, 'remote', 'set-url', 'origin', 'https://github.com/owner/replacement.git');
+    if (conflict === 'working_files') await fs.writeFile(path.join(value.destination, 'answer.txt'), 'tampered\n');
+    await assert.rejects(value.controller.start(refreshInput('identity_conflict')), /GITHUB_REGISTRATION_|REGISTRATION_CHECKOUT_INVALID/);
+    assert.equal(value.calls.filter(call => call === 'fetch').length, fetches);
+    assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  });
+}
+
+for (const failure of ['api', 'fetch', 'missing_commit', 'invalid_commit', 'branch_race', 'identity_race', 'missing_blob', 'sync']) {
+  test(`refresh admits no task on ${failure} failure`, async context => {
+    const value = await setup(context);
+    await value.controller.registerGitHubRepository(input);
+    const registry = await fs.readFile(value.file, 'utf8');
+    await advance(value, 'commit B\n');
+    const api = value.transport.api, fetch = value.transport.fetch;
+    if (failure === 'api') value.transport.api = () => { throw Error('private API error'); };
+    if (failure === 'fetch') value.transport.fetch = () => { throw Error('private fetch error'); };
+    if (['missing_commit', 'invalid_commit'].includes(failure)) {
+      value.transport.api = endpoint => endpoint.includes('/commits/') ? { sha: failure === 'missing_commit' ? 'a'.repeat(40) : 'not-a-commit' } : api(endpoint);
+      value.transport.fetch = () => {};
+    }
+    if (failure === 'sync') value.controller.registration.synchronize = () => { throw Error('disk failure'); };
+    if (['branch_race', 'identity_race', 'missing_blob'].includes(failure)) value.transport.fetch = async (...args) => {
+      fetch(...args);
+      if (failure === 'branch_race') await advance(value, 'commit C\n');
+      if (failure === 'identity_race') value.metadata.id++;
+      if (failure === 'missing_blob') {
+        const blob = repoGit(value.destination, 'rev-parse', `${args[3]}:answer.txt`).trim();
+        await fs.unlink(path.join(value.destination, '.git/objects', blob.slice(0, 2), blob.slice(2)));
+      }
+    };
+    await assert.rejects(value.controller.start(refreshInput('failed_refresh')), error => !String(error).includes('private'));
+    assert.equal(await fs.readFile(value.file, 'utf8'), registry);
+    assert.equal(repoGit(value.destination, 'rev-parse', 'HEAD').trim(), value.baseline);
+    assert.equal(await fs.readFile(path.join(value.destination, 'answer.txt'), 'utf8'), 'baseline\n');
+    assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+    assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+    assert.equal(value.controller._api, undefined);
+    if (failure === 'missing_blob') {
+      // Even unreachable refreshed objects retain strict connectivity checking.
+      await assert.rejects(resolveRepository(value.file, 'github_1234', value.baseline, value.config.workspaceRoot, value.config.stateRoot));
+    }
+  });
+}
+
+for (const kind of ['symlink', 'submodule']) test(`refreshed ${kind} tree is rejected before task admission`, async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  if (kind === 'symlink') { await fs.symlink('/etc/passwd', path.join(value.upstream, 'outside')); repoGit(value.upstream, 'add', '.'); }
+  else repoGit(value.upstream, 'update-index', '--add', '--cacheinfo', `160000,${value.baseline},nested`);
+  repoGit(value.upstream, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unsupported');
+  await assert.rejects(value.controller.start(refreshInput('unsupported_tree')), /REGISTRATION_UNSUPPORTED_ENTRY/);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  assert.equal(repoGit(value.destination, 'rev-parse', 'HEAD').trim(), value.baseline);
+});
+
+test('concurrent starts, identical retries, registration and discovery preserve source and task identities', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  const before = await checkoutSnapshot(value.destination, x => x), commitB = await advance(value, 'commit B\n');
+  const fetch = value.transport.fetch; let active = 0, maximum = 0;
+  value.transport.fetch = async (...args) => {
+    maximum = Math.max(maximum, ++active);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    fetch(...args); active--;
+  };
+  const [first, duplicate, second, pinned, registered, discovered] = await Promise.all([
+    value.controller.start(refreshInput('concurrent_branch')),
+    value.controller.start(refreshInput('concurrent_branch')),
+    value.controller.start(refreshInput('concurrent_other', 'refs/heads/main')),
+    value.controller.start(refreshInput('concurrent_pinned', value.baseline)),
+    value.controller.registerGitHubRepository(input), value.controller.listRegisteredRepositories(),
+  ]);
+  await Promise.all([...value.controller.jobs.values()]);
+  assert.equal(first.task_id, duplicate.task_id); assert.equal(maximum, 1);
+  assert.equal(registered.baseline_commit, value.baseline);
+  assert.equal(discovered.repositories[0].baseline_commit, value.baseline);
+  for (const [result, expected] of [[first, commitB], [second, commitB], [pinned, value.baseline]]) {
+    const task = value.controller.task(result.task_id);
+    assert.equal(task.baseline, expected); assert.equal(task.implementer.state, 'completed');
+    assert.equal(repoGit(path.join(value.config.workspaceRoot, task.id, 'repo'), 'rev-parse', 'HEAD').trim(), expected);
+  }
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM operations').get().n, 3);
+  assert.equal(compareSnapshots(before, await checkoutSnapshot(value.destination, x => x)).status, 'unchanged');
+});
+
+test('cross-process refresh contention and retained registry locks fail closed', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  await advance(value, 'commit B\n');
+  const other = new GitHubRegistration({ stateRoot: value.config.stateRoot, workspaceRoot: value.config.workspaceRoot, transport: value.transport });
+  await withRegistryLock(value.file, async () => {
+    await assert.rejects(other.resolveForTask('github_1234', 'main'), /REPOSITORY_REGISTRY_BUSY/);
+    await assert.rejects(value.controller.start(refreshInput('locked_start')), /REPOSITORY_REGISTRY_BUSY/);
+  });
+  assert.equal(value.calls.filter(call => call === 'fetch').length, 1);
+});
+
+test('uncertain refresh termination retains lock and blocks admission across restart', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  await advance(value, 'commit B\n');
+  value.transport.fetch = () => { throw Object.assign(Error('uncertain'), { code: 'REGISTRATION_TERMINATION_UNCERTAIN' }); };
+  await assert.rejects(value.controller.start(refreshInput('uncertain_refresh')), /REGISTRATION_TERMINATION_UNCERTAIN/);
+  assert((await fs.stat(`${value.file}.lock`)).isDirectory());
+  await assert.rejects(value.controller.start(refreshInput('blocked_after_uncertainty', 'HEAD')), /REPOSITORY_REGISTRY_BUSY/);
+  assert.equal(value.controller.registration.terminationUncertain, true);
+  await assert.rejects(value.controller.close(), /REGISTRATION_TERMINATION_UNCERTAIN/);
+  // Test teardown only: production shutdown preserves the uncertainty signal.
+  value.controller.registration.terminationUncertain = false;
+  await value.controller.close();
+  const restarted = await new Controller(value.config).init();
+  try { await assert.rejects(restarted.start(refreshInput('restart_uncertain')), /REPOSITORY_REGISTRY_BUSY/); }
+  finally { await restarted.close(); }
+});
+
+test('shutdown cancels a real refresh process and admits no task or late writer', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  await advance(value, 'commit B\n');
+  const marker = path.join(value.root, 'late-refresh-write'); let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  value.transport.fetch = async (directory, target, signal) => {
+    const running = registrationProcess('/bin/sh', ['-c', '(sleep 0.5; touch "$1") & wait', 'fixture', marker], { cwd: directory, env: { PATH: '/usr/bin:/bin' }, signal });
+    started(); await running;
+  };
+  const pending = assert.rejects(value.controller.start(refreshInput('shutdown_refresh')), /REGISTRATION_INTERRUPTED/);
+  await ready; await value.controller.close(); await pending;
+  await new Promise(resolve => setTimeout(resolve, 600));
+  await assert.rejects(fs.stat(marker), { code: 'ENOENT' });
+});
+
+test('object-only transport fetch has no ref destination or credential delegation', async () => {
+  const calls = [], transport = new GitHubRegistrationTransport((binary, args, options) => { calls.push({ binary, args, options }); return ''; });
+  await transport.fetch('/trusted/managed', { full_name: 'owner/fixture', default_branch: 'main' }, undefined, 'b'.repeat(40));
+  const call = calls[0];
+  assert.equal(call.args.at(-1), 'b'.repeat(40));
+  assert(call.args.includes('--no-write-fetch-head'));
+  assert(call.args.includes('gc.auto=0')); assert(call.args.includes('maintenance.auto=false'));
+  assert(!call.args.some(arg => arg.startsWith('refs/')));
+  assert.equal(call.options.env.GIT_NO_REPLACE_OBJECTS, '1');
+  assert.equal(call.options.env.GIT_NO_LAZY_FETCH, '1');
+  await assert.rejects(transport.fetch('/trusted/managed', {}, undefined, '--all'), /GITHUB_REGISTRATION_BASELINE_UNAVAILABLE/);
+  assert.equal(calls.length, 1);
+});
+
+
+for (const tampered of [false, true]) test(`publication after a later refresh ${tampered ? 'rejects changed candidate' : 'retains exact reviewed tree and parent'}`, async context => {
+  const value = await setup(context), api = new FakeAPI(); value.controller._api = api;
+  await value.controller.registerGitHubRepository(input);
+  const commitB = await advance(value, 'commit B\n');
+  const started = await value.controller.start({ ...refreshInput('reviewed_branch_b'), execution_backend: 'agents_api' });
+  await Promise.all([...value.controller.jobs.values()]);
+  const work = path.join(value.config.workspaceRoot, started.task_id, 'repo');
+  await fs.writeFile(path.join(work, 'answer.txt'), 'reviewed change\n');
+  api.completed(value.controller.task(started.task_id).implementer.session_id);
+  await value.controller.review({ task_id: started.task_id, request_id: 'independent_review' });
+  await Promise.all([...value.controller.jobs.values()]);
+  let task = value.controller.task(started.task_id);
+  api.completed(task.reviewer.session_id, JSON.stringify({ overall: 'PASS', findings: ['ANSWER', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Offline independent reviewer fixture' })) }));
+  assert.equal((await value.controller.get(task.id)).reviewer.overall, 'PASS');
+  task = value.controller.task(task.id);
+  const reviewedTree = task.reviewer.reviewed_git_state.tree_sha;
+  const before = await checkoutSnapshot(value.destination, x => x);
+  await advance(value, 'commit C\n');
+  await value.controller.start(refreshInput('later_branch_c'));
+  await Promise.all([...value.controller.jobs.values()]);
+  assert.equal(compareSnapshots(before, await checkoutSnapshot(value.destination, x => x)).status, 'unchanged');
+  const remote = path.join(value.root, 'publication.git'); await fs.mkdir(remote);
+  repoGit(remote, 'init', '--bare', '--template=', '--initial-branch=main');
+  const publisher = new GitHubPublisher(); publisher.api = () => value.metadata;
+  const target = publisher.target.bind(publisher);
+  publisher.target = async repository => ({ ...await target(repository), remote });
+  publisher.findPR = async () => null;
+  publisher.createPR = async (destination, branch, details) => {
+    assert.equal(details.draft, true);
+    return { number: 1, html_url: `https://github.com/${destination.repository}/pull/1`, state: 'open', draft: true, merged_at: null,
+      head: { ref: branch, sha: repoGit(remote, 'rev-parse', `refs/heads/${branch}`).trim(), repo: { full_name: destination.repository } },
+      base: { ref: destination.base, repo: { full_name: destination.repository } } };
+  };
+  value.controller.publisher = publisher;
+  if (tampered) await fs.writeFile(path.join(work, 'answer.txt'), 'unreviewed change\n');
+  const publish = () => value.controller.publish({ task_id: task.id, title: 'Offline refreshed fixture' });
+  if (tampered) {
+    await assert.rejects(publish(), /WORKTREE_CHANGED_SINCE_REVIEW/);
+    assert.equal(repoGit(remote, 'for-each-ref'), '');
+  } else {
+    const result = await publish();
+    assert.equal(result.reviewed_tree_sha, reviewedTree);
+    assert.equal(repoGit(remote, 'rev-parse', `${result.commit_sha}^{tree}`).trim(), reviewedTree);
+    assert.equal(repoGit(remote, 'rev-parse', `${result.commit_sha}^`).trim(), commitB);
+    assert.equal((await value.controller.reportTask(task.id)).publication.confirmed, true);
+  }
+});
+
+test('automatic task request binding retains the branch selector and immutable commit across deduplication', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  const commitB = await advance(value, 'commit B\n');
+  // Exercise admission/binding only; automatic execution has its own unchanged suites.
+  value.controller.scheduleAutomatic = () => {};
+  const request = { ...refreshInput('automatic_branch_b'), automatic: {
+    publish: { title: 'Offline automatic fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0,
+  } };
+  const result = await value.controller.start(request);
+  await Promise.all([...value.controller.jobs.values()]);
+  const task = value.controller.task(result.task_id);
+  assert.equal(task.baseline, commitB);
+  assert.equal(task.repository.base_ref, commitB);
+  assert.equal(task.repository.requested_base_ref, 'main');
+  assert.equal(value.controller.automaticOperationBinding(request.request_id).fingerprint,
+    value.controller.db.prepare('SELECT fingerprint FROM operations WHERE id=?').get(request.request_id).fingerprint);
+  await advance(value, 'commit C\n');
+  const calls = value.calls.length;
+  assert.equal((await value.controller.start(request)).task_id, task.id);
+  assert.equal(value.calls.length, calls);
+  assert.equal(value.controller.task(task.id).baseline, commitB);
+});
+
+
+test('MCP default-branch refresh requires authorization and reports the pinned commit without host paths', async context => {
+  const value = await setup(context);
+  await value.controller.registerGitHubRepository(input);
+  const commitB = await advance(value, 'commit B\n'), before = value.calls.length;
+  let authorized = false;
+  const server = createServer(value.controller, async () => { if (!authorized) throw Error('denied'); });
+  const client = new Client({ name: 'refresh-offline', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  const args = refreshInput('mcp_branch_refresh');
+  assert.equal((await client.callTool({ name: 'start_task', arguments: args })).isError, true);
+  assert.equal(value.calls.length, before);
+  assert.equal(value.controller.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  authorized = true;
+  const result = await client.callTool({ name: 'start_task', arguments: args });
+  assert.notEqual(result.isError, true);
+  assert.equal(result.structuredContent.repository.baseline_commit, commitB);
+  assert.equal(result.structuredContent.repository.base_ref, commitB);
+  assert(!JSON.stringify(result).includes(value.root));
+  await Promise.all([...value.controller.jobs.values()]);
+  const task = value.controller.task(result.structuredContent.task_id);
+  assert.equal(task.implementer.state, 'completed');
+  assert.equal(repoGit(path.join(value.config.workspaceRoot, task.id, 'repo'), 'remote'), '');
+  assert.equal(value.controller._api, undefined);
 });

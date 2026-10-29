@@ -59,7 +59,17 @@ export async function verifyManagedCheckout(directory, commit, git, signal) {
   const configuration = (await git(directory, 'config', '--local', '--list')).trim().split('\n');
   const allowed = /^(core\.(?:repositoryformatversion=0|filemode=true|bare=false|logallrefupdates=true)|remote\.origin\.(?:url=https:\/\/github\.com\/[A-Za-z0-9_.\/-]+\.git|fetch=\+refs\/heads\/\*:refs\/remotes\/origin\/\*))$/;
   if (configuration.some(line => !allowed.test(line)) || new Set(configuration.map(line => line.split('=')[0])).size !== configuration.length) fail('REGISTRATION_STORAGE_INVALID');
-  if ((await git(directory, 'fsck', '--full', '--strict', '--no-reflogs')).trim()) fail('REGISTRATION_STORAGE_INVALID');
+  // Object-only refreshes leave commits without refs. Check every dangling
+  // closure explicitly: fsck's default connectivity walk covers only its roots.
+  const dangling = (await git(directory, 'fsck', '--full', '--strict', '--no-reflogs')).trim();
+  if (dangling) {
+    const roots = dangling.split('\n').map(line => {
+      const match = /^dangling (?:commit|tree|blob) ([a-f0-9]{40})$/.exec(line);
+      if (!match) fail('REGISTRATION_STORAGE_INVALID');
+      return match[1];
+    });
+    if ((await git(directory, 'fsck', '--full', '--strict', '--no-reflogs', '--no-dangling', ...roots)).trim()) fail('REGISTRATION_STORAGE_INVALID');
+  }
   const files = await validateManagedTree(directory, commit, git);
   const index = (await git(directory, 'ls-files', '--stage', '-z')).split('\0').filter(Boolean);
   if (index.length !== files.size || index.some(entry => {

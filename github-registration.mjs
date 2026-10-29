@@ -19,7 +19,7 @@ export function validName(value) {
 }
 function environment(network = false) {
   return { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_ATTR_NOSYSTEM: '1',
-    GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0',
+    GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1',
     ...(network ? { HOME: homedir(), GH_TOKEN: process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '', GH_PROMPT_DISABLED: '1' } : {}) };
 }
 export class GitHubRegistrationTransport {
@@ -32,13 +32,14 @@ export class GitHubRegistrationTransport {
   failure(error, code) {
     fail(['REGISTRATION_INTERRUPTED', 'REGISTRATION_TERMINATION_UNCERTAIN'].includes(error.code) ? error.code : code);
   }
-  async fetch(directory, target, signal) {
+  async fetch(directory, target, signal, commit) {
+    if (commit !== undefined && !/^[a-f0-9]{40}$/.test(commit)) fail('GITHUB_REGISTRATION_BASELINE_UNAVAILABLE');
     try {
       await this.run('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
         '-c', 'credential.helper=', '-c', 'credential.helper=!/usr/bin/gh auth git-credential', '-c', 'credential.interactive=false',
         '-c', 'http.followRedirects=false', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'fetch.fsckObjects=true',
         'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', '--', `https://github.com/${target.full_name}.git`,
-        `refs/heads/${target.default_branch}:refs/remotes/origin/${target.default_branch}`], {
+        commit ?? `refs/heads/${target.default_branch}:refs/remotes/origin/${target.default_branch}`], {
         cwd: directory, env: environment(true), signal, timeout: 120000,
       });
     } catch (error) { this.failure(error, 'GITHUB_REGISTRATION_FETCH_FAILED'); }
@@ -179,6 +180,37 @@ export class GitHubRegistration {
         throw error;
       }
     });
+  }
+  // Only new task admission may synchronize. Discovery, retries and historical
+  // resolution never acquire network authority or move the registration baseline.
+  async resolveForTask(id, baseRef) {
+    try {
+      const registry = await readRegistry(this.file);
+      if (!registry.github_repositories?.[id]) return resolveRepository(this.file, id, baseRef, this.workspaceRoot, this.stateRoot);
+      return await withRegistryLock(this.file, async () => {
+        this.checkActive();
+        const registered = await resolveRepository(this.file, id, baseRef, this.workspaceRoot, this.stateRoot, this.git);
+        const saved = registered.github_identity;
+        if (baseRef === 'HEAD' || /^[a-f0-9]{40}$/.test(baseRef) ||
+            ![saved.default_branch, `refs/heads/${saved.default_branch}`].includes(baseRef)) return registered;
+        const target = await this.authorize(saved.full_name);
+        if (Object.entries(target).some(([key, value]) => saved[key] !== value)) fail('GITHUB_REGISTRATION_IDENTITY_CHANGED');
+        const endpoint = `repos/${target.full_name}/commits/${encodeURIComponent(target.default_branch)}`;
+        const selected = await this.transport.api(endpoint, this.abort.signal);
+        if (!/^[a-f0-9]{40}$/.test(selected?.sha || '')) fail('GITHUB_REGISTRATION_BASELINE_UNAVAILABLE');
+        // Fetch only the API-selected object closure. No destination ref,
+        // FETCH_HEAD, checkout, index, configuration or registry write is allowed.
+        await this.transport.fetch(registered.canonical_path, target, this.abort.signal, selected.sha);
+        const resolved = await resolveRepository(this.file, id, selected.sha, this.workspaceRoot, this.stateRoot, this.git);
+        const confirmed = await this.authorize(saved.full_name);
+        if (JSON.stringify(confirmed) !== JSON.stringify(target)) fail('GITHUB_REGISTRATION_IDENTITY_CHANGED');
+        if ((await this.transport.api(endpoint, this.abort.signal))?.sha !== selected.sha) fail('GITHUB_REGISTRATION_BASELINE_CHANGED');
+        await this.synchronize(registered.canonical_path, this.abort.signal);
+        await verifyManagedCheckout(registered.canonical_path, saved.baseline_commit, this.git, this.abort.signal);
+        this.checkActive();
+        return { ...resolved, requested_base_ref: baseRef };
+      });
+    } catch (error) { this.transportFailure(error); throw error; }
   }
   async list() {
     this.checkActive();
