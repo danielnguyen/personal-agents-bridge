@@ -518,7 +518,7 @@ export class Controller {
     if (!Number.isFinite(completed) || !Number.isFinite(prepared) || prepared < task.created || completed < prepared || completed > Date.now()) throw new BridgeError('AUTOMATIC_RECOVERY_EVIDENCE_INVALID');
     if (completed >= task.deadline) throw new BridgeError('AUTOMATIC_PUBLICATION_AFTER_DEADLINE');
     const startPayload = { execution_backend: 'local_codex', input: { contract: binding.contract, repository_id: task.repository.repository_id,
-      base_ref: task.repository.base_ref, automatic: a.authorization } };
+      base_ref: task.repository.requested_base_ref ?? task.repository.base_ref, automatic: a.authorization } };
     const expected = [[task.request_id, digest({ kind: 'start', payload: startPayload }), ['accepted']],
       [a.review_request_id, digest({ kind: 'review', payload: { id: task.id } }), ['accepted']],
       [a.publish_request_id, digest({ kind: 'automatic_publish', payload: { task_id: task.id, ...a.authorization.publish } }), ['pending', 'accepted']]];
@@ -929,7 +929,7 @@ export class Controller {
       if (id === task.request_id) {
         kind = task.correction ? 'correction' : 'start';
         payload = task.correction || { execution_backend: 'local_codex', input: { contract: a.contract_binding.contract,
-          repository_id: task.repository.repository_id, base_ref: task.repository.base_ref, automatic: a.authorization } };
+          repository_id: task.repository.repository_id, base_ref: task.repository.requested_base_ref ?? task.repository.base_ref, automatic: a.authorization } };
       } else if (id === a?.review_request_id) { kind = 'review'; payload = { id: task.id }; }
       else if (id === a?.publish_request_id) {
         kind = 'automatic_publish'; taskId = a.corrective_publication?.task_id || a.correction?.task_id || task.id;
@@ -1377,8 +1377,8 @@ export class Controller {
     }
   }
   async currentReviewPacket(task) {
-    const current = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), task.repository.repository_id,
-      task.repository.base_ref, this.workspaceRoot, this.stateRoot, asynchronousRepoGit(AbortSignal.timeout(10000)));
+    const current = await this.locked('repository-registration', () => resolveRepository(path.join(this.stateRoot, 'repositories.json'), task.repository.repository_id,
+      task.repository.base_ref, this.workspaceRoot, this.stateRoot, asynchronousRepoGit(AbortSignal.timeout(10000))));
     if (current.baseline_commit !== task.baseline || ['repository_id', 'canonical_path', 'registered_identity', 'base_ref', 'baseline_commit', 'github_identity']
       .some(key => digest(current[key] ?? null) !== digest(task.repository[key] ?? null))) throw new BridgeError('REPOSITORY_PATH_CHANGED');
     return this.verifyLocalReviewPacket(task, { readOnly: true });
@@ -1513,7 +1513,7 @@ export class Controller {
       const task = this.task(childId); task.repository = repository; task.correction_state = 'running';
       this.save(task);
       if (parent.automatic.authorization.max_codex_turns === 4) {
-        const before = await captureBefore(this.task(childId), this.stateRoot, this.workspaceRoot, this.bounded.bind(this));
+        const before = await this.locked('repository-registration', () => captureBefore(this.task(childId), this.stateRoot, this.workspaceRoot, this.bounded.bind(this)));
         const current = this.task(childId); current.review_evidence_before = JSON.parse(this.safe(JSON.stringify(before))); this.save(current);
       }
       await this.localReferenceEvidence(repo, parent.baseline, contract, true, true);
@@ -1997,6 +1997,9 @@ export class Controller {
     this.finishAutomatic(id, 'succeeded', null);
   }
   async start(input) {
+    return this.locked(`start:${input.request_id}`, () => this.startVerified(input));
+  }
+  async startVerified(input) {
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
     this.storageAuthority();
     const { contract, request_id, repository_id, base_ref = 'HEAD', execution_backend = 'agents_api' } = input;
@@ -2016,17 +2019,24 @@ export class Controller {
     for (const name of Object.keys(contract.initial_files || {})) safeRelative(name);
     const ids = [...contract.requirements, ...contract.invariants].map(r => r.id);
     if (new Set(ids).size !== ids.length || ids.some(id => ['SCOPE', 'TEST_EVIDENCE'].includes(id))) throw new BridgeError('DUPLICATE_OR_RESERVED_REQUIREMENT_ID');
+    const payload = repository_id !== undefined ? { contract, repository_id, base_ref, ...(automatic ? { automatic } : {}) } : contract;
+    const operationPayload = execution_backend === 'agents_api' ? payload : { execution_backend, input: payload };
+    // Replays must return the original binding before any branch lookup/fetch.
+    if (this.db.prepare('SELECT id FROM operations WHERE id=?').get(request_id)) {
+      const old = this.operation(request_id, 'start', operationPayload, `task_${randomUUID()}`);
+      return this.get(old.task_id);
+    }
     const id = `task_${randomUUID()}`;
     // Validate allowlisting and pin the commit before accepting any paid work.
     let repository;
     if (repository_id !== undefined) {
       if (Object.keys(contract.initial_files || {}).length) throw new BridgeError('REPOSITORY_INITIAL_FILES_UNSUPPORTED');
-      try { repository = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), repository_id, base_ref, this.workspaceRoot, this.stateRoot); }
+      try { repository = await this.locked('repository-registration', () => this.registration.resolveForTask(repository_id, base_ref)); }
       catch (e) { throw new BridgeError(/^[A-Z_]+$/.test(e.code || '') ? e.code : 'REPOSITORY_VALIDATION_FAILED'); }
     }
     if (execution_backend === 'local_codex') await this.localReferenceEvidence(repository.canonical_path, repository.baseline_commit, contract, false);
-    const payload = repository ? { contract, repository_id, base_ref, ...(automatic ? { automatic } : {}) } : contract;
-    const old = this.operation(request_id, 'start', execution_backend === 'agents_api' ? payload : { execution_backend, input: payload }, id);
+    if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
+    const old = this.operation(request_id, 'start', operationPayload, id);
     if (old) return this.get(old.task_id);
     const active = this.db.prepare('SELECT value FROM tasks').all().filter(r => !JSON.parse(r.value).cleaned);
     if (active.length >= 3) { this.db.prepare('DELETE FROM operations WHERE id=?').run(request_id); throw new BridgeError('ACTIVE_TASK_LIMIT'); }
@@ -2055,7 +2065,7 @@ export class Controller {
       const taskRoot = path.join(this.workspaceRoot, id); const repo = path.join(taskRoot, 'repo');
       await fs.mkdir(taskRoot, { recursive: true, mode: 0o700 });
       if (repository) {
-        const identity = await createTaskWorktree(taskRoot, id, repository);
+        const identity = await this.locked('repository-registration', () => createTaskWorktree(taskRoot, id, repository));
         const fresh = this.task(id); fresh.repository = identity; this.save(fresh);
       } else await fs.mkdir(repo, { mode: 0o700 });
       // Never overwrite repository-owned instructions (including symlinks).
@@ -2073,7 +2083,7 @@ export class Controller {
       const fresh = this.task(id); fresh.baseline = git(repo, 'rev-parse', 'HEAD').trim(); this.save(fresh);
       await fs.writeFile(path.join(taskRoot, 'baseline-state.json'), JSON.stringify({ head: fresh.baseline, staged_files: git(repo, 'diff', '--cached', '--name-only'), config_hash: digest(await fs.readFile(path.join(taskRoot, repository ? 'git-store/config' : 'repo/.git/config'), 'utf8')) }), { mode: 0o600 });
       if (repository) {
-        const evidence = await captureBefore(this.task(id), this.stateRoot, this.workspaceRoot, this.bounded.bind(this));
+        const evidence = await this.locked('repository-registration', () => captureBefore(this.task(id), this.stateRoot, this.workspaceRoot, this.bounded.bind(this)));
         const current = this.task(id); current.review_evidence_before = JSON.parse(this.safe(JSON.stringify(evidence))); this.save(current);
       }
       if (execution_backend === 'local_codex') {
@@ -2459,7 +2469,7 @@ export class Controller {
           operation(id, value.id, expected.fingerprint);
         }
       } else {
-        const payload = { contract, repository_id: value.repository.repository_id, base_ref: value.repository.base_ref };
+        const payload = { contract, repository_id: value.repository.repository_id, base_ref: value.repository.requested_base_ref ?? value.repository.base_ref };
         operation(value.request_id, value.id, digest({ kind: 'start', payload: value.execution_backend === 'local_codex' ?
           { execution_backend: 'local_codex', input: payload } : payload }));
         operation(ref.request_id || ref.creation_request, value.id, digest({ kind: 'review', payload: { id: value.id } }));
@@ -3290,7 +3300,7 @@ export class Controller {
       const data = { ...localEvidencePacket(t, contract.test_commands, repo, reviewedState),
         local_scope: { version: 'pab.local-scope.bounded.v1', provenance: 'controller', contract_sha256: digest(contract),
           protected_before: t.local_protected_before || null, protected_at_review: await this.localProtectedState(repo) },
-        reviewed_git_state: reviewedState, controller_evidence: await repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this)),
+        reviewed_git_state: reviewedState, controller_evidence: await this.locked('repository-registration', () => repositoryReviewEvidence(t, this.stateRoot, this.workspaceRoot, this.bounded.bind(this))),
         file_byte_evidence: fileBytes, baseline_state: JSON.parse(await fs.readFile(path.join(root, 'baseline-state.json'), 'utf8')),
         current_config_hash: digest(await fs.readFile(path.join(root, 'git-store/config'), 'utf8')),
         contract: markdown, contract_binding: localContractBinding(contract, markdown), baseline_commit: t.baseline, current_commit: git(repo, 'rev-parse', 'HEAD').trim(),
@@ -3337,7 +3347,7 @@ export class Controller {
       retained.push(candidate); commandBytes += size;
     }
     commands.push(...retained.sort((a,b) => a.order - b.order).map(x => x.record));
-    const controllerEvidence = t.repository ? await repositoryReviewEvidence(this.task(t.id), this.stateRoot, this.workspaceRoot, this.bounded.bind(this)) : null;
+    const controllerEvidence = t.repository ? await this.locked('repository-registration', () => repositoryReviewEvidence(this.task(t.id), this.stateRoot, this.workspaceRoot, this.bounded.bind(this))) : null;
     const commandEvidence = { provenance: 'agents_api_command_execution', session_id: t.implementer.session_id,
       records: commands, required_test_commands_missing: contract.test_commands.filter(cmd => !matchedTests.has(cmd)), items_scan_complete: complete, omitted_command_records: omitted, error: commandError,
       coverage: 'Git-operation records are retained before required-test and inspection records, then presented in source order. Only command_execution items are retained. Hidden reasoning, assistant prose and unrestricted raw logs are excluded. This is not an exhaustive network/syscall audit.' };
@@ -3861,7 +3871,7 @@ export class Controller {
         if (t.execution_backend === 'local_codex') await this.qualifyLocalPublication(t);
         else if (!t.reviewer || t.reviewer.stale || t.reviewer.state !== 'completed' || t.reviewer.session_id === t.implementer.session_id ||
             t.reviewer.review_result?.overall !== 'PASS' || t.reviewer.review_result.packet_hash !== t.reviewer.packet_hash) throw new BridgeError('PUBLICATION_REQUIRES_PASS_REVIEW');
-        const registered = await resolveRepository(path.join(this.stateRoot, 'repositories.json'), t.repository.repository_id, t.repository.base_ref, this.workspaceRoot, this.stateRoot);
+        const registered = await this.locked('repository-registration', () => resolveRepository(path.join(this.stateRoot, 'repositories.json'), t.repository.repository_id, t.repository.base_ref, this.workspaceRoot, this.stateRoot));
         this.automaticGuard(this.task(t.id));
         if (JSON.stringify(registered.registered_identity) !== JSON.stringify(t.repository.registered_identity)) throw new BridgeError('REPOSITORY_PATH_CHANGED');
         for (const role of ['implementer', 'reviewer']) {

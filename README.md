@@ -765,6 +765,33 @@ symlink policy bypass; it is not evidence of a demonstrated sandbox escape. Lega
 host registrations retain their existing tree policy. Supported GitHub HTTPS/SCP/SSH
 origins are compared by complete normalized owner/repository identity, not prefixes.
 
+For a separately authorized new task on a managed GitHub registration, explicitly
+select `base_ref: "main"` (substitute the registered default branch), or its full
+`refs/heads/` form, to select the current verified GitHub commit. The Controller
+rechecks the authenticated numeric owner/repository identity and default branch,
+fetches only that API-selected commit's objects, validates their connectivity and
+supported tree, and synchronizes storage before task admission. It does not update
+source refs, HEAD, index, working files or the registration's original baseline.
+The task stores the selected commit SHA as its immutable `base_ref`; the original
+branch selector is retained only for request deduplication. Later task starts cannot
+move existing tasks or invalidate their source-checkout evidence. Identical accepted
+`request_id` retries return their original task before any network synchronization,
+including after restart. Different input with the same ID is rejected.
+
+Omitted `base_ref` and `HEAD` keep the original local selection. Explicit commit
+selection never fetches missing objects; use the default branch selection for a new
+current task. Discovery and repeated registration remain read-only with respect to
+refresh. Other refs retain local resolution and never acquire fetch authority.
+Changed identity/default branch, API/fetch failure, a branch changing during
+verification, invalid or missing objects, unsupported trees and synchronization
+failure admit no task. Repository selection, source integrity captures and provisioning
+share the Controller's registration serialization; managed task admission also uses
+the existing cross-process registry lock. Unconfirmed fetch termination retains
+that lock and requires operator inspection, including after restart. No agent
+receives network access, credentials or registration authority. Object storage and
+subprocess bounds remain the existing registration limits; this adds no background
+refresh, garbage collection or new publication authority.
+
 Identical requests revalidate and return `already_registered`; they do not refresh
 the baseline or alter an existing checkout. Rename, transfer, origin/identity changes
 and local ID/path collisions fail closed. An existing host-registered GitHub origin
