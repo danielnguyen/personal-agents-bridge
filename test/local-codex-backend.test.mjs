@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { LocalCodexBackend, childEnvironment, APPROVAL_LIMITATION } from '../local-codex-backend.mjs';
+import { createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 const account = () => ({ account: { type: 'chatgpt', email: 'fixture@example.invalid', planType: 'pro' }, requiresOpenaiAuth: true });
 const configuration = () => ({ model: 'gpt-6.1-sol', model_provider: 'openai', model_providers: {}, chatgpt_base_url: 'https://chatgpt.com/backend-api/',
@@ -251,6 +252,285 @@ test('failed turns and nonzero commands are distinct from successful completion'
   } });
   const result = await value.run(); assert.equal(result.status, 'failed'); assert.equal(result.terminalObserved, true);
   assert.equal(result.commands[0].exitCode, 1);
+});
+
+test('global thread status for another thread does not abort the active turn', async context => {
+  const progress = [], lifecycle = [];
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, event, items, complete }) => {
+    nextTurn();
+    setImmediate(() => {
+      event('thread/status/changed', { threadId: 'unrelated-thread', status: { type: 'idle' } });
+      items(); complete();
+    });
+    return { turn: { id: 'turn-1' } };
+  } }, { onProgress: event => { progress.push(event); }, onLifecycle: event => { lifecycle.push(event); } });
+  const result = await value.run();
+  assert.equal(result.status, 'completed', JSON.stringify({ status: result.status, terminalObserved: result.terminalObserved, diagnostics: result.uncertainties }));
+  assert.equal(result.terminalObserved, true); assert.equal(result.turnId, 'turn-1');
+  assert.equal(result.commands.length, 1); assert.deepEqual(result.messages, [{ provenance: 'model', text: 'Tests passed.' }]);
+  assert(!JSON.stringify(progress).includes('unrelated-thread'));
+  assert(!JSON.stringify(lifecycle).includes('unrelated-thread'));
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  assert(!value.requests.some(request => request.method === 'turn/interrupt'));
+});
+
+test('global thread status routes only validated metadata before and after acknowledgement', async context => {
+  const statuses = [{ type: 'notLoaded' }, { type: 'idle' }, { type: 'systemError' },
+    { type: 'active', activeFlags: [] }, { type: 'active', activeFlags: ['waitingOnApproval'] },
+    { type: 'active', activeFlags: ['waitingOnUserInput'] }, { type: 'active', activeFlags: ['waitingOnApproval', 'waitingOnUserInput'] }];
+  for (const early of [false, true]) for (const foreign of [false, true]) for (const status of statuses)
+    await context.test(JSON.stringify({ early, foreign, status }), async t => {
+      const progress = [], lifecycle = [];
+      const value = await fixture(t, { 'turn/start': ({ nextTurn, send, items, complete }) => {
+        nextTurn();
+        const emit = () => { send({ method: 'thread/status/changed', emittedAtMs: 123,
+          params: { threadId: foreign ? 'unrelated-thread' : 'thread-fixture', status } }); items(); complete(); };
+        if (early) emit(); else setImmediate(emit);
+        return { turn: { id: 'turn-1' } };
+      } }, { onProgress: event => { progress.push(event); }, onLifecycle: event => { lifecycle.push(event); },
+        onApproval: () => assert.fail('Metadata cannot authorize approval'), onQuestion: () => assert.fail('Metadata cannot request human input') });
+      const result = await value.run();
+      assert.equal(result.status, 'completed'); assert.equal(result.terminalObserved, true);
+      assert.equal(result.commands.length, 1); assert.equal(result.messages.length, 1); assert.deepEqual(result.files, []); assert.equal(result.usage, undefined);
+      assert.equal(progress.filter(event => event.method === 'thread/status/changed').length, foreign ? 0 : 1);
+      assert(!JSON.stringify(progress).includes('unrelated-thread')); assert(!JSON.stringify(lifecycle).includes('unrelated-thread'));
+      assert.equal(value.replies.length, 0); assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+    });
+});
+
+test('global thread status exception never admits foreign execution, terminal or authority events', async context => {
+  const binding = { threadId: 'foreign-thread', turnId: 'turn-1' };
+  const cases = [
+    { method: 'turn/completed', params: { threadId: 'foreign-thread', turn: { id: 'turn-1', status: 'completed' } } },
+    { method: 'turn/completed', params: { threadId: 'thread-fixture', turn: { id: 'foreign-turn', status: 'completed' } }, code: 'INVALID_TERMINAL_EVENT' },
+    { method: 'turn/started', params: { threadId: 'foreign-thread', turn: { id: 'foreign-turn', status: 'inProgress' } } },
+    { method: 'item/started', params: { ...binding, item: { id: 'foreign-command', type: 'commandExecution', command: 'FOREIGN_OUTPUT' } } },
+    { method: 'item/completed', params: { ...binding, item: { id: 'foreign-command', type: 'commandExecution', command: 'FOREIGN_OUTPUT', exitCode: 0 } } },
+    { method: 'item/completed', params: { ...binding, item: { id: 'foreign-file', type: 'fileChange', changes: ['FOREIGN_OUTPUT'] } } },
+    { method: 'item/completed', params: { ...binding, item: { id: 'foreign-message', type: 'agentMessage', text: 'FOREIGN_OUTPUT' } } },
+    ...['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput'].map(method => ({ id: 0, method, params: binding })),
+    { method: 'serverRequest/resolved', params: { threadId: 'foreign-thread', requestId: 0 } },
+    { method: 'thread/tokenUsage/updated', params: { ...binding, tokenUsage: { foreign: true } } },
+    { method: 'unknown/notification', params: binding },
+    { method: 'item/started', params: { threadId: 'thread-fixture', turnId: 'foreign-turn', item: { id: 'foreign-command' } }, code: 'EVENT_TURN_MISMATCH' },
+    { method: 'account/updated', params: { authMode: 'apikey' }, code: 'CHATGPT_AUTHENTICATION_CHANGED' },
+  ];
+  for (const [index, message] of cases.entries()) await context.test(String(index) + ' ' + message.method, async t => {
+    const { code = 'EVENT_THREAD_MISMATCH', ...wire } = message, progress = [], lifecycle = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, event, send, complete }) => {
+      nextTurn(); setImmediate(() => {
+        event('thread/status/changed', { threadId: 'unrelated-thread', status: { type: 'idle' } });
+        send(wire); complete();
+      }); return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); }, onLifecycle: event => { lifecycle.push(event); },
+      onApproval: () => assert.fail('Foreign approval'), onQuestion: () => assert.fail('Foreign human request') });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false); assert(result.uncertainties.includes(code));
+    assert.deepEqual(result.commands, []); assert.deepEqual(result.files, []); assert.deepEqual(result.messages, []); assert.equal(result.usage, undefined);
+    // The existing raw progress callback precedes nested terminal validation.
+    // A same-thread/wrong-turn terminal is observable, but never retained as
+    // execution evidence and never qualifies terminal completion or authority.
+    assert.deepEqual(progress, code === 'INVALID_TERMINAL_EVENT' ? [wire] : []);
+    const ledger = createLocalEvidence('synthetic-routing-task'), before = structuredClone(ledger);
+    for (const event of progress) assert.equal(observeLocalEvidence(ledger, event,
+      { thread_id: 'thread-fixture', turn_id: 'turn-1' }, text => text), false);
+    assert.deepEqual(ledger, before);
+    assert(!lifecycle.some(event => ['human_request', 'human_request_resolved', 'terminal_observed'].includes(event.phase)));
+    assert.equal(value.replies.length, 0); assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+// Literal wire frames: object construction/stringification would erase the defect.
+test('raw duplicate JSON keys cannot enter the global thread status exception', async context => {
+  const frames = [
+    ['method', String.raw`{"method":"turn/completed","method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped method', String.raw`{"method":"turn/completed","metho\u0064":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['params', String.raw`{"method":"thread/status/changed","params":null,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped params', String.raw`{"method":"thread/status/changed","params":null,"param\u0073":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['threadId', String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped threadId', String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","thread\u0049d":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['status', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed"},"status":{"type":"idle"}}}`],
+    ['escaped status', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed"},"statu\u0073":{"type":"idle"}}}`],
+    ['status.type', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed","type":"idle"}}}`],
+    ['escaped status.type', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"completed","typ\u0065":"idle"}}}`],
+    ['status.activeFlags', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"active","activeFlags":["unknown"],"activeFlags":[]}}}`],
+    ['escaped status.activeFlags', String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"active","activeFlags":["unknown"],"active\u0046lags":[]}}}`],
+    ['emittedAtMs', String.raw`{"method":"thread/status/changed","emittedAtMs":null,"emittedAtMs":123,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+    ['escaped emittedAtMs', String.raw`{"method":"thread/status/changed","emittedAtMs":null,"emittedAtM\u0073":123,"params":{"threadId":"unrelated-thread","status":{"type":"idle"}}}`],
+  ];
+  assert.equal(frames.length, 14);
+  for (const early of [true, false]) for (const [name, frame] of frames) await context.test(`${name}; early=${early}`, async t => {
+    const progress = [], lifecycle = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, items, complete }) => {
+      nextTurn();
+      const emit = () => { child.stdout.write(frame + '\n'); items(); complete(); };
+      if (early) emit(); else setImmediate(emit);
+      return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); }, onLifecycle: event => { lifecycle.push(event); },
+      onApproval: () => assert.fail('Ambiguous frame cannot approve'), onQuestion: () => assert.fail('Ambiguous frame cannot request input') });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_DUPLICATE_JSON_KEY'));
+    assert.deepEqual(progress, []); assert.deepEqual(result.commands, []); assert.deepEqual(result.messages, []); assert.deepEqual(result.files, []);
+    assert(!lifecycle.some(event => event.phase === 'terminal_observed' || event.phase === 'human_request'));
+    assert.equal(value.replies.length, 0); assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw admission rejects duplicate keys in active metadata and RPC responses too', async context => {
+  const frames = [
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"type":"idle","type":"idle"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"typ\u0065":"idle","type":"idle"}}}`,
+    String.raw`{"id":0,"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"}}}`,
+    String.raw`{"id":REQUEST_ID,"result":null,"result":{"turn":{"id":"turn-1"}}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":[{"key":1,"key":2}]}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":[{"__proto__":1,"\u005f_proto__":2}]}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":{"\ud83d\ude80":1,"🚀":2}}}`,
+    String.raw`{"id":REQUEST_ID,"result":{"turn":{"id":"turn-1"},"extra":{"a\\b":1,"a\u005cb":2}}}`,
+  ];
+  for (const [index, frame] of frames.entries()) await context.test(String(index), async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, requests, complete }) => {
+      nextTurn(); child.stdout.write(frame.replace('REQUEST_ID', requests.at(-1).id) + '\n'); complete();
+      return undefined;
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_DUPLICATE_JSON_KEY')); assert.deepEqual(progress, []);
+    assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw admission preserves legal keys, strings, arrays, nesting and fragmented frames', async context => {
+  const extra = String.raw`{"same":1,"Same":2,"__proto__":3,"constructor":4,"type":5,"typ\\u0065":6,"a\"b":7,"a\\b":8,"":9,"☃":10,"🚀":11,"array":[{"key":1},{"key":2},null,true,false,-2.5e+3,[],{}],"text":"{\"type\":1,\"type\":2}: [] \\ \" \b \f \n \r \t \u0061"}`;
+  for (const fragmented of [false, true]) await context.test('fragmented=' + fragmented, async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, requests, items, complete }) => {
+      nextTurn();
+      const response = '{"id":' + requests.at(-1).id + ',"result":{"turn":{"id":"turn-1","status":"inProgress"},"extra":' + extra + ',"deep":' + '['.repeat(12000) + '0' + ']'.repeat(12000) + '}}\r\n';
+      child.stdout.write(response);
+      setImmediate(() => {
+        const frames = String.raw`{"metho\u0064":"thread/status/changed","params":{"thread\u0049d":"unrelated-thread","status":{"typ\u0065":"active","activeFlags":["waitingOnApproval","waitingOnUserInput"]}},"emittedAtMs":123,"jsonrpc":"2.0"}` + '\n' +
+          String.raw`{"method":"thread/status/changed","params":{"threadId":"thread-fixture","status":{"type":"idle"}}}` + '\n';
+        if (fragmented) for (const character of frames) child.stdout.write(character);
+        else child.stdout.write(frames);
+        items(); complete();
+      });
+      return undefined;
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'completed'); assert.equal(result.terminalObserved, true);
+    assert.equal(result.commands.length, 1); assert.equal(result.messages.length, 1);
+    assert.equal(progress.filter(event => event.method === 'thread/status/changed').length, 1);
+    assert(!JSON.stringify(progress).includes('unrelated-thread'));
+  });
+});
+
+test('raw foreign execution, terminal, approval and human requests retain identity rejection', async context => {
+  const frames = [
+    String.raw`{"method":"item/completed","params":{"threadId":"foreign-thread","turnId":"turn-1","item":{"id":"foreign-command","type":"commandExecution","command":"FOREIGN_OUTPUT","status":"completed","exitCode":0}}}`,
+    String.raw`{"method":"turn/completed","params":{"threadId":"foreign-thread","turn":{"id":"turn-1","status":"completed"}}}`,
+    String.raw`{"id":0,"method":"item/commandExecution/requestApproval","params":{"threadId":"foreign-thread","turnId":"turn-1"}}`,
+    String.raw`{"id":0,"method":"item/tool/requestUserInput","params":{"threadId":"foreign-thread","turnId":"turn-1"}}`,
+  ];
+  for (const early of [true, false]) for (const [index, frame] of frames.entries()) await context.test(`${index}; early=${early}`, async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); const emit = () => { child.stdout.write(frame + '\n'); complete(); };
+      if (early) emit(); else setImmediate(emit);
+      return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); },
+      onApproval: () => assert.fail('Foreign approval'), onQuestion: () => assert.fail('Foreign human request') });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('EVENT_THREAD_MISMATCH'));
+    assert.deepEqual(result.commands, []); assert.deepEqual(result.messages, []); assert.deepEqual(result.files, []);
+    assert.deepEqual(progress, []); assert.deepEqual(value.replies, []);
+    assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('raw malformed JSON remains rejected without dispatch or completion', async context => {
+  const frames = [
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}},}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle\q"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle\u00ZZ"}}}`,
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}},"unterminated":"` + '\\',
+    String.raw`{"method":"thread/status/changed","params":{"threadId":"unrelated-thread","status":{"type":"idle"}}} {}`,
+  ];
+  for (const [index, frame] of frames.entries()) await context.test(String(index), async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); setImmediate(() => { child.stdout.write(frame + '\n'); complete(); }); return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_PROTOCOL_ERROR')); assert.deepEqual(progress, []);
+  });
+});
+
+test('raw admission preserves the existing complete and partial frame size limits', async context => {
+  for (const terminated of [false, true]) await context.test('terminated=' + terminated, async t => {
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, child, complete }) => {
+      nextTurn(); setImmediate(() => {
+        child.stdout.write(' '.repeat(1024 * 1024 + 1) + (terminated ? '\n' : '')); complete();
+      }); return { turn: { id: 'turn-1' } };
+    } });
+    const result = await value.run();
+    assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('CODEX_FRAME_TOO_LARGE'));
+  });
+});
+
+test('global thread status rejects malformed or ambiguous notifications', async context => {
+  const valid = { threadId: 'unrelated-thread', status: { type: 'idle' } };
+  const malformed = [null, [], {}, { status: valid.status }, { ...valid, threadId: '' }, { ...valid, threadId: 42 },
+    { ...valid, threadId: ' padded ' }, { ...valid, threadId: 'x'.repeat(201) }, { ...valid, status: null },
+    { ...valid, status: [] }, { ...valid, status: { type: 'completed' } }, { ...valid, status: { type: 'idle', activeFlags: [] } },
+    { ...valid, turnId: 'foreign-turn' }, { ...valid, thread_id: 'ambiguous-thread' },
+    ...[undefined, 'waitingOnApproval', ['unknown'], [{}], ['waitingOnApproval', 'waitingOnApproval']].map(activeFlags =>
+      ({ ...valid, status: { type: 'active', activeFlags } }))];
+  const messages = malformed.map(params => ({ method: 'thread/status/changed', params }));
+  messages.push({ id: 0, method: 'thread/status/changed', params: valid }, { id: null, method: 'thread/status/changed', params: valid },
+    { method: 'thread/status/changed', params: { threadId: 'thread-fixture', status: { type: 'idle', turn: { status: 'completed' } } } });
+  for (const extra of [{ result: {} }, { error: {} }, { turnId: 'foreign-turn' }, { emittedAtMs: 'invalid' },
+    { emittedAtMs: -1 }, { emittedAtMs: {} }, { jsonrpc: '1.0' }]) messages.push({ method: 'thread/status/changed', params: valid, ...extra });
+  for (const [index, message] of messages.entries()) await context.test(String(index), async t => {
+    const progress = [];
+    const value = await fixture(t, { 'turn/start': ({ nextTurn, send, complete }) => {
+      nextTurn(); setImmediate(() => { send(message); complete(); }); return { turn: { id: 'turn-1' } };
+    } }, { onProgress: event => { progress.push(event); } });
+    const result = await value.run(); assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+    assert(result.uncertainties.includes('INVALID_THREAD_STATUS_EVENT')); assert.deepEqual(progress, []); assert.equal(value.replies.length, 0);
+  });
+});
+
+for (const stop of ['cancel', 'transport loss', 'commands without terminal']) test('global thread status preserves ' + stop + ' and no replay', async context => {
+  let value;
+  value = await fixture(context, { 'turn/start': ({ nextTurn, event, child, items }) => {
+    nextTurn(); setImmediate(() => {
+      event('thread/status/changed', { threadId: 'unrelated-thread', status: { type: 'idle' } });
+      if (stop === 'cancel') value.backend.cancel();
+      else { if (stop === 'commands without terminal') items(); child.kill(); }
+    }); return { turn: { id: 'turn-1' } };
+  } });
+  const result = await value.run(); assert.equal(result.status, stop === 'cancel' ? 'interrupted' : 'uncertain');
+  assert.equal(result.terminalObserved, stop === 'cancel');
+  assert.equal(value.requests.filter(request => request.method === 'turn/start').length, 1);
+  assert.equal(value.requests.filter(request => request.method === 'turn/interrupt').length, stop === 'cancel' ? 1 : 0);
+  if (stop === 'commands without terminal') { assert.equal(result.commands[0].exitCode, 0); assert.equal(result.messages.length, 1); }
+});
+
+for (const early of [false, true]) test('global thread status preserves event limits; early=' + early, async context => {
+  const value = await fixture(context, { 'turn/start': ({ nextTurn, event }) => {
+    nextTurn(); const emit = () => { for (let count = 0; count < (early ? 1001 : 10001); count++)
+      event('thread/status/changed', { threadId: 'unrelated-thread', status: { type: 'idle' } }); };
+    if (early) emit(); else setImmediate(emit);
+    return { turn: { id: 'turn-1' } };
+  } });
+  const result = await value.run(); assert.equal(result.status, 'uncertain'); assert.equal(result.terminalObserved, false);
+  assert(result.uncertainties.includes('EVENT_OVERFLOW'));
 });
 
 test('events preceding turn/start acknowledgement are correlated without losing evidence', async context => {
