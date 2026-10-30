@@ -53,7 +53,7 @@ class FakeLocal {
 }
 
 async function setup(context, mode = {}, options = {}) {
-  const root = await fs.mkdtemp(options.fixturePrefix || '/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
+  const root = await fs.mkdtemp(options.fixturePrefix || '/var/tmp/personal-agents-bridge/pab-local-controller-'), normal = path.join(root, 'normal');
   await fs.mkdir(normal);
   repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n');
