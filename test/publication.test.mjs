@@ -1554,18 +1554,20 @@ async function revisionFixture(context, mode = {}) {
       const identity = { model: 'fixture-model', threadId: mode.reuseIdentity && options.reviewOnly ? original.reviewer.local.thread_id : `revision-${role}-${++instance}`,
         turnId: `revision-turn-${instance}`, turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
       options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
+      let review;
       if (!options.reviewOnly) {
         assert.equal(options.requireFreshThread, true);
-        const item = { id: 'revision-write', type: 'commandExecution', command: "printf 'revised\\n' > one.txt", cwd: options.cwd };
+        const content = mode.content ?? 'revised\n';
+        const item = { id: 'revision-write', type: 'commandExecution', command: mode.noWrite ? 'cat one.txt' : `printf ${JSON.stringify(content)} > one.txt`, cwd: options.cwd };
         options.onProgress({ method: 'item/started', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'inProgress' } } });
-        await fs.writeFile(path.join(options.cwd, 'one.txt'), 'revised\n');
+        if (!mode.noWrite) await fs.writeFile(path.join(options.cwd, 'one.txt'), content);
         if (mode.outside) await fs.writeFile(path.join(options.cwd, 'keep.txt'), 'out of scope\n');
         options.onProgress({ method: 'item/completed', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'completed', exitCode: 0 } } });
-      } else await mode.review?.(options);
+      } else review = await mode.review?.(options);
       options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
       const verdict = mode.verdict || 'PASS';
       return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: [], commands: [],
-        messages: options.reviewOnly ? [{ provenance: 'model', text: JSON.stringify({ overall: verdict,
+        messages: options.reviewOnly ? [{ provenance: 'model', text: JSON.stringify(review || { overall: verdict,
           findings: ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: verdict, evidence: 'Independent revision fixture.' })) }) }] : [] };
     }, async cancel() {}, async close() { return mode.closeFailure !== (options.reviewOnly ? 'reviewer' : 'implementer'); }
   });
@@ -1778,15 +1780,62 @@ test('revision can revise the next confirmed head while retaining every prior ta
   const v = await revisionFixture(context), first = await v.run();
   assert.equal(first.automatic.status, 'succeeded');
   const retained = v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(first.id).value;
+  v.mode.content = 'revised again\n';
   v.input.request_id = 'second_owner_revision'; v.input.revise_pr.expected_head_sha = first.publication.commit_sha;
   const second = await v.run();
   assert.equal(second.automatic.status, 'succeeded', JSON.stringify(second.automatic));
   assert.equal(second.revision.source_task_id, first.id); assert.equal(second.revision.original_task_id, v.original.id);
-  assert.equal(repoGit(v.remote, 'rev-parse', `${second.publication.commit_sha}^`).trim(), first.publication.commit_sha);
+  assert.notEqual(first.reviewer.local.thread_id, second.reviewer.local.thread_id);
+  assert.notEqual(first.local_validation.attempt_id, second.local_validation.attempt_id);
+  assert.notEqual(first.reviewer.packet_hash, second.reviewer.packet_hash);
+  assert.notEqual(first.reviewer.reviewed_git_state.tree_sha, second.reviewer.reviewed_git_state.tree_sha);
+  for (const [task, parent, content] of [[first, v.original.publication.commit_sha, 'revised\n'],
+    [second, first.publication.commit_sha, 'revised again\n']]) {
+    const p = task.publication, reviewer = task.reviewer;
+    assert.equal(repoGit(v.remote, 'show', '-s', '--format=%P', p.commit_sha).trim(), parent);
+    assert.equal(repoGit(v.remote, 'show', `${p.commit_sha}:one.txt`), content);
+    assert.equal(repoGit(v.remote, 'diff-tree', '--no-commit-id', '--name-only', '-r', parent, p.commit_sha).trim(), 'one.txt');
+    assert.equal(repoGit(v.remote, 'rev-parse', `${p.commit_sha}^{tree}`).trim(), reviewer.reviewed_git_state.tree_sha);
+    assert.equal(task.local_validation.status, 'completed');
+    assert.equal(task.local_validation.results[0].status, 'passed');
+    assert.equal(task.local_validation.results[0].stdout.text, content);
+    assert.equal(task.local_validation.reviewed_git_state.tree_sha, reviewer.reviewed_git_state.tree_sha);
+    assert.equal(reviewer.review_result.overall, 'PASS');
+    assert.equal(reviewer.review_result.scope_qualification.status, 'qualified');
+    assert.deepEqual(reviewer.review_result.controller_overrides, []);
+    assert.equal(reviewer.review_result.packet_hash, reviewer.packet_hash);
+    assert.equal(p.review_packet_sha256, reviewer.packet_hash);
+    assert.equal(p.reviewed_tree_sha, reviewer.reviewed_git_state.tree_sha);
+    assert.equal(p.reviewer_thread_id, reviewer.local.thread_id);
+  }
   assert.equal(v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(first.id).value, retained);
   assert.equal((await reportingPublication(v.c, first.id)).confirmed, true);
   assert.equal((await reportingPublication(v.c, second.id)).confirmed, true);
   assert.equal(v.publisher.pushes, 3); assert.equal(v.publisher.creates, 1); await v.unchanged();
+});
+
+test('revision no-op fails its requested change in independent review without updating the PR', async context => {
+  const v = await revisionFixture(context, { noWrite: true, review: async options => {
+    const packet = JSON.parse(await fs.readFile(path.join(options.cwd, 'evidence.json'), 'utf8'));
+    assert.deepEqual(packet.changed_files, []); assert.equal(packet.diff, '');
+    assert.equal(packet.baseline['one.txt'], packet.current['one.txt']);
+    return { overall: 'FAIL', findings: [
+      { id: 'R1', status: 'FAIL', evidence: 'The requested revision made no change: one.txt is identical to its baseline and the diff is empty.' },
+      { id: 'SCOPE', status: 'PASS', evidence: 'No file changes or prohibited operations observed in the bounded packet.' },
+      { id: 'TEST_EVIDENCE', status: 'PASS', evidence: 'Independent cat one.txt validation passed for the unchanged candidate; this does not prove the requested change.' }
+    ] };
+  } });
+  const task = await v.run(), reviewer = task.reviewer;
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.automatic.reason, 'PUBLICATION_REQUIRES_PASS_REVIEW');
+  assert.equal(task.local_validation.status, 'completed'); assert.equal(task.local_validation.results[0].status, 'passed');
+  assert.equal(reviewer.state, 'completed'); assert.equal(reviewer.review_result.model_overall, 'FAIL');
+  assert.equal(reviewer.review_result.overall, 'FAIL'); assert.deepEqual(reviewer.review_result.controller_overrides, []);
+  assert.equal(reviewer.review_result.scope_qualification.status, 'qualified');
+  assert.equal(reviewer.review_result.findings.find(finding => finding.id === 'R1').status, 'FAIL');
+  assert.equal(reviewer.reviewed_git_state.tree_sha, v.original.publication.reviewed_tree_sha);
+  assert.equal(task.publication, undefined); assert.equal(v.publisher.pushes, 1); assert.equal(v.publisher.creates, 1);
+  assert.equal(repoGit(v.remote, 'rev-parse', `refs/heads/${v.original.publication.pushed_branch}`).trim(), v.original.publication.commit_sha);
+  assert.deepEqual(v.calls, ['implementer', 'reviewer']); await v.unchanged();
 });
 
 test('revision accepts a retained published task after workspace cleanup without thawing history', async context => {
