@@ -89,3 +89,27 @@ test('CCP-sized multi-megabyte evidence is complete and available without one-pr
   assert.equal(reconstructLocalDiff(parsed),diff);
   assert.equal(parsed.packet_budget.limit_bytes,PACKET_LIMIT);
 });
+
+
+test('the original 132331-byte acceptance envelope retains exact content', context => {
+  const data = { current: { 'acceptance.txt': '' }, baseline: {}, diff: '', native_activity: { commands: [] } };
+  const overhead = budgetLocalPacket(data).bytes;
+  data.current['acceptance.txt'] = 'a'.repeat(132331 - overhead);
+  const result = budgetLocalPacket(data), packet = JSON.parse(result.text);
+  assert.equal(result.bytes, 132331); assert.equal(packet.current['acceptance.txt'], data.current['acceptance.txt']);
+  assert.deepEqual(packet.baseline, data.baseline); assert.deepEqual(packet.native_activity, data.native_activity);
+  context.diagnostic(`Acceptance envelope: ${result.bytes} UTF-8 bytes preserved.`);
+});
+
+test('local admission accepts the exact 64 MiB serialized ceiling and rejects one byte beyond', context => {
+  const data = { current: { 'ceiling.txt': '' }, baseline: {}, diff: '' };
+  const overhead = budgetLocalPacket(data).bytes;
+  data.current['ceiling.txt'] = 'x'.repeat(PACKET_LIMIT - overhead);
+  const result = budgetLocalPacket(data);
+  assert.equal(result.bytes, PACKET_LIMIT);
+  assert.equal(JSON.parse(result.text).current['ceiling.txt'], data.current['ceiling.txt']);
+  data.current['ceiling.txt'] += 'x';
+  assert.throws(() => budgetLocalPacket(data), error => error.code === 'EVIDENCE_SIZE_LIMIT' &&
+    error.diagnostic.limit_bytes === PACKET_LIMIT && error.diagnostic.measured_bytes === PACKET_LIMIT + 1);
+  context.diagnostic(`Exact serialized ceiling: ${PACKET_LIMIT} accepted; ${PACKET_LIMIT + 1} rejected.`);
+});

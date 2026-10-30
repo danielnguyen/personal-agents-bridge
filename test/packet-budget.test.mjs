@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { budgetPacket, PACKET_LIMIT } from '../packet-budget.mjs';
+import { budgetPacket, PACKET_LIMIT, NEW_PACKET_LIMIT } from '../packet-budget.mjs';
 import { Controller } from '../controller.mjs';
 import { repositoryIdentity, repoGit } from '../repositories.mjs';
 import { createFileRpcJournal } from '../file-rpc-evidence.mjs';
 import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { createServer } from '../server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -53,12 +54,11 @@ test('moderately large repository packet keeps semantic files, complete RPC evid
   assert(d.diff.includes('Bridge workflow')||d.packet_budget.sections.diff.semantic_text_complete);
 });
 
-test('redundant text diff deduplicates deterministically but complete semantic maps remain',async t=>{
+test('fitting text and mode patches stay literal and deterministic with complete semantic maps',async t=>{
   const {c,task}=await setup(t);const d=JSON.parse((await c.buildPacket(task)).text);delete d.packet_budget;
   d.diff='diff --git a/AGENTS.md b/AGENTS.md\n'+ '@@ -1 +1 @@\n-old\n+new\n'.repeat(2400);
   const a=budgetPacket(d),b=budgetPacket(d);assert.equal(a.text,b.text);const p=JSON.parse(a.text);
-  assert.equal(p.diff,'');assert.equal(p.packet_budget.sections.diff.complete,false);
-  assert.equal(p.packet_budget.sections.diff.semantic_text_complete,true);
+  assert.equal(p.diff,d.diff);assert.equal(p.packet_budget.sections.diff.complete,true);
   assert.deepEqual(p.baseline,d.baseline);assert.deepEqual(p.current,d.current);
   assert.deepEqual(p.file_rpc_operation_evidence,d.file_rpc_operation_evidence);
   d.diff='old mode 100644\nnew mode 100755\n'+d.diff;
@@ -101,11 +101,78 @@ test('relevant Git operations survive inspection quotas and upstream truncation 
 
 test('local review budget is configurable while historical hard retention cap remains fixed', async () => {
   const {execFileSync}=await import('node:child_process');
-  const snippet=`import {budgetLocalPacket} from './local-evidence.mjs';
+  const snippet=`import assert from 'node:assert/strict';
+    import {budgetLocalPacket} from './local-evidence.mjs';
+    import {PACKET_LIMIT,NEW_PACKET_LIMIT} from './packet-budget.mjs';
+    assert.equal(PACKET_LIMIT,67108864); assert.equal(NEW_PACKET_LIMIT,262144);
+    const data={diff:'',required:''}, overhead=budgetLocalPacket(data).bytes;
+    data.required='x'.repeat(NEW_PACKET_LIMIT-overhead);
+    assert.equal(budgetLocalPacket(data).bytes,NEW_PACKET_LIMIT);
+    assert.equal(JSON.parse(budgetLocalPacket(data).text).required,data.required);
+    data.required+='x';
+    assert.throws(()=>budgetLocalPacket(data),e=>e.code==='EVIDENCE_SIZE_LIMIT'&&e.diagnostic.measured_bytes===NEW_PACKET_LIMIT+1);
     try {budgetLocalPacket({diff:'x'.repeat(300000)});console.log('UNEXPECTED_PASS');}
     catch(e){console.log(e.code+':'+e.diagnostic.limit_bytes);}`;
   const output=execFileSync(process.execPath,['--input-type=module','-e',snippet],{
     cwd:process.cwd(),encoding:'utf8',env:{...process.env,PAB_REVIEW_PACKET_LIMIT_BYTES:'262144'}
   }).trim();
   assert.equal(output,'EVIDENCE_SIZE_LIMIT:262144');
+});
+
+
+test('configured admission overflow reaches MCP before any reviewer session is created', async t => {
+  if (NEW_PACKET_LIMIT !== 131072) {
+    const output = execFileSync(process.execPath, ['--test', '--test-reporter=tap',
+      '--test-name-pattern=^configured admission overflow reaches MCP', 'test/packet-budget.test.mjs'], {
+      env: { ...process.env, NODE_TEST_CONTEXT: undefined, PAB_REVIEW_PACKET_LIMIT_BYTES: '131072' }, encoding: 'utf8' });
+    assert.match(output, /# pass 1/); return;
+  }
+  const { c, api, task, work } = await setup(t);
+  await fs.writeFile(path.join(work, 'AGENTS.md'), 'semantic content\n'.repeat(7400));
+  api.completed(task.implementer.session_id);
+  const server = createServer(c, async () => {}), client = new Client({ name: 'budget-test', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+  t.after(async () => { await client.close(); await server.close(); });
+  const result = await client.callTool({ name: 'review_task', arguments: { task_id: task.id, request_id: 'budget_review' } });
+  assert.equal(result.isError, true); const error = JSON.parse(result.content[0].text);
+  assert.equal(error.error, 'EVIDENCE_SIZE_LIMIT'); assert.equal(error.diagnostic.required_section, 'current');
+  assert(error.diagnostic.section_bytes.current > 100000); assert(error.diagnostic.section_bytes.contract > 0);
+  assert.equal(error.diagnostic.limit_bytes, 131072); assert.equal(api.created.length, 1);
+  assert.deepEqual((await c.get(task.id)).review_packet_diagnostic, error.diagnostic);
+  assert.equal(c.task(task.id).reviewer, undefined);
+});
+
+test('invalid admission configuration fails at startup for both packet builders', () => {
+  for (const value of ['0', '131071', '67108865', '-131072', '1.5', '1e6', ' 131072', '0131072', 'NaN']) {
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e',
+      "try { await import('./packet-budget.mjs'); console.log('unexpected'); } catch(e) { console.log(e.message); }"], {
+      env: { ...process.env, PAB_REVIEW_PACKET_LIMIT_BYTES: value }, encoding: 'utf8' });
+    assert.equal(result.trim(), 'INVALID_PAB_REVIEW_PACKET_LIMIT_BYTES', value);
+  }
+});
+
+
+test('Agents API Controller captures a complete 1.7 MiB source and literal patch', async t => {
+  const { c, task, work, baseline } = await setup(t);
+  const source = 'const evidence = "retained";\n'.repeat(61500);
+  await fs.writeFile(path.join(work, 'AGENTS.md'), source);
+  const packet = await c.buildPacket(task), parsed = JSON.parse(packet.text);
+  assert.equal(parsed.current['AGENTS.md'], source); assert.equal(parsed.baseline['AGENTS.md'], baseline);
+  assert.equal(parsed.diff, await c.repositoryDiff(work, task.baseline));
+  assert.equal(parsed.packet_budget.sections.diff.complete, true);
+  assert(packet.bytes > 3 * 1024 * 1024 && packet.bytes < PACKET_LIMIT);
+  t.diagnostic(`Agents API packet: ${packet.bytes} bytes; complete source and literal diff retained.`);
+});
+
+test('legacy semantic diff deduplication remains available under configured admission', () => {
+  const snippet = `import assert from 'node:assert/strict'; import {budgetPacket} from './packet-budget.mjs';
+    const source = 'complete source\\n'.repeat(2000);
+    const data = {contract:'bounded',changed_files:['a.txt'],baseline:{'a.txt':source},current:{'a.txt':source},
+      diff:'header\\n'+'-old\\n+new\\n'.repeat(10000)};
+    const parsed = JSON.parse(budgetPacket(data).text);
+    assert.equal(parsed.diff,''); assert(parsed.packet_budget.sections.diff.semantic_text_complete);
+    assert.deepEqual(parsed.current,data.current); assert.deepEqual(parsed.baseline,data.baseline);
+    console.log('semantic maps retained');`;
+  assert.match(execFileSync(process.execPath, ['--input-type=module', '-e', snippet], {
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined, PAB_REVIEW_PACKET_LIMIT_BYTES: '131072' }, encoding: 'utf8' }), /semantic maps retained/);
 });

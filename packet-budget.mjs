@@ -59,7 +59,7 @@ export function budgetPacket(input) {
   }
   const diffBytes = size(data.diff);
   metadata.sections.diff.budget_bytes = available;
-  if (diffBytes > available || size(data) + size(metadata) > INLINE_REVIEW_OPTIMIZATION_BYTES) {
+  if (diffBytes > available) {
     // Full ordinary text files preserve every semantic before/after fact. Retain
     // non-text/mode-only/rename patches: they cannot be inferred from text alone.
     const reconstructable = data.changed_files.every(name =>
