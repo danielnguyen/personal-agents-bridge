@@ -1,10 +1,22 @@
 // Deterministic UTF-8 JSON budgets. Required semantic/controller sections never disappear.
-export const PACKET_LIMIT = 128 * 1024;
+// The hard retention bound is independent of the per-startup admission budget.
+// Lowering admission must not invalidate previously retained packets.
+export const PACKET_LIMIT = 64 * 1024 * 1024;
+export const INLINE_REVIEW_OPTIMIZATION_BYTES = 128 * 1024;
+function admittedPacketLimit() {
+  const raw = process.env.PAB_REVIEW_PACKET_LIMIT_BYTES;
+  if (raw === undefined || raw === '') return PACKET_LIMIT;
+  const parsed = Number(raw);
+  if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(parsed) ||
+      parsed < INLINE_REVIEW_OPTIMIZATION_BYTES || parsed > PACKET_LIMIT) throw new Error('INVALID_PAB_REVIEW_PACKET_LIMIT_BYTES');
+  return parsed;
+}
+export const NEW_PACKET_LIMIT = admittedPacketLimit();
 const size = value => Buffer.byteLength(JSON.stringify(value));
 const requiredOrder = ['contract', 'baseline_commit', 'current_commit', 'changed_files', 'unauthorized_files',
   'reviewed_git_state', 'file_byte_evidence', 'controller_evidence', 'baseline_state', 'current_config_hash',
   'staged_files', 'test_execution_evidence', 'file_rpc_operation_evidence', 'baseline', 'current', 'command_execution_evidence'];
-export function packetSizeDiagnostic(sections, blocked, total, limit = PACKET_LIMIT) {
+export function packetSizeDiagnostic(sections, blocked, total, limit = NEW_PACKET_LIMIT) {
   return { code: 'EVIDENCE_SIZE_LIMIT', limit_bytes: limit, measured_bytes: total, required_section: blocked,
     section_bytes: sections, action: 'Reduce task scope or split the task; required evidence was not silently removed. No reviewer session was created.' };
 }
@@ -14,7 +26,7 @@ function fail(sections, blocked, total) {
 }
 export function budgetPacket(input) {
   const data = structuredClone(input), original = Object.fromEntries(Object.entries(data).map(([k,v]) => [k,size(v)]));
-  const metadata = { limit_bytes: PACKET_LIMIT, encoding: 'compact UTF-8 JSON', metadata_reserve_bytes: PACKET_LIMIT,
+  const metadata = { limit_bytes: NEW_PACKET_LIMIT, encoding: 'compact UTF-8 JSON', metadata_reserve_bytes: NEW_PACKET_LIMIT,
     policy: 'Required sections first in declared order; command output bounded independently. Diff may be deduplicated only when complete before/after text is retained. Missing/truncated required evidence is still FAIL.',
     required_order: requiredOrder, sections: {} };
   for (const [name, value] of Object.entries(data)) metadata.sections[name] = { original_bytes: size(value), retained_bytes: size(value), budget_bytes: null, complete: true, representation: 'full' };
@@ -29,15 +41,15 @@ export function budgetPacket(input) {
   }
   // Existing controller sub-observations carry their own unavailable/conflict/truncation flags.
   if (metadata.sections.controller_evidence) metadata.sections.controller_evidence.representation = 'full controller observations; consult nested status/truncated flags for source completeness';
-  // Reserve a measured upper bound for the envelope, including the longest
-  // deduplication explanation and six-digit allocation fields (not a guessed pad).
+  // Reserve the measured envelope with the actual configured numeric budget.
+  // This covers its full decimal width without guessed padding.
   const deduplication = 'deduplicated: compare complete baseline/current maps by changed_files; absent keys mean file absent. Full patch text omitted, no semantic text omitted.';
   const worstMetadata = structuredClone(metadata);
-  for (const section of Object.values(worstMetadata.sections)) section.budget_bytes = PACKET_LIMIT;
+  for (const section of Object.values(worstMetadata.sections)) section.budget_bytes = NEW_PACKET_LIMIT;
   Object.assign(worstMetadata.sections.diff, { representation: deduplication, semantic_text_complete: true, omitted_bytes: original.diff });
   const reserve = size({ ...Object.fromEntries(Object.keys(data).map(k => [k, null])), packet_budget: worstMetadata }) - 4 * Object.keys(data).length;
   metadata.metadata_reserve_bytes = reserve;
-  let available = PACKET_LIMIT - reserve;
+  let available = NEW_PACKET_LIMIT - reserve;
   for (const name of requiredOrder) {
     if (!(name in data)) continue;
     const bytes = size(data[name]);
@@ -47,7 +59,7 @@ export function budgetPacket(input) {
   }
   const diffBytes = size(data.diff);
   metadata.sections.diff.budget_bytes = available;
-  if (diffBytes > available) {
+  if (diffBytes > available || size(data) + size(metadata) > INLINE_REVIEW_OPTIMIZATION_BYTES) {
     // Full ordinary text files preserve every semantic before/after fact. Retain
     // non-text/mode-only/rename patches: they cannot be inferred from text alone.
     const reconstructable = data.changed_files.every(name =>
@@ -55,17 +67,18 @@ export function budgetPacket(input) {
       (data.current[name] === undefined || typeof data.current[name] === 'string') &&
       (data.baseline[name] !== undefined || data.current[name] !== undefined)) &&
       !/^(?:old mode|new mode|new file mode 100755|deleted file mode 100755|similarity index|rename from|rename to|Binary files|GIT binary patch|new file mode 120000|deleted file mode 120000)/m.test(data.diff);
-    if (!reconstructable) fail(original, 'diff', size(data) + size(metadata));
-    data.diff = '';
-    metadata.sections.diff.retained_bytes = size(data.diff);
-    metadata.sections.diff.complete = false;
-    metadata.sections.diff.representation = deduplication;
-    metadata.sections.diff.semantic_text_complete = true;
-    metadata.sections.diff.omitted_bytes = diffBytes;
+    if (reconstructable) {
+      data.diff = '';
+      metadata.sections.diff.retained_bytes = size(data.diff);
+      metadata.sections.diff.complete = false;
+      metadata.sections.diff.representation = deduplication;
+      metadata.sections.diff.semantic_text_complete = true;
+      metadata.sections.diff.omitted_bytes = diffBytes;
+    } else if (diffBytes > available) fail(original, 'diff', size(data) + size(metadata));
   }
   data.evidence_version = 5;
   data.packet_budget = metadata;
   const text = JSON.stringify(data), bytes = Buffer.byteLength(text);
-  if (bytes > PACKET_LIMIT) fail(original, 'packet_metadata', bytes);
+  if (bytes > NEW_PACKET_LIMIT) fail(original, 'packet_metadata', bytes);
   return { text, bytes };
 }

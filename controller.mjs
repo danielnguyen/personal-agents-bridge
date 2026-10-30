@@ -1,5 +1,5 @@
 import { reviewerInstructions } from './reviewer-instructions.mjs';
-import { budgetPacket, packetSizeDiagnostic } from './packet-budget.mjs';
+import { budgetPacket, packetSizeDiagnostic, PACKET_LIMIT } from './packet-budget.mjs';
 import { captureFileRpcEvidence } from './file-rpc-evidence.mjs';
 import OpenAI from 'openai';
 import { deepRedact } from '@hackylabs/deep-redact';
@@ -26,7 +26,9 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const AUTOMATIC_OPERATION_STATES = new Set(['pending', 'reserved', 'submitting', 'submitted', 'accepted', 'failed', 'uncertain', 'result_received', 'push_attempted', 'pushed', 'pr_attempted', 'not_started']);
-const MAX_PACKET = 128 * 1024;
+const MAX_PACKET = PACKET_LIMIT;
+const MAX_REVIEW_OUTPUT = 128 * 1024;
+const MAX_PROTECTED_CAPTURE = 128 * 1024;
 const MAX_FILES = 100;
 const DEBUG_WINDOW = 30 * 86400000;
 const automaticTransition = Symbol('controller automatic transition');
@@ -1861,7 +1863,7 @@ export class Controller {
     const binding = this.reviewReceiptBinding(task, packet.local_scope.contract_sha256);
     if (digest(received) !== sha || (task.reviewer.received_output_sha256 && task.reviewer.received_output_sha256 !== sha) ||
         digest(received.binding) !== digest(binding) || received.version !== 1 || !received.complete || typeof received.output !== 'string' ||
-        Buffer.byteLength(received.output) > MAX_PACKET || this.safe(received.output) !== received.output || digest(received.output) !== received.output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+        Buffer.byteLength(received.output) > MAX_REVIEW_OUTPUT || this.safe(received.output) !== received.output || digest(received.output) !== received.output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
     this.reviewProtocol(task);
     const local = { ...received.observed_local, server_closed: task.reviewer.local.server_closed };
     this.applyReceivedReview(local, received);
@@ -2340,7 +2342,7 @@ export class Controller {
         const stat = await handle.stat();
         if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_PACKET) throw Error();
         // A fixed-size positional read also bounds a file grown after fstat.
-        const buffer = Buffer.alloc(MAX_PACKET + 1), read = await handle.read(buffer, 0, buffer.length, 0);
+        const buffer = Buffer.alloc(stat.size + 1), read = await handle.read(buffer, 0, buffer.length, 0);
         if (read.bytesRead > MAX_PACKET) throw Error();
         text = buffer.subarray(0, read.bytesRead).toString('utf8');
       } catch { text = undefined; }
@@ -3231,7 +3233,7 @@ export class Controller {
         entries.push([name, 'directory', stat.mode]);
         for (const child of (await fs.readdir(target)).sort()) await walk(`${name}/${child}`);
       } else {
-        bytes += stat.size; if (bytes > MAX_PACKET) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
+        bytes += stat.size; if (bytes > MAX_PROTECTED_CAPTURE) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
         entries.push([name, 'file', stat.mode, digest(await fs.readFile(target))]);
       }
     };

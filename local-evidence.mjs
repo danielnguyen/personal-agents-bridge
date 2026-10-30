@@ -1,4 +1,4 @@
-import { PACKET_LIMIT, packetSizeDiagnostic } from './packet-budget.mjs';
+import { PACKET_LIMIT, NEW_PACKET_LIMIT, INLINE_REVIEW_OPTIMIZATION_BYTES, packetSizeDiagnostic } from './packet-budget.mjs';
 import { createHash } from 'node:crypto';
 
 export const LOCAL_EVIDENCE_VERSION = 'pab.local-codex-review.v1';
@@ -223,12 +223,13 @@ function deduplicateLocalDiff(packet) {
 }
 
 export function budgetLocalPacket(data) {
-  const packet = { ...data, packet_budget: { limit_bytes: PACKET_LIMIT, policy: 'All sections retained; overflow rejects construction without silent removal.' } };
+  const packet = { ...data, packet_budget: { limit_bytes: NEW_PACKET_LIMIT, policy: 'All sections retained; overflow rejects construction without silent removal.' } };
   let text = JSON.stringify(packet), bytes = Buffer.byteLength(text);
-  if (bytes > PACKET_LIMIT) {
-    text = JSON.stringify(deduplicateLocalDiff(packet)); bytes = Buffer.byteLength(text);
+  if (bytes > INLINE_REVIEW_OPTIMIZATION_BYTES) {
+    const candidate = deduplicateLocalDiff(packet);
+    if (candidate !== packet) { text = JSON.stringify(candidate); bytes = Buffer.byteLength(text); }
   }
-  if (bytes > PACKET_LIMIT) throw Object.assign(new Error('EVIDENCE_SIZE_LIMIT'), { code: 'EVIDENCE_SIZE_LIMIT',
+  if (bytes > NEW_PACKET_LIMIT) throw Object.assign(new Error('EVIDENCE_SIZE_LIMIT'), { code: 'EVIDENCE_SIZE_LIMIT',
     diagnostic: packetSizeDiagnostic(Object.fromEntries(Object.entries(packet).map(([name, value]) => [name, size(value)])), 'local_packet', bytes) });
   return { text, bytes };
 }
