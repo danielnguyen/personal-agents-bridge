@@ -62,7 +62,8 @@ test('redundant text diff deduplicates deterministically but complete semantic m
   assert.deepEqual(p.baseline,d.baseline);assert.deepEqual(p.current,d.current);
   assert.deepEqual(p.file_rpc_operation_evidence,d.file_rpc_operation_evidence);
   d.diff='old mode 100644\nnew mode 100755\n'+d.diff;
-  assert.throws(()=>budgetPacket(d),e=>e.code==='EVIDENCE_SIZE_LIMIT'&&e.diagnostic.required_section==='diff');
+  // An unreconstructable patch fits inside the new capacity and must stay literal.
+  assert.equal(JSON.parse(budgetPacket(d).text).diff,d.diff);
 });
 
 test('required tests are retained even after generic command quota is exhausted',async t=>{
@@ -75,19 +76,11 @@ test('required tests are retained even after generic command quota is exhausted'
   assert.deepEqual(p.command_execution_evidence.required_test_commands_missing,[]);
 });
 
-test('required semantic overflow reports sections through MCP and get_task without starting reviewer',async t=>{
-  const {c,api,task,work}=await setup(t);
-  await fs.writeFile(path.join(work,'AGENTS.md'),'semantic content\n'.repeat(7400));
-  api.completed(task.implementer.session_id);
-  const server=createServer(c,async()=>{}),client=new Client({name:'budget-test',version:'1'});
-  const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);
-  t.after(async()=>{await client.close();await server.close();});
-  const result=await client.callTool({name:'review_task',arguments:{task_id:task.id,request_id:'budget_review'}});
-  assert.equal(result.isError,true);const error=JSON.parse(result.content[0].text);
-  assert.equal(error.error,'EVIDENCE_SIZE_LIMIT');assert.equal(error.diagnostic.required_section,'current');
-  assert(error.diagnostic.section_bytes.current>100000);assert(error.diagnostic.section_bytes.contract>0);
-  assert.equal(error.diagnostic.limit_bytes,131072);assert.equal(api.created.length,1);
-  assert.deepEqual((await c.get(task.id)).review_packet_diagnostic,error.diagnostic);
+test('configured 64 MiB hard capacity rejects oversized required semantic evidence', () => {
+  const data={contract:'x'.repeat(PACKET_LIMIT),diff:'',changed_files:[],baseline:{},current:{}};
+  assert.throws(()=>budgetPacket(data),e=>e.code==='EVIDENCE_SIZE_LIMIT'&&
+    e.diagnostic.required_section==='contract'&&e.diagnostic.limit_bytes===PACKET_LIMIT&&
+    e.diagnostic.section_bytes.contract>PACKET_LIMIT);
 });
 
 test('required result-section overflow fails closed rather than dropping required executions',async t=>{
@@ -104,4 +97,15 @@ test('relevant Git operations survive inspection quotas and upstream truncation 
   const push=p.command_execution_evidence.records.find(r=>r.item_id==='late_prohibited_push');
   assert(push);assert.equal(push.exit_code,1);assert.equal(push.truncated,true);assert.equal(push.source_truncated,true);
   assert(p.command_execution_evidence.omitted_command_records>0);
+});
+
+test('local review budget is configurable while historical hard retention cap remains fixed', async () => {
+  const {execFileSync}=await import('node:child_process');
+  const snippet=`import {budgetLocalPacket} from './local-evidence.mjs';
+    try {budgetLocalPacket({diff:'x'.repeat(300000)});console.log('UNEXPECTED_PASS');}
+    catch(e){console.log(e.code+':'+e.diagnostic.limit_bytes);}`;
+  const output=execFileSync(process.execPath,['--input-type=module','-e',snippet],{
+    cwd:process.cwd(),encoding:'utf8',env:{...process.env,PAB_REVIEW_PACKET_LIMIT_BYTES:'262144'}
+  }).trim();
+  assert.equal(output,'EVIDENCE_SIZE_LIMIT:262144');
 });
