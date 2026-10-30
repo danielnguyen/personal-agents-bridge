@@ -212,6 +212,31 @@ export class GitHubRegistration {
       });
     } catch (error) { this.transportFailure(error); throw error; }
   }
+  // Revision callers supply only Controller-verified publication authority.
+  // Reuse the selected-object fetch; never install a branch/ref in the checkout.
+  async resolveForRevision(id, revision, verify) {
+    try {
+      return await withRegistryLock(this.file, async () => {
+        this.checkActive();
+        const registered = await resolveRepository(this.file, id, 'HEAD', this.workspaceRoot, this.stateRoot, this.git);
+        const target = await this.authorize(revision.target.repository);
+        if (target.default_branch !== revision.target.base || (registered.github_identity &&
+            Object.entries(target).some(([key, value]) => registered.github_identity[key] !== value))) fail('REVISION_TARGET_CHANGED');
+        await verify(registered);
+        await this.transport.fetch(registered.canonical_path, target, this.abort.signal, revision.request.expected_head_sha);
+        const resolved = await resolveRepository(this.file, id, revision.request.expected_head_sha, this.workspaceRoot, this.stateRoot, this.git);
+        await validateManagedTree(registered.canonical_path, resolved.baseline_commit, this.git);
+        if (JSON.stringify(await this.authorize(target.full_name)) !== JSON.stringify(target)) fail('GITHUB_REGISTRATION_IDENTITY_CHANGED');
+        await verify(resolved);
+        if (registered.github_identity) {
+          await this.synchronize(registered.canonical_path, this.abort.signal);
+          await verifyManagedCheckout(registered.canonical_path, registered.github_identity.baseline_commit, this.git, this.abort.signal);
+        }
+        this.checkActive();
+        return { ...resolved, revision_identity: target };
+      });
+    } catch (error) { this.transportFailure(error); throw error; }
+  }
   async list() {
     this.checkActive();
     const registry = await readRegistry(this.file), repositories = [];

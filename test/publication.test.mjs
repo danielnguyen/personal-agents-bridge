@@ -1516,3 +1516,345 @@ test('ordinary disposable tasks cannot be published', async t => {
   await Promise.all([...c.jobs.values()]);
   await assert.rejects(c.publish({ task_id: started.task_id, title: 'not a repo' }), /PUBLICATION_REQUIRES_REPOSITORY/);
 });
+
+// Revision fixtures use real isolated Git stores and the production pre-push
+// check, with only GitHub transport/model responses replaced by offline fixtures.
+async function revisionFixture(context, mode = {}) {
+  const agents = mode.sourceBackend === 'agents_api';
+  const value = await setup(context, ['one.txt'], !agents, agents ? [] : ['cat one.txt'], agents ? undefined : {});
+  if (agents) { await fs.writeFile(path.join(value.work, 'one.txt'), 'exact\n'); await value.review(); await value.c.publish(value.input); }
+  const original = agents ? value.c.task(value.id) : await automaticSettled(value), { c, publisher, normal, remote } = value;
+  if (!agents) assert.equal(original.automatic.status, 'succeeded', JSON.stringify(original.automatic));
+  assert.equal((await c.qualifyPublicationEvidence(original)).confirmed, true);
+  const originalText = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(original.id).value;
+  const before = await publicationState(normal), refs = repoGit(normal, 'show-ref');
+  const calls = [], fetches = [], identities = [], target = publisher.target.bind(publisher);
+  publisher.target = async repository => { if (repository.github_identity) identities.push(repository.github_identity); return target(repository); };
+  const metadata = { id: 1234, full_name: 'fixture/isolated-publication', owner: { id: 12, login: 'fixture', type: 'User' },
+    private: false, permissions: { pull: true }, archived: false, disabled: false, default_branch: 'main', size: 1 };
+  c.registration.transport.api = async endpoint => {
+    if (endpoint === 'user') return { id: 12, login: 'fixture', type: 'User' };
+    assert.equal(endpoint, 'repos/fixture/isolated-publication'); return structuredClone(metadata);
+  };
+  c.registration.transport.fetch = async (directory, target, signal, commit) => {
+    fetches.push(commit);
+    repoGit(directory, '-c', 'protocol.file.allow=always', 'fetch', '--no-tags', '--no-write-fetch-head', remote, commit);
+    await mode.afterFetch?.();
+  };
+  publisher.getPR = async (target, number) => {
+    publisher.calls.push('getPR'); assert.equal(number, 7);
+    const pr = structuredClone(publisher.pr);
+    pr.head.sha = repoGit(remote, 'rev-parse', `refs/heads/${pr.head.ref}`).trim();
+    mode.pr?.(pr); return pr;
+  };
+  let instance = 0;
+  c.localBackendFactory = options => ({
+    async run() {
+      const role = options.reviewOnly ? 'reviewer' : 'implementer'; calls.push(role);
+      const identity = { model: 'fixture-model', threadId: mode.reuseIdentity && options.reviewOnly ? original.reviewer.local.thread_id : `revision-${role}-${++instance}`,
+        turnId: `revision-turn-${instance}`, turnSubmissionAttempted: true, turnSubmissionAcknowledged: true, terminalObserved: true };
+      options.onLifecycle({ ...identity, phase: 'turn_acknowledged' });
+      let review;
+      if (!options.reviewOnly) {
+        assert.equal(options.requireFreshThread, true);
+        const content = mode.content ?? 'revised\n';
+        const item = { id: 'revision-write', type: 'commandExecution', command: mode.noWrite ? 'cat one.txt' : `printf ${JSON.stringify(content)} > one.txt`, cwd: options.cwd };
+        options.onProgress({ method: 'item/started', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'inProgress' } } });
+        if (!mode.noWrite) await fs.writeFile(path.join(options.cwd, 'one.txt'), content);
+        if (mode.outside) await fs.writeFile(path.join(options.cwd, 'keep.txt'), 'out of scope\n');
+        options.onProgress({ method: 'item/completed', params: { threadId: identity.threadId, turnId: identity.turnId, item: { ...item, status: 'completed', exitCode: 0 } } });
+      } else review = await mode.review?.(options);
+      options.onLifecycle({ ...identity, phase: 'terminal_observed', status: 'completed' });
+      const verdict = mode.verdict || 'PASS';
+      return { ...identity, status: 'completed', authentication: 'chatgpt', uncertainties: [], commands: [],
+        messages: options.reviewOnly ? [{ provenance: 'model', text: JSON.stringify(review || { overall: verdict,
+          findings: ['R1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: verdict, evidence: 'Independent revision fixture.' })) }) }] : [] };
+    }, async cancel() {}, async close() { return mode.closeFailure !== (options.reviewOnly ? 'reviewer' : 'implementer'); }
+  });
+  const input = { request_id: 'authorized_revision', execution_backend: 'local_codex', repository_id: 'fixture',
+    contract: structuredClone(value.contract), automatic: { publish: { title: 'Owner-authorized fixture revision', draft: true },
+      max_duration_seconds: 120, max_codex_turns: 2, max_corrections: 0 },
+    revise_pr: { pr_number: 7, expected_head_sha: original.publication.commit_sha } };
+  const run = async () => {
+    const started = await c.start(input);
+    await Promise.all([...c.jobs.values()]); await Promise.all([...c.automaticJobs.values()]);
+    return c.task(started.task_id);
+  };
+  const unchanged = async () => {
+    assert.equal(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(original.id).value, originalText);
+    assert.deepEqual(await publicationState(normal), before); assert.equal(repoGit(normal, 'show-ref'), refs);
+    assert.equal(publisher.creates, 1); assert.equal(repoGit(remote, 'rev-parse', 'main').trim(), value.baseline);
+  };
+  return { ...value, original, originalText, input, run, unchanged, calls, fetches, identities, mode, metadata };
+}
+
+test('revision owner authorization publishes a fresh reviewed child on the same draft PR exactly once', async context => {
+  const v = await revisionFixture(context), { c, publisher, remote } = v;
+  const task = await v.run();
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.notEqual(task.id, v.original.id); assert.equal(task.baseline, v.input.revise_pr.expected_head_sha);
+  assert.notEqual(task.reviewer.local.thread_id, v.original.reviewer.local.thread_id);
+  assert.notEqual(task.local_validation.attempt_id, v.original.local_validation.attempt_id);
+  const p = task.publication;
+  assert.equal(p.pr_number, 7); assert.equal(p.pr_url, v.original.publication.pr_url); assert.equal(p.pr_attempted, false);
+  assert.equal(p.pushed_branch, v.original.publication.pushed_branch); assert.equal(p.previous_head_sha, task.baseline);
+  assert.equal(repoGit(remote, 'rev-parse', `${p.commit_sha}^`).trim(), task.baseline);
+  assert.equal(repoGit(remote, 'rev-parse', `${p.commit_sha}^{tree}`).trim(), task.reviewer.reviewed_git_state.tree_sha);
+  assert.equal(repoGit(remote, 'rev-parse', `refs/heads/${p.pushed_branch}`).trim(), p.commit_sha);
+  assert.equal(repoGit(path.join(c.workspaceRoot, task.id, 'repo'), 'rev-parse', 'HEAD').trim(), task.baseline);
+  assert.equal(task.local_validation.results[0].status, 'passed'); assert.equal(publisher.pushes, 2);
+  assert.deepEqual(v.calls, ['implementer', 'reviewer']); assert.deepEqual(v.fetches, [task.baseline]);
+  assert.equal(task.revision.github_identity.repository_id, 1234); assert.equal(v.identities.at(-1).repository_id, 1234);
+  const calls = [...publisher.calls];
+  assert.equal((await c.qualifyPublicationEvidence(task)).confirmed, true);
+  const report = await reportingPublication(c, task.id);
+  assert.equal(report.confirmed, true); assert.equal(report.revision.previous_head_sha, task.baseline);
+  assert.deepEqual(publisher.calls, calls); // Reporting never reconciles GitHub.
+  const [a, b] = await Promise.all([c.start(v.input), c.start(v.input)]);
+  assert.equal(a.task_id, task.id); assert.equal(b.task_id, task.id); assert.equal(publisher.pushes, 2);
+  assert.deepEqual(v.calls, ['implementer', 'reviewer']); await v.unchanged();
+  await assert.rejects(c.continue({ task_id: v.original.id, request_id: 'historical_continue', instruction: 'more' }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  await assert.rejects(c.start({ ...v.input, revise_pr: { ...v.input.revise_pr, pr_number: 8 } }), /REQUEST_ID_REUSED_WITH_DIFFERENT_INPUT/);
+});
+
+for (const kind of ['missing publication', 'missing receipt', 'contradictory receipt', 'missing packet', 'changed publication identity',
+  'different repository', 'changed head', 'closed', 'merged', 'ready', 'head owner', 'base owner', 'branch', 'base', 'wrong number', 'scope', 'owner'])
+test(`revision admission rejects ${kind} without execution or push`, async context => {
+  const v = await revisionFixture(context), { c, mode, publisher } = v;
+  const source = c.task(v.original.id);
+  if (kind === 'missing publication') delete source.publication;
+  if (kind === 'missing receipt') delete source.reviewer.received_review_output;
+  if (kind === 'contradictory receipt') {
+    source.reviewer.received_review_output.output = '{"overall":"FAIL","findings":[]}';
+    source.reviewer.received_review_output.output_sha256 = digest(source.reviewer.received_review_output.output);
+    source.reviewer.received_output_sha256 = digest(source.reviewer.received_review_output);
+  }
+  if (kind === 'missing packet') c.db.prepare('DELETE FROM automatic_attempts WHERE task_id=?').run(source.id);
+  if (kind === 'changed publication identity') source.publication.pushed_branch = 'bridge/other';
+  if (kind === 'different repository') source.repository.repository_id = 'different';
+  if (kind === 'scope') v.input.contract.allowed_files.push('keep.txt');
+  if (kind === 'owner') v.metadata.owner.id = 999;
+  const mutations = { 'changed head': pr => { pr.head.sha = 'a'.repeat(40); }, closed: pr => { pr.state = 'closed'; },
+    merged: pr => { pr.merged_at = '2026-01-01T00:00:00Z'; }, ready: pr => { pr.draft = false; },
+    'head owner': pr => { pr.head.repo.full_name = 'other/repository'; }, 'base owner': pr => { pr.base.repo.full_name = 'other/repository'; },
+    branch: pr => { pr.head.ref = 'other'; }, base: pr => { pr.base.ref = 'other'; }, 'wrong number': pr => { pr.number = 8; } };
+  mode.pr = mutations[kind];
+  c.db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(source), source.id);
+  await assert.rejects(v.run(), /REVISION_|PUBLICATION_|GITHUB_REGISTRATION_/);
+  assert.deepEqual(v.calls, []); assert.equal(publisher.pushes, 1); assert.equal(publisher.creates, 1);
+  assert.equal(c.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 1);
+});
+
+for (const kind of ['wrong backend', 'manual', 'extra turn', 'base selection', 'short sha', 'extra field', 'invalid number'])
+test(`revision input rejects ${kind}`, async context => {
+  const v = await revisionFixture(context);
+  if (kind === 'wrong backend') v.input.execution_backend = 'agents_api';
+  if (kind === 'manual') delete v.input.automatic;
+  if (kind === 'extra turn') Object.assign(v.input.automatic, { max_codex_turns: 4, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION });
+  if (kind === 'base selection') v.input.base_ref = 'main';
+  if (kind === 'short sha') v.input.revise_pr.expected_head_sha = '1234';
+  if (kind === 'extra field') v.input.revise_pr.branch = 'main';
+  if (kind === 'invalid number') v.input.revise_pr.pr_number = -1;
+  await assert.rejects(v.run(), /INVALID_REVISION_AUTHORITY|INVALID_AUTOMATIC/);
+  assert.equal(v.publisher.pushes, 1); assert.deepEqual(v.calls, []);
+});
+
+for (const kind of ['FAIL', 'failed validation', 'outside scope', 'reviewer termination', 'implementer termination', 'changed tree', 'missing evidence', 'reused reviewer'])
+test(`revision ${kind} stops before branch update`, async context => {
+  const mode = {};
+  if (kind === 'FAIL') mode.verdict = 'FAIL';
+  if (kind === 'outside scope') mode.outside = true;
+  if (kind === 'reviewer termination') mode.closeFailure = 'reviewer';
+  if (kind === 'implementer termination') mode.closeFailure = 'implementer';
+  if (kind === 'reused reviewer') mode.reuseIdentity = true;
+  if (kind === 'changed tree') mode.review = async options => fs.writeFile(path.join(path.dirname(options.cwd), 'repo/one.txt'), 'modified after validation\n');
+  const v = await revisionFixture(context, mode);
+  if (kind === 'failed validation') v.input.contract.test_commands = ['false'];
+  if (kind === 'missing evidence') mode.review = async () => {
+    const task = v.c.db.prepare('SELECT value FROM tasks WHERE id<>?').all(v.original.id).map(row => JSON.parse(row.value))[0];
+    task.local_validation.termination_confirmed = false; v.c.save(task);
+  };
+  const task = await v.run();
+  assert.notEqual(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.equal(v.publisher.pushes, 1); assert.equal(v.publisher.creates, 1);
+  assert.equal(repoGit(v.remote, 'rev-parse', v.original.publication.pushed_branch).trim(), v.input.revise_pr.expected_head_sha);
+  await v.unchanged();
+});
+
+for (const stage of ['after fetch', 'before publication', 'push advertisement', 'receive race'])
+test(`revision changed head at ${stage} fails closed preserving the other actor`, async context => {
+  const mode = {}, v = await revisionFixture(context, mode), branch = v.original.publication.pushed_branch;
+  // Build an independent actor commit on the expected head. The staged
+  // hooks also exercise branch changes after the push advertisement.
+  const advance = () => {
+    const commit = publicationGit(v.remote, ['commit-tree', repoGit(v.remote, 'rev-parse', `${v.input.revise_pr.expected_head_sha}^{tree}`).trim(), '-p', v.input.revise_pr.expected_head_sha],
+      { input: 'Competing actor\n', env: { GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' } }).trim();
+    repoGit(v.remote, 'update-ref', `refs/heads/${branch}`, commit); return commit;
+  };
+  let other;
+  if (stage === 'after fetch') mode.afterFetch = () => { other = advance(); };
+  if (stage === 'before publication') mode.review = () => { other = advance(); };
+  if (stage === 'push advertisement') v.publisher.beforePush = () => { other = advance(); };
+  if (stage === 'receive race') {
+    const hook = path.join(v.remote, 'hooks/pre-receive');
+    // receive-pack has advertised the expected head, then a competing actor
+    // changes it. Its old-OID transaction must reject our normal push.
+    await fs.writeFile(hook, `#!/bin/sh\nread old new ref\nenv -u GIT_QUARANTINE_PATH git update-ref "$ref" "${v.baseline}"\n`, { mode: 0o700 });
+    other = v.baseline;
+  }
+  if (stage === 'after fetch') await assert.rejects(v.run(), /PUBLICATION_PR_CONFLICT|REVISION_HEAD_CHANGED/);
+  else assert.notEqual((await v.run()).automatic.status, 'succeeded');
+  assert.equal(repoGit(v.remote, 'rev-parse', branch).trim(), other);
+  assert.equal(v.publisher.creates, 1); await v.unchanged();
+});
+
+test('revision competing starts reserve one task and duplicate requests cannot duplicate turns', async context => {
+  const v = await revisionFixture(context);
+  const results = await Promise.allSettled([v.c.start(v.input), v.c.start({ ...v.input, request_id: 'competing_revision' })]);
+  assert.equal(results.filter(row => row.status === 'fulfilled').length, 1);
+  assert.match(results.find(row => row.status === 'rejected').reason.code, /REVISION_COMPETING_PUBLICATION/);
+  await Promise.all([...v.c.jobs.values()]); await Promise.all([...v.c.automaticJobs.values()]);
+  assert.equal(v.publisher.pushes, 2); assert.deepEqual(v.calls, ['implementer', 'reviewer']); await v.unchanged();
+});
+
+for (const lost of ['push acknowledgment', 'push before effect'])
+test(`revision lost ${lost} and restart never resubmit or replay`, async context => {
+  const v = await revisionFixture(context), push = v.publisher.push.bind(v.publisher);
+  v.publisher.push = async (...args) => {
+    if (lost === 'push acknowledgment') await push(...args);
+    else v.publisher.pushes++;
+    throw Error('Synthetic uncertain push');
+  };
+  const task = await v.run(); assert.equal(task.automatic.status, 'uncertain');
+  assert.equal(task.publication.push_attempted, true); assert.equal(v.publisher.creates, 1); assert.equal(v.publisher.pushes, 2);
+  const commit = task.publication.commit_sha;
+  await v.c.close();
+  const restarted = await new Controller({ stateRoot: v.c.stateRoot, workspaceRoot: v.c.workspaceRoot, publisher: v.publisher, secrets: [],
+    localBackendFactory: () => { throw Error('EXECUTION REPLAY'); } }).init();
+  try {
+    const repeated = await restarted.start(v.input); assert.equal(repeated.task_id, task.id);
+    assert.equal(restarted.task(task.id).publication.commit_sha, commit);
+    assert.equal(restarted.task(task.id).automatic.status, 'uncertain');
+    assert.equal(v.publisher.pushes, 2); assert.equal(v.publisher.creates, 1);
+    await assert.rejects(restarted.start({ ...v.input, request_id: 'new_request_after_uncertainty' }), /REVISION_COMPETING_PUBLICATION/);
+    assert.equal(v.publisher.pushes, 2);
+    await assert.rejects(restarted.publish({ task_id: task.id, title: v.input.automatic.publish.title }), /AUTOMATIC_TASK_OWNS_TRANSITIONS/);
+  } finally { await restarted.close(); }
+});
+
+test('revision expected-old-head guard rejects a remotely rewound ancestor that would permit fast-forward', async context => {
+  const v = await revisionFixture(context), p = v.original.publication;
+  const repo = path.join(v.c.workspaceRoot, v.original.id, 'repo');
+  const commit = publicationGit(repo, ['commit-tree', p.reviewed_tree_sha, '-p', p.commit_sha], { input: 'Revision fixture\n',
+    env: { GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' } }).trim();
+  repoGit(v.remote, 'update-ref', `refs/heads/${p.pushed_branch}`, v.baseline);
+  // The ancestor relation alone would allow this push. The expected old OID is
+  // checked against the advertisement at the actual production push boundary.
+  repoGit(repo, 'merge-base', '--is-ancestor', v.baseline, commit);
+  await assert.rejects(v.publisher.push(repo, p.target, p.pushed_branch, commit, v.c.stateRoot, p.commit_sha), /PUBLICATION_GIT_FAILED/);
+  assert.equal(repoGit(v.remote, 'rev-parse', p.pushed_branch).trim(), v.baseline);
+  assert.equal(v.publisher.creates, 1);
+});
+
+test('revision MCP schema is strict and the existing start_task tool executes the same-PR path', async context => {
+  const v = await revisionFixture(context), server = createServer(v.c, async () => {});
+  const client = new Client({ name: 'revision-fixture', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(a); await client.connect(b);
+  context.after(async () => { await client.close(); await server.close(); });
+  const tools = (await client.listTools()).tools, start = tools.find(tool => tool.name === 'start_task');
+  assert.equal(start.inputSchema.properties.revise_pr.additionalProperties, false);
+  assert(!tools.some(tool => tool.name === 'revise_pr'));
+  for (const revise_pr of [{ ...v.input.revise_pr, branch: 'main' }, { ...v.input.revise_pr, expected_head_sha: 'short' },
+    { ...v.input.revise_pr, pr_number: 1.5 }]) {
+    const result = await client.callTool({ name: 'start_task', arguments: { ...v.input, revise_pr } });
+    assert.equal(result.isError, true); assert.equal(v.publisher.pushes, 1); assert.deepEqual(v.calls, []);
+  }
+  const result = await client.callTool({ name: 'start_task', arguments: v.input });
+  assert.notEqual(result.isError, true);
+  await Promise.all([...v.c.jobs.values()]); await Promise.all([...v.c.automaticJobs.values()]);
+  assert.equal(v.c.task(result.structuredContent.task_id).automatic.status, 'succeeded');
+  await v.unchanged();
+});
+
+test('revision can revise the next confirmed head while retaining every prior task and review', async context => {
+  const v = await revisionFixture(context), first = await v.run();
+  assert.equal(first.automatic.status, 'succeeded');
+  const retained = v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(first.id).value;
+  v.mode.content = 'revised again\n';
+  v.input.request_id = 'second_owner_revision'; v.input.revise_pr.expected_head_sha = first.publication.commit_sha;
+  const second = await v.run();
+  assert.equal(second.automatic.status, 'succeeded', JSON.stringify(second.automatic));
+  assert.equal(second.revision.source_task_id, first.id); assert.equal(second.revision.original_task_id, v.original.id);
+  assert.notEqual(first.reviewer.local.thread_id, second.reviewer.local.thread_id);
+  assert.notEqual(first.local_validation.attempt_id, second.local_validation.attempt_id);
+  assert.notEqual(first.reviewer.packet_hash, second.reviewer.packet_hash);
+  assert.notEqual(first.reviewer.reviewed_git_state.tree_sha, second.reviewer.reviewed_git_state.tree_sha);
+  for (const [task, parent, content] of [[first, v.original.publication.commit_sha, 'revised\n'],
+    [second, first.publication.commit_sha, 'revised again\n']]) {
+    const p = task.publication, reviewer = task.reviewer;
+    assert.equal(repoGit(v.remote, 'show', '-s', '--format=%P', p.commit_sha).trim(), parent);
+    assert.equal(repoGit(v.remote, 'show', `${p.commit_sha}:one.txt`), content);
+    assert.equal(repoGit(v.remote, 'diff-tree', '--no-commit-id', '--name-only', '-r', parent, p.commit_sha).trim(), 'one.txt');
+    assert.equal(repoGit(v.remote, 'rev-parse', `${p.commit_sha}^{tree}`).trim(), reviewer.reviewed_git_state.tree_sha);
+    assert.equal(task.local_validation.status, 'completed');
+    assert.equal(task.local_validation.results[0].status, 'passed');
+    assert.equal(task.local_validation.results[0].stdout.text, content);
+    assert.equal(task.local_validation.reviewed_git_state.tree_sha, reviewer.reviewed_git_state.tree_sha);
+    assert.equal(reviewer.review_result.overall, 'PASS');
+    assert.equal(reviewer.review_result.scope_qualification.status, 'qualified');
+    assert.deepEqual(reviewer.review_result.controller_overrides, []);
+    assert.equal(reviewer.review_result.packet_hash, reviewer.packet_hash);
+    assert.equal(p.review_packet_sha256, reviewer.packet_hash);
+    assert.equal(p.reviewed_tree_sha, reviewer.reviewed_git_state.tree_sha);
+    assert.equal(p.reviewer_thread_id, reviewer.local.thread_id);
+  }
+  assert.equal(v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(first.id).value, retained);
+  assert.equal((await reportingPublication(v.c, first.id)).confirmed, true);
+  assert.equal((await reportingPublication(v.c, second.id)).confirmed, true);
+  assert.equal(v.publisher.pushes, 3); assert.equal(v.publisher.creates, 1); await v.unchanged();
+});
+
+test('revision no-op fails its requested change in independent review without updating the PR', async context => {
+  const v = await revisionFixture(context, { noWrite: true, review: async options => {
+    const packet = JSON.parse(await fs.readFile(path.join(options.cwd, 'evidence.json'), 'utf8'));
+    assert.deepEqual(packet.changed_files, []); assert.equal(packet.diff, '');
+    assert.equal(packet.baseline['one.txt'], packet.current['one.txt']);
+    return { overall: 'FAIL', findings: [
+      { id: 'R1', status: 'FAIL', evidence: 'The requested revision made no change: one.txt is identical to its baseline and the diff is empty.' },
+      { id: 'SCOPE', status: 'PASS', evidence: 'No file changes or prohibited operations observed in the bounded packet.' },
+      { id: 'TEST_EVIDENCE', status: 'PASS', evidence: 'Independent cat one.txt validation passed for the unchanged candidate; this does not prove the requested change.' }
+    ] };
+  } });
+  const task = await v.run(), reviewer = task.reviewer;
+  assert.equal(task.automatic.status, 'stopped'); assert.equal(task.automatic.reason, 'PUBLICATION_REQUIRES_PASS_REVIEW');
+  assert.equal(task.local_validation.status, 'completed'); assert.equal(task.local_validation.results[0].status, 'passed');
+  assert.equal(reviewer.state, 'completed'); assert.equal(reviewer.review_result.model_overall, 'FAIL');
+  assert.equal(reviewer.review_result.overall, 'FAIL'); assert.deepEqual(reviewer.review_result.controller_overrides, []);
+  assert.equal(reviewer.review_result.scope_qualification.status, 'qualified');
+  assert.equal(reviewer.review_result.findings.find(finding => finding.id === 'R1').status, 'FAIL');
+  assert.equal(reviewer.reviewed_git_state.tree_sha, v.original.publication.reviewed_tree_sha);
+  assert.equal(task.publication, undefined); assert.equal(v.publisher.pushes, 1); assert.equal(v.publisher.creates, 1);
+  assert.equal(repoGit(v.remote, 'rev-parse', `refs/heads/${v.original.publication.pushed_branch}`).trim(), v.original.publication.commit_sha);
+  assert.deepEqual(v.calls, ['implementer', 'reviewer']); await v.unchanged();
+});
+
+test('revision accepts a retained published task after workspace cleanup without thawing history', async context => {
+  const v = await revisionFixture(context);
+  await v.c.cleanup({ task_id: v.original.id, delete_workspace: true });
+  const retained = v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(v.original.id).value;
+  assert.equal((await v.c.qualifyPublicationEvidence(v.c.task(v.original.id))).confirmed, true);
+  const task = await v.run();
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.equal(v.c.db.prepare('SELECT value FROM tasks WHERE id=?').get(v.original.id).value, retained);
+  assert.equal(v.publisher.pushes, 2); assert.equal(v.publisher.creates, 1);
+});
+
+test('revision accepts authenticated retained original Agents API publication without changing that workflow', async context => {
+  const v = await revisionFixture(context, { sourceBackend: 'agents_api' });
+  const task = await v.run();
+  assert.equal(task.automatic.status, 'succeeded', JSON.stringify(task.automatic));
+  assert.equal(repoGit(v.remote, 'rev-parse', `${task.publication.commit_sha}^`).trim(), v.original.publication.commit_sha);
+  assert.notEqual(task.reviewer.local.thread_id, v.original.reviewer.session_id);
+  assert.equal((await reportingPublication(v.c, task.id)).confirmed, true);
+  assert.equal(v.publisher.pushes, 2); await v.unchanged();
+});

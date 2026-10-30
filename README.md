@@ -121,6 +121,53 @@ orchestration framework. Offline mocks and local bare-Git publication fixtures d
 not constitute live end-to-end acceptance. Separately authorized successful and
 failed-path acceptance remains required before deployment.
 
+### Owner-authorized revisions of an existing draft PR
+
+To address owner feedback on an existing PAB-published draft PR, submit a **new**
+`start_task` with its own request ID, feedback in the contract, and:
+
+```json
+"revise_pr": {
+  "pr_number": 7,
+  "expected_head_sha": "0123456789abcdef0123456789abcdef01234567"
+}
+```
+
+This option requires `execution_backend: "local_codex"`, a registered
+`repository_id`, and explicit `automatic` authorization with two Codex turns and
+zero corrections. Omit `base_ref`: the Controller independently verifies and pins
+the current PR head. Manual revision tasks and revision correction rounds are not
+supported. Omitting `revise_pr` preserves existing behavior and fingerprints.
+
+Before execution, the Controller verifies authenticated retained PAB publication,
+review and validation evidence, current GitHub owner/repository identity, open draft
+status, exact head, original branch and registered default base. Editable files
+must remain within the original approved file set. It fetches only the verified
+commit's objects; registered HEAD, refs, index, working files and registry remain
+unchanged. A new isolated task retains its own deadline, budget, contract,
+implementation, independent validation and fresh independent reviewer. The prior
+task stays frozen and its evidence is never rewritten. Missing historical proof
+cannot be reconstructed by this feature.
+
+A qualified PASS authorizes one Controller commit whose parent is the expected
+head and whose tree is the exact reviewed tree. The publisher updates the existing
+PR branch using normal fast-forward push with an exact expected-old-head check in
+its pre-push hook and Git's receive-side compare-and-swap. It never force-pushes,
+updates the default branch, creates another PR, changes draft status or merges.
+The publication title supplies the commit message; title/body remain bound to
+the authorization. Existing PR metadata is retained. Agents receive no GitHub publication credentials or push rights.
+
+Retained task/publication JSON in the existing SQLite ledger binds source and
+original task IDs, PR identity, previous head, review packet/tree and the single
+push attempt. Concurrent or uncertain publications block another revision. Duplicate
+request IDs return the same task without fetching or replaying turns/pushes;
+changed input requires a new authorization. A lost push acknowledgment stays
+uncertain, including after restart, even if the branch was updated. No automatic
+resubmission or replay is authorized. This initial path deliberately does not use
+the original create-PR restart reconciliation. Revision lineage is bounded to 31
+retained predecessors; all predecessor proof must remain available. Offline fixture
+checks do not establish live GitHub/Codex revision acceptance or deployment.
+
 ### Bounded review packaging and explicit pre-execution retry
 
 Local contracts may optionally select `reference_files`, for example
@@ -448,7 +495,8 @@ lists still require a completed validation lifecycle. Legacy tasks lacking the n
 pre-execution protected snapshot or review binding cannot qualify retrospectively.
 
 The shared publisher freezes implementation/review changes, uses only the fixed
-task branch, builds a commit from the reviewed tree, verifies tree identity, refuses
+task branch (or the verified existing branch for a revision), builds a commit from
+the reviewed tree, verifies tree identity, refuses
 default-branch or conflicting-ref updates, and creates only draft PRs. Retry input
 fingerprints and uncertain push/PR reconciliation remain unchanged; missing remote
 acknowledgements do not authorize duplicate PR creation. Local thread/turn identities

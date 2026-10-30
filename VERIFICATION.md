@@ -19,6 +19,11 @@ The suite covers:
   symlinks and binary content; missing/failed/stale review and tree mismatch rejection.
 - Remote branch conflicts/races, default-branch rejection, freezing, concurrency,
   lost-response reconciliation, strict MCP schema and durable publication audit.
+- Owner-authorized draft revisions in a new task on the same PR/branch, sole
+  prior-head parent and exact reviewed tree, fresh independent validation/review,
+  immutable prior history, original file scope, strict request fingerprints,
+  changed-head/owner/base/draft rejection, push-boundary and receive-side races,
+  competing starts, review/evidence/termination failures and restart without replay.
 - Ordered file-RPC journals, payload exclusion, record limits, missing/conflicting
   capture, persistence failure before dispatch, and cleanup/restart retention.
 - Deterministic packet budgeting, independent stream truncation, complete semantic
@@ -68,6 +73,17 @@ redaction can hold multiple copies in memory. SQLite retains packet text and
 historical observations without a total storage quota; lowering admission neither
 rewrites history nor makes capture a streaming operation. Operators must allow
 for larger memory, storage and review-time costs within these unchanged limits.
+
+Focused offline revision checks use the existing publication and registration fixtures:
+
+```bash
+node --test --test-name-pattern='^revision ' test/publication.test.mjs
+node --test --test-name-pattern='^revision ' test/github-registration.test.mjs
+```
+
+These do not contact the live Controller, modify a real target PR or start paid
+Codex turns. Full native acceptance remains a separate owner-operated procedure;
+source checks do not establish deployment or live same-PR revision acceptance.
 
 ## Public-source scan
 

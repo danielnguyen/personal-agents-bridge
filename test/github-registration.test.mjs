@@ -934,3 +934,46 @@ test('MCP default-branch refresh requires authorization and reports the pinned c
   assert.equal(repoGit(path.join(value.config.workspaceRoot, task.id, 'repo'), 'remote'), '');
   assert.equal(value.controller._api, undefined);
 });
+
+for (const failure of [null, 'verification', 'identity', 'fetch', 'unsupported tree', 'sync'])
+test(`revision selected-object synchronization ${failure ? `rejects ${failure}` : 'pins head without checkout/ref mutation'}`, async context => {
+  const value = await setup(context); await value.controller.registerGitHubRepository(input);
+  const before = await checkoutSnapshot(value.destination, x => x), refs = repoGit(value.destination, 'show-ref');
+  const registry = await fs.readFile(value.file, 'utf8'), index = await fs.readFile(path.join(value.destination, '.git/index'));
+  const head = await advance(value, 'revision commit\n');
+  if (failure === 'unsupported tree') {
+    await fs.symlink('answer.txt', path.join(value.upstream, 'link'));
+    repoGit(value.upstream, 'add', 'link');
+    repoGit(value.upstream, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unsupported');
+  }
+  const selected = repoGit(value.upstream, 'rev-parse', 'HEAD').trim();
+  // A PR head is selected by the trusted Controller callback, not a caller's ref.
+  const revision = { request: { pr_number: 7, expected_head_sha: selected }, target: { repository: input.repository, base: 'main' } };
+  const selectedCommits = [], fetch = value.transport.fetch;
+  value.transport.fetch = (...args) => { selectedCommits.push(args[3]); if (failure === 'fetch') throw Error('fetch failed'); return fetch(...args); };
+  let verified = 0;
+  const verify = async repository => { verified++; assert.equal(repository.repository_id, 'github_1234'); if (failure === 'verification') throw Error('verification failed'); };
+  if (failure === 'identity') value.metadata.owner.id = 999;
+  if (failure === 'sync') value.controller.registration.synchronize = async () => { throw Error('sync failed'); };
+  const run = () => value.controller.registration.resolveForRevision('github_1234', revision, verify);
+  if (failure) await assert.rejects(run());
+  else {
+    const resolved = await run();
+    assert.equal(resolved.baseline_commit, head); assert.equal(resolved.base_ref, head);
+    assert.equal(resolved.revision_identity.repository_id, 1234); assert.equal(resolved.revision_identity.owner_id, 12);
+    const publisher = new GitHubPublisher(); publisher.api = () => value.metadata;
+    const publicationRepository = { ...resolved, github_identity: resolved.revision_identity };
+    assert.equal((await publisher.target(publicationRepository)).repository, input.repository);
+    value.metadata.id = 5678;
+    await assert.rejects(publisher.target(publicationRepository), /PUBLICATION_GITHUB_IDENTITY_CHANGED/);
+    value.metadata.id = 1234;
+    assert.equal(verified, 2); assert.deepEqual(selectedCommits, [head]);
+    assert.equal((await resolveRepository(value.file, 'github_1234', 'HEAD', value.config.workspaceRoot, value.config.stateRoot)).baseline_commit, value.baseline);
+    assert.equal((await resolveRepository(value.file, 'github_1234', head, value.config.workspaceRoot, value.config.stateRoot)).baseline_commit, head);
+  }
+  assert.equal(compareSnapshots(before, await checkoutSnapshot(value.destination, x => x)).status, 'unchanged');
+  assert.equal(repoGit(value.destination, 'show-ref'), refs); assert.equal(await fs.readFile(value.file, 'utf8'), registry);
+  assert.deepEqual(await fs.readFile(path.join(value.destination, '.git/index')), index);
+  assert.equal(repoGit(value.destination, 'rev-parse', 'HEAD').trim(), value.baseline);
+  if (failure === 'verification' || failure === 'identity') assert.deepEqual(selectedCommits, []);
+});

@@ -82,16 +82,20 @@ export class GitHubPublisher {
     if (fields.length !== 2 || !oid(fields[0]) || fields[1] !== ref) fail('PUBLICATION_REMOTE_REF_INVALID');
     return fields[0];
   }
-  async push(repo, target, branch, commit, controlRoot) {
+  async push(repo, target, branch, commit, controlRoot, expectedHead) {
     const hooks = await fs.mkdtemp(path.join(controlRoot, 'publish-hooks-'));
     try {
-      // Verify the remote's advertised old OID is zero: never fast-forward an
-      // unexpected existing ref. receive-pack's old-OID CAS protects a later race.
+      // Check the advertised old OID at the push boundary. Ordinary publication
+      // requires absence; a revision requires the retained exact previous head.
+      // Normal push ancestry checks and receive-pack old-OID CAS still apply.
       const ref = `refs/heads/${branch}`;
-      const script = `#!/usr/bin/python3\nimport sys\nrows=[line.split() for line in sys.stdin]\nexpected=${JSON.stringify(ref)}\ncommit=${JSON.stringify(commit)}\nif len(rows)!=1: sys.exit(1)\nr=rows[0]\nif not (len(r)==4 and r[1]==commit and r[2]==expected and len(r[3]) in (40,64) and set(r[3])=={'0'}): sys.exit(1)\n`;
+      const script = `#!/usr/bin/python3\nimport sys\nrows=[line.split() for line in sys.stdin]\nexpected=${JSON.stringify(ref)}\ncommit=${JSON.stringify(commit)}\nold=${JSON.stringify(expectedHead || '')}\nif len(rows)!=1: sys.exit(1)\nr=rows[0]\nif not (len(r)==4 and r[1]==commit and r[2]==expected and ((r[3]==old) if old else (len(r[3]) in (40,64) and set(r[3])=={'0'}))): sys.exit(1)\n`;
       await fs.writeFile(path.join(hooks, 'pre-push'), script, { mode: 0o700, flag: 'wx' });
       publicationGit(repo, ['push', '--porcelain', '--', target.remote, `${commit}:${ref}`], { hooks, network: true });
     } finally { await fs.rm(hooks, { recursive: true, force: true }); }
+  }
+  async getPR(target, number) {
+    return this.api(`repos/${target.repository}/pulls/${number}`);
   }
   async findPR(target, branch) {
     const owner = target.repository.split('/')[0];
@@ -103,7 +107,8 @@ export class GitHubPublisher {
     return this.api(`repos/${target.repository}/pulls`, 'POST', { title: input.title, body: input.body, head: branch, base: target.base, draft: true });
   }
 }
-function verifyPR(pr, target, branch, commit) {
+export function verifyPR(pr, target, branch, commit, expectedNumber) {
+  if (expectedNumber !== undefined && (pr?.number !== expectedNumber || pr?.merged === true)) fail('PUBLICATION_PR_CONFLICT');
   if (!Number.isInteger(pr?.number) || pr.number <= 0 || pr.state !== 'open' || pr.draft !== true || pr.merged_at ||
       pr.head?.ref !== branch || pr.head?.sha !== commit || pr.head?.repo?.full_name !== target.repository ||
       pr.base?.ref !== target.base || pr.base?.repo?.full_name !== target.repository ||
@@ -131,7 +136,9 @@ export async function publishReviewedTask(controller, task, input) {
   const fingerprint = sha(JSON.stringify(input)), backend = controller.publisher;
   if (task.publication && task.publication.input_sha256 !== fingerprint) fail('PUBLICATION_INPUT_CHANGED');
   task.publication_frozen = true; controller.save(task); // durable: continue/review cannot restart implementation
-  const target = await backend.target(task.repository), branch = task.repository.branch;
+  const target = await backend.target(task.revision ? { ...task.repository, github_identity: task.revision.github_identity } : task.repository);
+  const branch = task.revision?.branch || task.repository.branch;
+  if (task.revision) return publishRevision(controller, task, input, { repo, reviewed, target, branch, fingerprint });
   publicationGit(repo, ['check-ref-format', `refs/heads/${target.base}`]);
   if (target.base === branch) fail('PUBLICATION_DEFAULT_BRANCH_FORBIDDEN');
   let p = task.publication;
@@ -172,6 +179,58 @@ export async function publishReviewedTask(controller, task, input) {
   }
   verifyPR(pr, target, branch, p.commit_sha);
   p.phase = 'complete'; p.pr_number = pr.number; p.pr_url = pr.html_url; p.completed_at = new Date().toISOString(); controller.save(task);
+  return publicationResult(p);
+}
+async function publishRevision(controller, task, input, { repo, reviewed, target, branch, fingerprint }) {
+  const backend = controller.publisher, r = task.revision;
+  await controller.verifyRevisionEvidence(task);
+  if (JSON.stringify(target) !== JSON.stringify(r.target) || branch === target.base) fail('REVISION_TARGET_CHANGED');
+  publicationGit(repo, ['check-ref-format', `refs/heads/${branch}`]);
+  let p = task.publication;
+  if (p && (p.input_sha256 !== fingerprint || JSON.stringify(p.target) !== JSON.stringify(target) ||
+      p.previous_head_sha !== r.request.expected_head_sha || p.source_task_id !== r.source_task_id ||
+      p.pr_number !== r.request.pr_number || p.pushed_branch !== branch)) fail('REVISION_PUBLICATION_CHANGED');
+  // A retained attempted push permits only read-only confirmation of that exact
+  // commit. Absence or the old head never authorizes a second push.
+  const expected = p?.push_attempted ? p.commit_sha : r.request.expected_head_sha;
+  const pr = await backend.getPR(target, r.request.pr_number);
+  verifyPR(pr, target, branch, expected, r.request.pr_number);
+  if (pr.number !== r.request.pr_number || await backend.remoteHead(repo, target, branch) !== expected) fail('REVISION_HEAD_CHANGED');
+  if (!p) {
+    const timestamp = new Date().toISOString();
+    const commit = publicationGit(repo, ['commit-tree', reviewed.tree_sha, '-p', r.request.expected_head_sha], { input: input.title + '\n', env: {
+      GIT_AUTHOR_NAME: 'Personal Agents Bridge', GIT_AUTHOR_EMAIL: 'personal-agents-bridge@users.noreply.github.com',
+      GIT_COMMITTER_NAME: 'Personal Agents Bridge', GIT_COMMITTER_EMAIL: 'personal-agents-bridge@users.noreply.github.com',
+      GIT_AUTHOR_DATE: timestamp, GIT_COMMITTER_DATE: timestamp
+    } }).trim();
+    if (!oid(commit)) fail('PUBLICATION_COMMIT_INVALID');
+    p = task.publication = { phase: 'prepared', task_id: task.id, input_sha256: fingerprint, reviewed_tree_sha: reviewed.tree_sha,
+      commit_sha: commit, pushed_branch: branch, target, review_packet_sha256: task.reviewer.packet_hash,
+      reviewer_backend: 'local_codex', reviewer_thread_id: task.reviewer.local.thread_id, reviewer_session_id: null,
+      reviewer_turn_id: task.reviewer.review_result.turn_id, review_overall: 'PASS', prepared_at: timestamp,
+      push_attempted: false, pr_attempted: false, pr_number: pr.number, pr_url: pr.html_url,
+      source_task_id: r.source_task_id, original_task_id: r.original_task_id, previous_head_sha: r.request.expected_head_sha,
+      source_publication_sha256: r.source_publication_sha256 };
+    controller.save(task);
+  }
+  const headers = publicationGit(repo, ['cat-file', '-p', p.commit_sha]).split('\n\n')[0].split('\n');
+  if (headers[0] !== `tree ${reviewed.tree_sha}` || p.reviewed_tree_sha !== reviewed.tree_sha ||
+      headers.filter(line => line.startsWith('parent ')).join() !== `parent ${r.request.expected_head_sha}`) fail('PUBLICATION_TREE_MISMATCH');
+  p.commit_tree_matches_reviewed_tree = true; controller.save(task);
+  if (!p.push_attempted) {
+    if (JSON.stringify(await publicationState(repo)) !== JSON.stringify(reviewed.state) ||
+        await worktreeTree(path.dirname(repo), task.baseline) !== reviewed.tree_sha) fail('WORKTREE_CHANGED_SINCE_REVIEW');
+    // Reverify immediately before retaining the single push attempt.
+    verifyPR(await backend.getPR(target, r.request.pr_number), target, branch, r.request.expected_head_sha, r.request.pr_number);
+    await controller.verifyRevisionEvidence(task);
+    p.push_attempted = true; controller.save(task);
+    await backend.push(repo, target, branch, p.commit_sha, controller.stateRoot, r.request.expected_head_sha);
+  }
+  if (await backend.remoteHead(repo, target, branch) !== p.commit_sha) fail('PUBLICATION_PUSH_UNCONFIRMED');
+  verifyPR(await backend.getPR(target, r.request.pr_number), target, branch, p.commit_sha, r.request.pr_number);
+  if (p.phase !== 'complete') {
+    p.phase = 'complete'; p.completed_at = new Date().toISOString(); controller.save(task);
+  }
   return publicationResult(p);
 }
 export function publicationResult(p) {
