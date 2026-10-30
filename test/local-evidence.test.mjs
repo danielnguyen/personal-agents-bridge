@@ -225,12 +225,14 @@ test('model/reasoning and output-delta events cannot become trusted records', ()
   assert.deepEqual(ledger.commands, []); assert.deepEqual(ledger.file_changes, []);
 });
 
-test('local packet uses shared byte limit without changing version or silently removing required sections', () => {
+test('local packet retains large Unicode evidence without changing version or omitting sections', () => {
   const input = { evidence_version: LOCAL_EVIDENCE_VERSION, current: { 'a.txt': 'ok' } };
   const packet = budgetLocalPacket(input);
   assert.equal(packet.bytes, Buffer.byteLength(packet.text)); assert(packet.bytes <= PACKET_LIMIT);
   assert.deepEqual(JSON.parse(packet.text).current, input.current);
   assert.equal(JSON.parse(packet.text).evidence_version, LOCAL_EVIDENCE_VERSION);
-  assert.throws(() => budgetLocalPacket({ ...input, current: { 'a.txt': '🙂'.repeat(PACKET_LIMIT) } }), error =>
-    error.code === 'EVIDENCE_SIZE_LIMIT' && error.diagnostic.limit_bytes === PACKET_LIMIT && error.diagnostic.required_section === 'local_packet');
+  const unicode = '🙂'.repeat(40000);
+  const expanded = budgetLocalPacket({ ...input, current: { 'a.txt': unicode } });
+  assert.equal(JSON.parse(expanded.text).current['a.txt'], unicode);
+  assert(expanded.bytes > 128 * 1024 && expanded.bytes < PACKET_LIMIT);
 });
