@@ -925,14 +925,15 @@ test('pre-ledger local tasks expose unavailable history, not a reconstructed suc
   assert.equal(data.native_activity.status, 'unavailable'); assert.equal(data.independent_validation.status, 'unavailable');
 });
 
-test('local packet overflow persists shared size diagnostics without API retrieval or section loss', async context => {
+test('local packet retains previously oversized content without API retrieval or section loss', async context => {
   const value = await setup(context, { status: 'completed' }, { noApi: true }), started = await value.start(); await value.drain();
-  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(125000));
-  await assert.rejects(value.controller.buildPacket(value.controller.task(started.task_id)), error =>
-    error.code === 'EVIDENCE_SIZE_LIMIT' && error.diagnostic.required_section === 'local_packet');
+  const content = 'x'.repeat(125000);
+  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), content);
+  const packet = await value.controller.buildPacket(value.controller.task(started.task_id));
+  assert(packet.bytes > 128 * 1024);
+  assert.equal(JSON.parse(packet.text).current['greeting.txt'], content);
   const saved = value.controller.task(started.task_id);
-  assert.equal(saved.review_packet_diagnostic.limit_bytes, 128 * 1024);
-  assert(saved.review_packet_diagnostic.measured_bytes > 128 * 1024);
+  assert.equal(saved.review_packet_diagnostic, undefined);
   assert.equal(saved.reviewer, undefined); assert.equal(value.controller._api, undefined);
 });
 
