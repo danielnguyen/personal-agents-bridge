@@ -5,7 +5,7 @@ import OpenAI from 'openai';
 import { deepRedact } from '@hackylabs/deep-redact';
 import { z } from 'zod';
 import { LocalCodexBackend, INSTRUCTIONS as localInstructions, humanRequestMethods, validateHumanResponse } from './local-codex-backend.mjs';
-import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult } from './publication.mjs';
+import { GitHubPublisher, reviewedGitState, publicationState, publishReviewedTask, publicationResult, verifyPR } from './publication.mjs';
 import { captureBefore, repositoryReviewEvidence, checkoutSnapshot, compareSnapshots } from './review-evidence.mjs';
 import { createLocalEvidence, observeLocalEvidence, localEvidencePacket, budgetLocalPacket, localReferencePaths, localReferencesValid, LOCAL_REFERENCE_BYTES } from './local-evidence.mjs';
 import { localReviewerInstructions, validateLocalReview, localExecutionQualified, localContractBinding, localCorrectionEligibility,
@@ -117,6 +117,7 @@ const reportCleanup = z.object(Object.fromEntries(['executor_stopped', 'remote_s
   'validation_termination_confirmed', 'workspace_deletion_requested', 'workspace_deleted', 'worktree_deleted'].map(key => [key, reportBool]))).nullable().catch(null);
 const reportPublication = z.object({ phase: reportPhase, reviewed_tree_sha: reportGit, commit_sha: reportGit,
   commit_tree_matches_reviewed_tree: reportBool, push_attempted: z.boolean().nullable().catch(null), pr_attempted: z.boolean().nullable().catch(null), pr_number: reportInteger,
+  revision: z.object({ source_task_id: reportTaskId, original_task_id: reportTaskId, previous_head_sha: reportGit }).optional(),
   draft: reportBool, confirmed: reportBool, uncertain: reportBool,
   live_github_verified: z.literal(false).catch(false),
   execution_authorized: z.literal(false).catch(false) }).nullable().catch(null);
@@ -507,7 +508,7 @@ export class Controller {
   async verifyCompletedAutomaticPublication(task) {
     this.storageAuthority();
     const a = task.automatic, p = task.publication, ref = task.reviewer, binding = a.contract_binding;
-    if (task.execution_backend !== 'local_codex' || task.correction || a.correction || a.corrective_publication ||
+    if (task.execution_backend !== 'local_codex' || task.revision || task.correction || a.correction || a.corrective_publication ||
         task.cleaned || task.workspace_deleted || task.cleanup || a.expiry_stop || task.previous_reviewers?.length || task.publication_error ||
         a.phase !== 'publication' || task.publication_frozen !== true || p?.phase !== 'complete' ||
         p.push_attempted !== true || p.pr_attempted !== true || p.commit_tree_matches_reviewed_tree !== true ||
@@ -723,11 +724,13 @@ export class Controller {
           if (t.correction && t.automatic) reviewStates.set(t.id, operation?.id === t.automatic.review_request_id ? operation.status :
             this.db.prepare('SELECT status FROM operations WHERE id=?').get(t.automatic.review_request_id)?.status);
           const prior = this.db.prepare('SELECT value FROM tasks WHERE id=?').get(t.id);
+          if (!prior && t.revision) this.assertNoCompetingRevision(t);
           if (prior) {
             const old = JSON.parse(prior.value);
             if ((old.correction && (digest(old.correction) !== digest(t.correction) || old.deadline !== t.deadline || old.baseline !== t.baseline || t.execution_backend !== 'local_codex')) ||
                 (old.automatic?.correction && digest(old.automatic.correction) !== digest(t.automatic?.correction))) throw new BridgeError('CORRECTION_BINDING_CHANGED');
             if (old.correction && old.implementer.local.turn_submission_attempted && !t.implementer.local.turn_submission_attempted) throw new BridgeError('CORRECTIVE_EVIDENCE_UNVERIFIED');
+            if (old.revision && digest(old.revision) !== digest(t.revision)) throw new BridgeError('REVISION_BINDING_CHANGED');
             if (old.automatic && (['request_id', 'deadline', 'baseline'].some(key => old[key] !== t[key]) ||
                 ['review_request_id', 'publish_request_id', 'owner_instance', 'deadline', 'contract_binding'].some(key => digest(old.automatic[key] ?? null) !== digest(t.automatic?.[key] ?? null)))) throw new BridgeError('AUTOMATIC_BINDING_CHANGED');
             if (old.automatic && (digest(old.automatic.authorization) !== digest(t.automatic?.authorization ?? null) ||
@@ -933,7 +936,7 @@ export class Controller {
       if (id === task.request_id) {
         kind = task.correction ? 'correction' : 'start';
         payload = task.correction || { execution_backend: 'local_codex', input: { contract: a.contract_binding.contract,
-          repository_id: task.repository.repository_id, base_ref: task.repository.requested_base_ref ?? task.repository.base_ref, automatic: a.authorization } };
+          repository_id: task.repository.repository_id, base_ref: task.repository.requested_base_ref ?? task.repository.base_ref, automatic: a.authorization, ...(task.revision ? { revise_pr: task.revision.request } : {}) } };
       } else if (id === a?.review_request_id) { kind = 'review'; payload = { id: task.id }; }
       else if (id === a?.publish_request_id) {
         kind = 'automatic_publish'; taskId = a.corrective_publication?.task_id || a.correction?.task_id || task.id;
@@ -2000,15 +2003,91 @@ export class Controller {
     if (task.publication?.phase !== 'complete') throw new BridgeError('AUTOMATIC_PUBLICATION_UNCONFIRMED');
     this.finishAutomatic(id, 'succeeded', null);
   }
+  assertNoCompetingRevision(task) {
+    const r = task.revision, ancestors = new Set();
+    let id = r.source_task_id;
+    while (id) {
+      if (ancestors.has(id) || ancestors.size >= 31) throw new BridgeError('REVISION_LINEAGE_INVALID');
+      ancestors.add(id); id = this.task(id).revision?.source_task_id;
+    }
+    for (const row of this.db.prepare('SELECT value FROM tasks').all()) {
+      const other = JSON.parse(row.value), p = other.publication;
+      if (other.id === task.id || ancestors.has(other.id)) continue;
+      if ((other.revision?.target.repository === r.target.repository && other.revision.request.pr_number === r.request.pr_number &&
+          (!other.cleaned || p?.push_attempted)) ||
+          (p?.target?.repository === r.target.repository && (p.pushed_branch === r.branch || p.pr_number === r.request.pr_number) &&
+          (p.push_attempted || p.pr_attempted))) throw new BridgeError('REVISION_COMPETING_PUBLICATION');
+    }
+  }
+  async verifyRevisionEvidence(task, seen = new Set(), competing = true) {
+    const r = task.revision, source = this.task(r.source_task_id), p = source.publication;
+    if (task.id && (!Number.isSafeInteger(r.github_identity?.repository_id) || r.github_identity.repository_id <= 0 ||
+        !Number.isSafeInteger(r.github_identity.owner_id) || r.github_identity.owner_id <= 0 ||
+        r.github_identity.full_name !== r.target.repository || r.github_identity.default_branch !== r.target.base)) throw new BridgeError('REVISION_TARGET_CHANGED');
+    if (task.execution_backend !== 'local_codex' || !task.automatic || task.automatic.authorization.max_codex_turns !== 2 ||
+        task.automatic.authorization.max_corrections !== 0 || task.baseline !== r.request.expected_head_sha ||
+        task.repository.repository_id !== source.repository?.repository_id ||
+        digest(task.repository.registered_identity) !== digest(source.repository.registered_identity) ||
+        p?.commit_sha !== r.request.expected_head_sha || p.pr_number !== r.request.pr_number || p.pushed_branch !== r.branch ||
+        digest(p) !== r.source_publication_sha256 || digest(p.target) !== digest(r.target) ||
+        r.original_task_id !== (source.revision?.original_task_id || source.id) ||
+        !(await this.qualifyPublicationEvidence(source, seen))?.confirmed) throw new BridgeError('REVISION_PUBLICATION_UNVERIFIED');
+    const original = this.task(r.original_task_id), binding = task.automatic.contract_binding || task.evidence_contract, contract = binding.contract;
+    if (digest(contract) !== binding.sha256) throw new BridgeError('REVISION_CONTRACT_CHANGED');
+    const allowed = (original.automatic?.contract_binding || original.evidence_contract)?.contract?.allowed_files;
+    if (!Array.isArray(allowed) || contract.allowed_files.some(name => !allowed.includes(name))) throw new BridgeError('REVISION_SCOPE_VIOLATION');
+    // New task and independent reviewer identities must not reuse historical sessions.
+    const current = [task.implementer?.local?.thread_id, task.reviewer?.local?.thread_id].filter(Boolean);
+    let previous = source, count = 0;
+    while (previous) {
+      if (++count >= 32 || current.some(identity => [previous.implementer?.local?.thread_id, previous.reviewer?.local?.thread_id,
+          previous.implementer?.session_id, previous.reviewer?.session_id].includes(identity))) throw new BridgeError('REVISION_IDENTITY_REUSED');
+      previous = previous.revision ? this.task(previous.revision.source_task_id) : null;
+    }
+    if (competing) this.assertNoCompetingRevision(task);
+  }
+  async admitRevision(input) {
+    const repository = await this.registration.resolveForTask(input.repository_id, 'HEAD');
+    const target = await this.publisher.target(repository);
+    const candidates = this.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).filter(task =>
+      task.repository?.repository_id === input.repository_id && task.publication?.target?.repository === target.repository &&
+      task.publication.pr_number === input.revise_pr.pr_number && task.publication.commit_sha === input.revise_pr.expected_head_sha);
+    if (candidates.length !== 1) throw new BridgeError('REVISION_PUBLICATION_UNVERIFIED');
+    const source = candidates[0], p = source.publication;
+    const revision = { request: structuredClone(input.revise_pr), source_task_id: source.id,
+      original_task_id: source.revision?.original_task_id || source.id, source_publication_sha256: digest(p), branch: p.pushed_branch, target: p.target };
+    if (digest(target) !== digest(p.target)) throw new BridgeError('REVISION_TARGET_CHANGED');
+    const proposed = { execution_backend: 'local_codex', baseline: input.revise_pr.expected_head_sha, repository, revision,
+      automatic: { authorization: input.automatic }, evidence_contract: { sha256: digest(input.contract), contract: input.contract } };
+    const verify = async registered => {
+      proposed.repository = registered;
+      await this.verifyRevisionEvidence(proposed);
+      const pr = await this.publisher.getPR(target, revision.request.pr_number);
+      verifyPR(pr, target, revision.branch, revision.request.expected_head_sha, revision.request.pr_number);
+      if (pr.number !== revision.request.pr_number ||
+          await this.publisher.remoteHead(registered.canonical_path, target, revision.branch) !== revision.request.expected_head_sha) throw new BridgeError('REVISION_HEAD_CHANGED');
+    };
+    await verify(repository);
+    const { revision_identity, ...resolved } = await this.registration.resolveForRevision(input.repository_id, revision, verify);
+    revision.github_identity = revision_identity;
+    return { repository: { ...resolved, requested_base_ref: 'HEAD' }, revision };
+  }
   async start(input) {
-    return this.locked(`start:${input.request_id}`, () => this.startVerified(input));
+    return this.locked(`start:${input.request_id}`, () => input.revise_pr ?
+      this.locked(`revision:${input.repository_id}:${input.revise_pr.pr_number}`, () => this.startVerified(input)) : this.startVerified(input));
   }
   async startVerified(input) {
     if (this.closed) throw new BridgeError('CONTROLLER_CLOSED');
     this.storageAuthority();
     const { contract, request_id, repository_id, base_ref = 'HEAD', execution_backend = 'agents_api' } = input;
-    if (Object.keys(input).some(k => !['contract', 'request_id', 'repository_id', 'base_ref', 'execution_backend', 'automatic'].includes(k))) throw new BridgeError('INVALID_START_INPUT');
+    if (Object.keys(input).some(k => !['contract', 'request_id', 'repository_id', 'base_ref', 'execution_backend', 'automatic', 'revise_pr'].includes(k))) throw new BridgeError('INVALID_START_INPUT');
     const automatic = this.automaticAuthorization(input);
+    if (input.revise_pr !== undefined && (!input.revise_pr || typeof input.revise_pr !== 'object' || Array.isArray(input.revise_pr) ||
+        Object.keys(input.revise_pr).sort().join() !== 'expected_head_sha,pr_number' ||
+        !Number.isSafeInteger(input.revise_pr.pr_number) || input.revise_pr.pr_number <= 0 ||
+        typeof input.revise_pr.expected_head_sha !== 'string' || !/^[a-f0-9]{40}$/.test(input.revise_pr.expected_head_sha) ||
+        execution_backend !== 'local_codex' || !repository_id || input.base_ref !== undefined ||
+        !automatic || automatic.max_codex_turns !== 2 || automatic.max_corrections !== 0)) throw new BridgeError('INVALID_REVISION_AUTHORITY');
     if (!['agents_api', 'local_codex'].includes(execution_backend)) throw new BridgeError('INVALID_EXECUTION_BACKEND');
     if (execution_backend === 'local_codex' && !repository_id) throw new BridgeError('LOCAL_CODEX_REQUIRES_REPOSITORY');
     if (!repository_id && input.base_ref !== undefined) throw new BridgeError('BASE_REF_REQUIRES_REPOSITORY');
@@ -2023,7 +2102,7 @@ export class Controller {
     for (const name of Object.keys(contract.initial_files || {})) safeRelative(name);
     const ids = [...contract.requirements, ...contract.invariants].map(r => r.id);
     if (new Set(ids).size !== ids.length || ids.some(id => ['SCOPE', 'TEST_EVIDENCE'].includes(id))) throw new BridgeError('DUPLICATE_OR_RESERVED_REQUIREMENT_ID');
-    const payload = repository_id !== undefined ? { contract, repository_id, base_ref, ...(automatic ? { automatic } : {}) } : contract;
+    const payload = repository_id !== undefined ? { contract, repository_id, base_ref, ...(automatic ? { automatic } : {}), ...(input.revise_pr ? { revise_pr: input.revise_pr } : {}) } : contract;
     const operationPayload = execution_backend === 'agents_api' ? payload : { execution_backend, input: payload };
     // Replays must return the original binding before any branch lookup/fetch.
     if (this.db.prepare('SELECT id FROM operations WHERE id=?').get(request_id)) {
@@ -2032,10 +2111,13 @@ export class Controller {
     }
     const id = `task_${randomUUID()}`;
     // Validate allowlisting and pin the commit before accepting any paid work.
-    let repository;
+    let repository, revision;
     if (repository_id !== undefined) {
       if (Object.keys(contract.initial_files || {}).length) throw new BridgeError('REPOSITORY_INITIAL_FILES_UNSUPPORTED');
-      try { repository = await this.locked('repository-registration', () => this.registration.resolveForTask(repository_id, base_ref)); }
+      try {
+        if (input.revise_pr) ({ repository, revision } = await this.locked('repository-registration', () => this.admitRevision(input)));
+        else repository = await this.locked('repository-registration', () => this.registration.resolveForTask(repository_id, base_ref));
+      }
       catch (e) { throw new BridgeError(/^[A-Z_]+$/.test(e.code || '') ? e.code : 'REPOSITORY_VALIDATION_FAILED'); }
     }
     if (execution_backend === 'local_codex') await this.localReferenceEvidence(repository.canonical_path, repository.baseline_commit, contract, false);
@@ -2045,7 +2127,7 @@ export class Controller {
     const active = this.db.prepare('SELECT value FROM tasks').all().filter(r => !JSON.parse(r.value).cleaned);
     if (active.length >= 3) { this.db.prepare('DELETE FROM operations WHERE id=?').run(request_id); throw new BridgeError('ACTIVE_TASK_LIMIT'); }
     const t = { id, execution_backend, created: Date.now(), deadline: Date.now() + this.timeoutMs, baseline: repository?.baseline_commit || null, ...(repository ? { repository } : {}), implementer: { state: 'starting' }, request_id,
-      evidence_contract: { sha256: digest(contract), contract } };
+      evidence_contract: { sha256: digest(contract), contract }, ...(revision ? { revision } : {}) };
     if (automatic) {
       t.deadline = t.created + Math.min(this.timeoutMs, automatic.max_duration_seconds * 1000);
       t.automatic = { authorization: automatic, status: 'progressing', phase: 'implementation', reason: null,
@@ -2178,7 +2260,7 @@ export class Controller {
     task.local_protected_before = protectedState; task.local_execution_evidence = createLocalEvidence(id); this.save(task);
     const abort = new AbortController();
     const backend = this.localBackendFactory({ cwd: workspace, timeoutMs: this.executionTimeout(task), deferHumanRequests: true,
-      ...(task.correction ? { requireFreshThread: true } : {}), onLifecycle: event => {
+      ...(task.correction || task.revision ? { requireFreshThread: true } : {}), onLifecycle: event => {
       if (this.dbClosed) throw new BridgeError('CONTROLLER_CLOSED');
       const current = this.task(id), ref = current.implementer, local = ref.local;
       this.correctiveIdentity(current, event);
@@ -2406,7 +2488,7 @@ export class Controller {
         stdout: discloseObservation(record.stdout), stderr: discloseObservation(record.stderr) })),
       truncated: Array.isArray(value?.results) && value.results.length > 10 };
   }
-  async qualifyPublicationEvidence(task) {
+  async qualifyPublicationEvidence(task, revisionSeen = new Set()) {
     // A historical Controller completion is not fresh publication authority.
     // Use the same retained projection on both reporting surfaces; never query
     // Git/GitHub or try to reconcile a publication during a read.
@@ -2494,14 +2576,20 @@ export class Controller {
       }
       if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
       require(!this.persistenceFailures.has(task.id) && !task.publication_error);
+      require(!revisionSeen.has(task.id) && revisionSeen.size < 32);
+      revisionSeen = new Set([...revisionSeen, task.id]);
+      if (task.revision) await this.verifyRevisionEvidence(task, revisionSeen, false);
       const ref = await reviewProof(task, 'PASS');
       require(typed(reportTaskId, task.id) && p.task_id === task.id && task.publication_frozen === true &&
-        p.phase === 'complete' && p.push_attempted === true && p.pr_attempted === true && p.commit_tree_matches_reviewed_tree === true &&
+        p.phase === 'complete' && p.push_attempted === true && p.pr_attempted === (task.revision ? false : true) && p.commit_tree_matches_reviewed_tree === true &&
         git(p.commit_sha) && git(p.reviewed_tree_sha) && git(ref?.reviewed_git_state?.tree_sha) &&
         p.reviewed_tree_sha === ref.reviewed_git_state.tree_sha && hash(p.review_packet_sha256) &&
         hash(ref.packet_hash) && p.review_packet_sha256 === ref.packet_hash && hash(p.input_sha256) &&
         git(task.baseline) && task.baseline === task.repository?.baseline_commit &&
-        typeof p.pushed_branch === 'string' && p.pushed_branch === `bridge/${task.id}` && p.pushed_branch === task.repository?.branch &&
+        typeof p.pushed_branch === 'string' && p.pushed_branch === (task.revision?.branch || `bridge/${task.id}`) &&
+        (!task.revision || (p.source_task_id === task.revision.source_task_id && p.original_task_id === task.revision.original_task_id &&
+          p.source_publication_sha256 === task.revision.source_publication_sha256 && p.previous_head_sha === task.revision.request.expected_head_sha &&
+          p.pr_number === task.revision.request.pr_number && digest(p.target) === digest(task.revision.target))) &&
         Number.isSafeInteger(p.pr_number) && p.pr_number > 0 && typeof p.target?.repository === 'string' &&
         /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(p.target.repository) && identity(p.target.base) && p.target.base !== p.pushed_branch &&
         p.pr_url === `https://github.com/${p.target.repository}/pull/${p.pr_number}` &&
@@ -2533,7 +2621,7 @@ export class Controller {
       confirmed = true;
     } catch { confirmed = false; }
     if (!p) return task.publication_frozen ? typed(reportPublication, { phase: 'frozen', confirmed: false, uncertain: true }) : null;
-    return typed(reportPublication, { ...p, phase: p.phase === 'complete' && !confirmed ? 'confirmation_pending' : p.phase,
+    return typed(reportPublication, { ...p, ...(task.revision ? { revision: { source_task_id: p.source_task_id, original_task_id: p.original_task_id, previous_head_sha: p.previous_head_sha } } : {}), phase: p.phase === 'complete' && !confirmed ? 'confirmation_pending' : p.phase,
       draft: confirmed ? true : p.draft, confirmed, live_github_verified: false,
       uncertain: !!task.publication_error || this.persistenceFailures.has(task.id) || this.transactionUnresolved === true ||
         typeof p.push_attempted !== 'boolean' || typeof p.pr_attempted !== 'boolean' ||
@@ -2896,7 +2984,7 @@ export class Controller {
       !validation || validation.status === 'pending' ? 'not_attempted' : 'unknown';
     const p = task.publication, publicationOperation = operation(a.publish_request_id);
     const publicationConfirmed = !storageUncertain && a.status === 'succeeded' && a.reconciliation?.confirmed !== false && p?.phase === 'complete' && p.commit_tree_matches_reviewed_tree === true &&
-      p.push_attempted === true && p.pr_attempted === true && publicationOperation === 'accepted' && this.confirmedAutomaticPublication(task);
+      p.push_attempted === true && p.pr_attempted === (task.revision ? false : true) && publicationOperation === 'accepted' && this.confirmedAutomaticPublication(task);
     const publication = { request_id: identity(a.publish_request_id), status: publicationConfirmed ? 'confirmed_completed' :
       p?.push_attempted === true || p?.pr_attempted === true || publicationOperation === 'pending' || publicationOperation === 'uncertain' ? 'attempted_unconfirmed' :
       !p && (!publicationOperation || ['reserved', 'not_started', 'failed'].includes(publicationOperation)) ? 'not_attempted' : 'unknown' };
@@ -3845,7 +3933,7 @@ export class Controller {
         !qualified.controller_context.authorityValid || !qualified.controller_context.uncertaintyFree)) throw new BridgeError('LOCAL_PUBLICATION_EXECUTION_UNVERIFIED');
     if (qualified.overall !== 'PASS' || JSON.stringify(qualified.scope_qualification) !== JSON.stringify(result.scope_qualification)) throw new BridgeError('LOCAL_PUBLICATION_REVIEW_INVALID');
     const publication = task.publication;
-    if (publication && (publication.task_id !== task.id || publication.pushed_branch !== task.repository.branch ||
+    if (publication && (publication.task_id !== task.id || publication.pushed_branch !== (task.revision?.branch || task.repository.branch) ||
         publication.review_packet_sha256 !== task.reviewer.packet_hash || publication.reviewed_tree_sha !== task.reviewer.reviewed_git_state.tree_sha ||
         publication.reviewer_backend !== 'local_codex' || publication.reviewer_session_id !== null ||
         publication.reviewer_thread_id !== task.reviewer.local.thread_id || publication.reviewer_turn_id !== task.reviewer.local.turn_id ||
@@ -3885,14 +3973,14 @@ export class Controller {
         }
         t = this.task(t.id);
         const publicationController = Object.create(this);
-        publicationController.publisher = Object.fromEntries(['target', 'remoteHead', 'push', 'findPR', 'createPR'].map(method => [method, async (...args) => {
+        publicationController.publisher = Object.fromEntries(['target', 'remoteHead', 'push', 'findPR', 'createPR', ...(t.revision ? ['getPR'] : [])].map(method => [method, async (...args) => {
           this.automaticGuard(this.task(t.id));
           if (t.correction) await this.qualifyCorrectivePublication(this.task(t.id));
-          else if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
+          else if (t.revision || this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
           const result = await this.publisher[method](...args);
           this.automaticGuard(this.task(t.id));
           if (t.correction) await this.qualifyCorrectivePublication(this.task(t.id));
-          else if (this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
+          else if (t.revision || this.reviewProtocol(this.task(t.id)) === LOCAL_ACTIONABILITY_REVIEW_VERSION) await this.qualifyLocalPublication(this.task(t.id));
           return result;
         }]));
         publicationController.save = value => {

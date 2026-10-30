@@ -38,7 +38,19 @@ per-task authorization, or proof of human intent supplied by the tunnel.
   RPC initialization must pass before implementation input is submitted.
 - Agents cannot push or merge. Only `publish_task` in the trusted controller can
   publish an unchanged, independently PASS-reviewed tree, as a draft PR on the
-  fixed task branch. It never force-pushes, pushes the default branch or merges.
+  fixed task branch, or an owner-authorized existing PAB draft branch for a new
+  revision task. Revision admission requires authenticated retained publication
+  and independent review/validation proof, verified current GitHub owner/repository,
+  open draft/base/branch identity, exact expected head and the original allowed file
+  set. Revisions require local Codex automatic 2/0 authority; historical tasks stay
+  frozen. Only the verified commit's objects are fetched, without moving registered
+  checkout refs, HEAD, index or working files. The revision commit has the prior
+  PR head as its sole parent and exactly the independently reviewed tree. An exact
+  old-head pre-push guard plus normal fast-forward/receive-side CAS prevents
+  overwriting competing changes. No second PR or readiness update is issued.
+  Retained competing or uncertain attempts block further revisions; uncertain pushes
+  never authorize resubmission or execution replay after restart. It never
+  force-pushes, pushes the default branch or merges.
 - Unsupported RPCs and missing/conflicting sandbox attestation fail closed.
 
 These guarantees depend on a compatible Linux kernel/Codex runtime. Run the local
