@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, constants as sqlite } from 'node:sqlite';
 import { Controller, safeRelative, redact, digest, discloseObservation, taskReportSchema } from '../controller.mjs';
+import { PACKET_LIMIT } from '../packet-budget.mjs';
 import { authorizePersonalTunnel, createServer } from '../server.mjs';
 import { FakeAPI, FakeExecutor, contract } from './helpers.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -2492,7 +2493,7 @@ test('oversized or symlink evidence fails closed without starting a reviewer', a
   const repo = path.join(c.workspaceRoot, x.task_id, 'repo');
   await fs.symlink('/etc/hosts', path.join(repo, 'greeting.txt'));
   await assert.rejects(c.review({ task_id: x.task_id, request_id: 'review_symlink' }), /UNSAFE_WORKSPACE/); assert.equal(api.created.length, 1);
-  await fs.unlink(path.join(repo, 'greeting.txt')); await fs.writeFile(path.join(repo, 'greeting.txt'), 'x'.repeat(140000));
+  await fs.unlink(path.join(repo, 'greeting.txt')); await fs.writeFile(path.join(repo, 'greeting.txt'), 'x'.repeat(PACKET_LIMIT + 1));
   await assert.rejects(c.review({ task_id: x.task_id, request_id: 'review_oversize' }), /OVERSIZE/); assert.equal(api.created.length, 1);
 });
 test('incomplete or contradictory reviewer JSON cannot become PASS', async t => {

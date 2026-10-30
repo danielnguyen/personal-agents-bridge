@@ -38,8 +38,36 @@ Activation requires a safe controller restart. Legacy tasks without first-execut
 RPC capture remain incomplete; historical operations cannot be reconstructed or
 retroactively certified. Old review packets without the frozen Git tree cannot be
 retroactively authorized for publication. Existing frozen packets are not rewritten.
-Version-5 packets retain the 128 KiB limit and add explicit section budgets and
-completeness metadata. Required evidence that cannot fit fails before reviewer creation.
+Version-5 packets now admit up to 64 MiB of retained review evidence by default.
+The lower admission limit may be configured at controller startup using
+`PAB_REVIEW_PACKET_LIMIT_BYTES` (integer bytes, 131072–67108864). The 64 MiB
+hard retention bound remains in force for prior packets even if admission is
+reduced later. Existing retained packets are not rewritten.
+
+The reviewer reads only the controller-produced, frozen `evidence.json`, and
+must inspect large source/evidence sections in bounded successive views rather
+than loading them into one model response. Complete task-required evidence
+remains mandatory; absence, corruption or unreviewed sections cannot PASS.
+The review-receipt verification cap remains 128 KiB; local findings still have
+a separate 16000-byte limit. Neither increases with evidence capacity. Total
+packet bytes, per-record command limits and reviewer tokens are distinct resource controls; raising the packet limit does not grant new execution,
+network, publication or repository access.
+
+Incremental inspection is a reviewer instruction, not a Controller-enforced
+coverage ledger or model-context guarantee. Fake reviewer tests establish packet
+availability, identity and qualification gates; they do not establish that a live
+reviewer inspected every required window. Git patches and source reads use larger
+buffers, while Git metadata, protected capture, reference context (32 KiB),
+validation materialization (16 MiB), command records and timeouts keep their own
+bounds. Binary source is represented by hashes/lengths and Git tree identity,
+not retained raw bytes. Redaction can change source evidence; the larger packet
+limit does not certify unredacted content or remove completeness checks.
+
+Packets remain whole JSON values. Capture, parsing, diff reconstruction and
+redaction can hold multiple copies in memory. SQLite retains packet text and
+historical observations without a total storage quota; lowering admission neither
+rewrites history nor makes capture a streaming operation. Operators must allow
+for larger memory, storage and review-time costs within these unchanged limits.
 
 ## Public-source scan
 

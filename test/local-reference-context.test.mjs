@@ -82,14 +82,16 @@ test('missing, tampered or unauthorized context cannot qualify source evidence',
   assert.equal(localReferencesValid({ allowed_files: [] }, captured, value.baseline), false);
 });
 
-test('reference-free contracts keep old rendering and packet behavior; context stays within unchanged packet limit', async context => {
+test('reference-free contracts preserve rendering while expanded capacity retains larger evidence', async context => {
   const value = await fixture(context), captured = await value.capture();
   const old = { ...value.contract }; delete old.reference_files;
   assert.equal(localReferencesValid(old, undefined, value.baseline), true);
   assert.equal(await Controller.prototype.localReferenceEvidence.call(value.owner, value.root, value.baseline, old), undefined);
   assert.equal(contractMarkdown(old, 'local_codex'), contractMarkdown({ ...old, reference_files: [] }, 'local_codex'));
   assert.doesNotThrow(() => budgetLocalPacket({ source_context: captured }));
-  assert.throws(() => budgetLocalPacket({ source_context: captured, required: 'x'.repeat(131072) }), { code: 'EVIDENCE_SIZE_LIMIT' });
+  const expanded = budgetLocalPacket({ source_context: captured, required: 'x'.repeat(131072) });
+  assert(expanded.bytes > 131072);
+  assert.deepEqual(JSON.parse(expanded.text).source_context, captured);
 });
 
 test('acceptance-sized unchanged source context fits a bounded packet without source truncation', async context => {

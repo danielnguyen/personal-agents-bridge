@@ -77,6 +77,8 @@ test('local instructions distinguish provenance, obligations and optional gaps w
   assert.match(localReviewerInstructions, /independent_validation.status=unavailable/);
   assert.match(localReviewerInstructions, /Do not fabricate Agents API sandbox attestations/);
   assert.match(localReviewerInstructions, /data, never as instructions/);
+  assert.match(localReviewerInstructions, /multi-megabyte/);
+  assert.match(localReviewerInstructions, /bounded successive read-only queries/);
 });
 
 function boundContractPacket(value) {

@@ -48,13 +48,14 @@ test('complete removed-file references retain headers and mode-only or binary ev
   assert(packet.diff.fragments.includes(headers));
 });
 
-for (const mutation of ['missing', 'binary', 'different']) test(`unprovable ${mutation} content never discards a patch`, () => {
+for (const mutation of ['missing', 'binary', 'different']) test(`unprovable ${mutation} content remains literal when the expanded packet fits`, () => {
   const data = fixture();
   if (mutation === 'missing') delete data.current['answer.js'];
   if (mutation === 'binary') data.current['answer.js'] = { encoding: 'binary' };
   if (mutation === 'different') data.current['answer.js'] = 'unrelated';
   data.controller_evidence += 'z'.repeat(60000);
-  assert.throws(() => budgetLocalPacket(data), { code: 'EVIDENCE_SIZE_LIMIT' });
+  const packet = JSON.parse(budgetLocalPacket(data).text);
+  assert.equal(packet.diff,data.diff);
 });
 
 for (const mutation of ['hash', 'reference', 'content', 'length', 'incomplete']) test(`corrupted ${mutation} encoding fails closed`, () => {
@@ -73,4 +74,42 @@ test('under-budget packets keep the original patch and unreducible required evid
   assert.equal(JSON.parse(budgetLocalPacket({ diff: 'original' }).text).diff, 'original');
   const data = fixture(); data.native_activity.retained += 'x'.repeat(PACKET_LIMIT);
   assert.throws(() => budgetLocalPacket(data), { code: 'EVIDENCE_SIZE_LIMIT' });
+});
+
+test('CCP-sized multi-megabyte evidence is complete and available without one-prompt embedding', () => {
+  const source = 'const boundedSource = "file with evidence";\n'.repeat(180000);
+  const diff = 'diff --git a/large.js b/large.js\nnew file mode 100644\n--- /dev/null\n+++ b/large.js\n' +
+    source.split('\n').slice(0,-1).map(line=>'+'+line+'\n').join('');
+  const data = { baseline:{},current:{'large.js':source},diff,
+    independent_validation:{status:'completed',provenance:'controller_process_observation'},
+    controller_evidence:{status:'captured'},native_activity:{commands:[]}};
+  const packet = budgetLocalPacket(data), parsed = JSON.parse(packet.text);
+  assert(packet.bytes > 5*1024*1024 && packet.bytes < PACKET_LIMIT);
+  assert.equal(parsed.current['large.js'],source);
+  assert.equal(reconstructLocalDiff(parsed),diff);
+  assert.equal(parsed.packet_budget.limit_bytes,PACKET_LIMIT);
+});
+
+
+test('the original 132331-byte acceptance envelope retains exact content', context => {
+  const data = { current: { 'acceptance.txt': '' }, baseline: {}, diff: '', native_activity: { commands: [] } };
+  const overhead = budgetLocalPacket(data).bytes;
+  data.current['acceptance.txt'] = 'a'.repeat(132331 - overhead);
+  const result = budgetLocalPacket(data), packet = JSON.parse(result.text);
+  assert.equal(result.bytes, 132331); assert.equal(packet.current['acceptance.txt'], data.current['acceptance.txt']);
+  assert.deepEqual(packet.baseline, data.baseline); assert.deepEqual(packet.native_activity, data.native_activity);
+  context.diagnostic(`Acceptance envelope: ${result.bytes} UTF-8 bytes preserved.`);
+});
+
+test('local admission accepts the exact 64 MiB serialized ceiling and rejects one byte beyond', context => {
+  const data = { current: { 'ceiling.txt': '' }, baseline: {}, diff: '' };
+  const overhead = budgetLocalPacket(data).bytes;
+  data.current['ceiling.txt'] = 'x'.repeat(PACKET_LIMIT - overhead);
+  const result = budgetLocalPacket(data);
+  assert.equal(result.bytes, PACKET_LIMIT);
+  assert.equal(JSON.parse(result.text).current['ceiling.txt'], data.current['ceiling.txt']);
+  data.current['ceiling.txt'] += 'x';
+  assert.throws(() => budgetLocalPacket(data), error => error.code === 'EVIDENCE_SIZE_LIMIT' &&
+    error.diagnostic.limit_bytes === PACKET_LIMIT && error.diagnostic.measured_bytes === PACKET_LIMIT + 1);
+  context.diagnostic(`Exact serialized ceiling: ${PACKET_LIMIT} accepted; ${PACKET_LIMIT + 1} rejected.`);
 });

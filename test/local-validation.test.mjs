@@ -147,8 +147,11 @@ test('pre-spawn persistence failure prevents execution and cannot produce observ
   assert.deepEqual((await fs.readdir(value.root)).sort(), ['repo']);
 });
 
-test('output-size controls retain independent results or reject the complete packet', () => {
-  assert.throws(() => budgetLocalPacket({ independent_validation: { results: [{ stdout: { text: 'x'.repeat(128 * 1024) } }] } }), /EVIDENCE_SIZE_LIMIT/);
+test('expanded packet capacity retains large independent validation outputs without truncation', () => {
+  const text = 'x'.repeat(128 * 1024);
+  const result = budgetLocalPacket({ independent_validation: { results: [{ stdout: { text } }] } });
+  assert.equal(JSON.parse(result.text).independent_validation.results[0].stdout.text, text);
+  assert(result.bytes > 128 * 1024);
 });
 
 test('observed supervisor close without command completion is not a verified PASS', async () => {

@@ -17,6 +17,9 @@ import { LocalCodexBackend } from '../local-codex-backend.mjs';
 import { compareSnapshots } from '../review-evidence.mjs';
 import { GitHubPublisher, publicationState } from '../publication.mjs';
 import { LocalValidation } from '../local-validation.mjs';
+import { execFileSync } from 'node:child_process';
+import { NEW_PACKET_LIMIT } from '../packet-budget.mjs';
+import { reconstructLocalDiff } from '../local-evidence.mjs';
 
 class FakeLocal {
   constructor(options, mode = {}) { this.options = options; this.mode = mode; this.calls = []; }
@@ -50,7 +53,7 @@ class FakeLocal {
 }
 
 async function setup(context, mode = {}, options = {}) {
-  const root = await fs.mkdtemp(options.fixturePrefix || '/tmp/pab-local-controller-'), normal = path.join(root, 'normal');
+  const root = await fs.mkdtemp(options.fixturePrefix || '/var/tmp/personal-agents-bridge/pab-local-controller-'), normal = path.join(root, 'normal');
   await fs.mkdir(normal);
   repoGit(normal, 'init', '--initial-branch=main');
   await fs.writeFile(path.join(normal, 'greeting.txt'), 'baseline\n');
@@ -925,14 +928,15 @@ test('pre-ledger local tasks expose unavailable history, not a reconstructed suc
   assert.equal(data.native_activity.status, 'unavailable'); assert.equal(data.independent_validation.status, 'unavailable');
 });
 
-test('local packet overflow persists shared size diagnostics without API retrieval or section loss', async context => {
+test('local packet retains previously oversized content without API retrieval or section loss', async context => {
   const value = await setup(context, { status: 'completed' }, { noApi: true }), started = await value.start(); await value.drain();
-  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(125000));
-  await assert.rejects(value.controller.buildPacket(value.controller.task(started.task_id)), error =>
-    error.code === 'EVIDENCE_SIZE_LIMIT' && error.diagnostic.required_section === 'local_packet');
+  const content = 'x'.repeat(125000);
+  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), content);
+  const packet = await value.controller.buildPacket(value.controller.task(started.task_id));
+  assert(packet.bytes > 128 * 1024);
+  assert.equal(JSON.parse(packet.text).current['greeting.txt'], content);
   const saved = value.controller.task(started.task_id);
-  assert.equal(saved.review_packet_diagnostic.limit_bytes, 128 * 1024);
-  assert(saved.review_packet_diagnostic.measured_bytes > 128 * 1024);
+  assert.equal(saved.review_packet_diagnostic, undefined);
   assert.equal(saved.reviewer, undefined); assert.equal(value.controller._api, undefined);
 });
 
@@ -2162,4 +2166,128 @@ test('safe restart integrated timely publication recovery wins concurrent expiry
     assert.equal(value.instances.length, 2); assert.equal(value.validations(), 1);
     assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
   } finally { if (recovered) interruptController(recovered); interruptController(c); }
+});
+
+
+test('large Controller capture preserves 1.7 MiB and multi-file evidence through SQLite restart with lower admission', async context => {
+  const value = await setup(context, {}, { noApi: true });
+  value.input.contract.allowed_files = ['greeting.txt', 'large-a.txt', 'large-b.txt', 'large-c.txt', 'unicode.txt', 'binary.bin', 'tool.sh'];
+  const started = await value.start(), implementer = await value.running(), c = value.controller;
+  const repo = path.join(c.workspaceRoot, started.task_id, 'repo');
+  const source = 'const evidence = "retained";\n'.repeat(61500);
+  await fs.writeFile(path.join(repo, 'large-a.txt'), source);
+  implementer.finish(); await value.drain();
+  const single = await c.buildPacket(c.task(started.task_id)), one = JSON.parse(single.text);
+  assert(Buffer.byteLength(source) > 1.6 * 1024 * 1024 && Buffer.byteLength(source) < 1.8 * 1024 * 1024);
+  assert.equal(one.current['large-a.txt'], source);
+  assert.equal(reconstructLocalDiff(one), await c.repositoryDiff(repo, value.baseline));
+  context.diagnostic(`Single file: ${Buffer.byteLength(source)} bytes; packet ${single.bytes} bytes.`);
+  const expected = { 'large-a.txt': source, 'large-b.txt': source.replaceAll('retained', 'complete'),
+    'large-c.txt': source.replaceAll('retained', 'reviewed'), 'unicode.txt': '🌱 Unicode evidence\r\n'.repeat(16000), 'tool.sh': '#!/bin/sh\necho bounded\n' };
+  for (const [name, text] of Object.entries(expected)) await fs.writeFile(path.join(repo, name), text);
+  await fs.chmod(path.join(repo, 'tool.sh'), 0o755);
+  await fs.writeFile(path.join(repo, 'binary.bin'), Buffer.from([0, 255, 128, 13, 10]));
+  await fs.unlink(path.join(repo, 'greeting.txt'));
+  const originalDiff = await c.repositoryDiff(repo, value.baseline);
+  await c.review({ task_id: started.task_id, request_id: 'large_review_operation' });
+  const reviewer = await value.running(1), task = c.task(started.task_id), ref = task.reviewer;
+  const text = await fs.readFile(path.join(reviewer.options.cwd, 'evidence.json'), 'utf8'), packet = JSON.parse(text);
+  assert(ref.packet_bytes >= 5 * 1024 * 1024 && ref.packet_bytes <= 8 * 1024 * 1024);
+  for (const [name, content] of Object.entries(expected)) {
+    assert.equal(packet.current[name], content);
+    assert.equal(packet.file_byte_evidence[name].sha256, createHash('sha256').update(content).digest('hex'));
+    assert.equal(packet.file_byte_evidence[name].byte_length, Buffer.byteLength(content));
+  }
+  assert.equal(packet.baseline['greeting.txt'], 'baseline\n'); assert.equal(packet.current['greeting.txt'], undefined);
+  assert.equal(packet.file_byte_evidence['tool.sh'].git_mode, '100755');
+  assert.deepEqual(packet.current['binary.bin'], { encoding: 'binary', byte_length: 5,
+    sha256: createHash('sha256').update(Buffer.from([0, 255, 128, 13, 10])).digest('hex') });
+  assert.equal(reconstructLocalDiff(packet), originalDiff); assert.match(originalDiff, /Binary files/);
+  assert.equal(digest(text), ref.packet_hash); assert.deepEqual(await c.verifyLocalReviewPacket(task), packet);
+  const fallback = structuredClone(task); delete fallback.reviewer.retained_packet;
+  assert.deepEqual((await c.retainedEvidencePacket(fallback)).packet, packet);
+  const file = path.join(reviewer.options.cwd, 'evidence.json'), open = fs.open;
+  const mocked = context.mock.method(fs, 'open', async (...args) => {
+    const handle = await open(...args);
+    if (args[0] === file) {
+      const read = handle.read.bind(handle);
+      handle.read = async (...input) => {
+        const result = await read(...input);
+        await fs.chmod(file, 0o600); await fs.appendFile(file, 'x'); await fs.chmod(file, 0o400);
+        return result;
+      };
+    }
+    return handle;
+  });
+  try { assert.equal(await c.retainedEvidencePacket(fallback), null); }
+  finally { mocked.mock.restore(); await fs.chmod(file, 0o600); await fs.writeFile(file, text); await fs.chmod(file, 0o400); }
+
+  assert.notEqual(ref.local.thread_id, task.implementer.local.thread_id); assert.equal(reviewer.options.reviewOnly, true);
+  const output = JSON.parse(reviewOutput()); output.overall = 'FAIL'; output.findings[0].status = 'FAIL';
+  reviewer.finish('completed', true, JSON.stringify(output)); await value.drain();
+  assert.equal(c.task(task.id).reviewer.review_result.overall, 'FAIL');
+  await c.cleanup({ task_id: task.id, delete_workspace: true });
+  const retained = await c.retainedEvidencePacket(c.task(task.id)); assert.deepEqual(retained.packet, packet);
+  const record = c.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value;
+  await c.close();
+  const snippet = `import assert from 'node:assert/strict';
+    import {Controller,digest} from './controller.mjs';
+    import {budgetLocalPacket} from './local-evidence.mjs';
+    const c = await new Controller(${JSON.stringify({ stateRoot: c.stateRoot, workspaceRoot: c.workspaceRoot })}).init();
+    try {
+      const task = c.task(${JSON.stringify(task.id)}), result = await c.retainedEvidencePacket(task);
+      assert(result); assert.equal(digest(JSON.stringify(result.packet)), ${JSON.stringify(ref.packet_hash)});
+      assert.equal(task.workspace_deleted, true);
+      assert.equal(digest(c.db.prepare('SELECT value FROM tasks WHERE id=?').get(task.id).value), ${JSON.stringify(digest(record))});
+      assert.throws(() => budgetLocalPacket(result.packet), {code:'EVIDENCE_SIZE_LIMIT'});
+      assert.equal(c.localRuns.size, 0); assert.equal(c.automaticJobs.size, 0);
+      task.reviewer.retained_packet.text += 'tampered'; assert.equal(await c.retainedEvidencePacket(task), null);
+      console.log('lower-admission restart retained exact historical packet; tampering rejected');
+    } finally { await c.close(); }`;
+  const result = execFileSync(process.execPath, ['--input-type=module', '-e', snippet], {
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined, PAB_REVIEW_PACKET_LIMIT_BYTES: '131072' }, encoding: 'utf8' });
+  assert.match(result, /lower-admission restart retained exact historical packet; tampering rejected/);
+  context.diagnostic(`Multi-file packet: ${ref.packet_bytes} bytes; exact text, diff, binary hash, modes and restart binding verified.`);
+});
+
+test('configured local overflow prevents reviewer backend creation and retains diagnostics', async context => {
+  if (NEW_PACKET_LIMIT !== 131072) {
+    const output = execFileSync(process.execPath, ['--test', '--test-reporter=tap',
+      '--test-name-pattern=^configured local overflow prevents reviewer', 'test/local-controller-integration.test.mjs'], {
+      env: { ...process.env, NODE_TEST_CONTEXT: undefined, PAB_REVIEW_PACKET_LIMIT_BYTES: '131072' }, encoding: 'utf8' });
+    assert.match(output, /# pass 1/); return;
+  }
+  const value = await setup(context, { status: 'completed' }, { noApi: true }), started = await value.start();
+  await value.drain();
+  await fs.writeFile(path.join(value.controller.workspaceRoot, started.task_id, 'repo/greeting.txt'), 'x'.repeat(150000));
+  await value.controller.review({ task_id: started.task_id, request_id: 'actual_local_overflow' }); await value.drain();
+  const task = value.controller.task(started.task_id);
+  assert.equal(task.reviewer.error, 'EVIDENCE_SIZE_LIMIT'); assert.equal(task.reviewer.local.instance_started, false);
+  assert.equal(task.reviewer.local.turn_submission_attempted, false); assert.equal(value.instances.length, 1);
+  assert.equal(task.review_packet_diagnostic.limit_bytes, 131072);
+  assert(task.review_packet_diagnostic.measured_bytes > 131072); assert.equal(value.controller._api, undefined);
+});
+
+
+test('automatic SQLite history retains exact multi-megabyte packets after workspace cleanup', async context => {
+  const value = await setup(context, { implementationDiagnostics: [] }, { noApi: true });
+  const started = await value.controller.start({ ...value.input, automatic: automaticAuthority() });
+  const implementer = await value.running(), c = value.controller;
+  const source = 'complete review evidence\n'.repeat(230000);
+  await fs.writeFile(path.join(c.workspaceRoot, started.task_id, 'repo/greeting.txt'), source);
+  implementer.finish(); await value.drain();
+  const reviewer = await value.running(1), task = c.task(started.task_id);
+  const text = await fs.readFile(path.join(reviewer.options.cwd, 'evidence.json'), 'utf8');
+  assert.equal(JSON.parse(text).current['greeting.txt'], source);
+  const original = c.db.prepare("SELECT * FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.kind')='review_packet'").all(task.id);
+  assert.equal(original.length, 1); assert.equal(JSON.parse(original[0].value).packet_utf8, text);
+  assert.equal(digest(JSON.parse(original[0].value)), original[0].observation_sha256);
+  const output = JSON.parse(reviewOutput()); output.overall = 'FAIL'; output.findings[0].status = 'FAIL';
+  reviewer.finish('completed', true, JSON.stringify(output)); await value.drain(); await Promise.all([...c.automaticJobs.values()]);
+  await c.cleanup({ task_id: task.id, delete_workspace: true });
+  assert.equal(c.task(task.id).workspace_deleted, true);
+  assert.equal(JSON.stringify((await c.retainedEvidencePacket(c.task(task.id))).packet), text);
+  const retained = c.db.prepare("SELECT * FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.kind')='review_packet'").all(task.id);
+  assert.deepEqual(retained, original);
+  context.diagnostic(`Automatic retained packet: ${Buffer.byteLength(text)} bytes; exact authenticated history survives cleanup.`);
 });

@@ -1,5 +1,5 @@
 import { reviewerInstructions } from './reviewer-instructions.mjs';
-import { budgetPacket, packetSizeDiagnostic } from './packet-budget.mjs';
+import { budgetPacket, packetSizeDiagnostic, PACKET_LIMIT } from './packet-budget.mjs';
 import { captureFileRpcEvidence } from './file-rpc-evidence.mjs';
 import OpenAI from 'openai';
 import { deepRedact } from '@hackylabs/deep-redact';
@@ -26,7 +26,9 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const AUTOMATIC_OPERATION_STATES = new Set(['pending', 'reserved', 'submitting', 'submitted', 'accepted', 'failed', 'uncertain', 'result_received', 'push_attempted', 'pushed', 'pr_attempted', 'not_started']);
-const MAX_PACKET = 128 * 1024;
+const MAX_PACKET = PACKET_LIMIT;
+const MAX_REVIEW_OUTPUT = 128 * 1024;
+const MAX_PROTECTED_CAPTURE = 128 * 1024;
 const MAX_FILES = 100;
 const DEBUG_WINDOW = 30 * 86400000;
 const automaticTransition = Symbol('controller automatic transition');
@@ -253,7 +255,9 @@ export async function privateDirectory(dir) {
   await fs.chmod(dir, 0o700);
 }
 function git(cwd, ...args) {
-  try { return execFileSync('/usr/bin/git', ['--literal-pathspecs', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd, encoding: 'utf8', maxBuffer: MAX_PACKET * 2, timeout: 10000, env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0' } }); }
+  // Only full evidence patches need the larger buffer; metadata keeps its prior bound.
+  const maxBuffer = args[0] === 'diff' && !args.includes('--name-only') ? MAX_PACKET * 2 : 256 * 1024;
+  try { return execFileSync('/usr/bin/git', ['--literal-pathspecs', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd, encoding: 'utf8', maxBuffer, timeout: 10000, env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0' } }); }
   catch (e) { if (args.includes('--no-index') && e.status === 1) return e.stdout; throw e; }
 }
 async function workspaceFiles(dir, prefix = '') {
@@ -1861,7 +1865,7 @@ export class Controller {
     const binding = this.reviewReceiptBinding(task, packet.local_scope.contract_sha256);
     if (digest(received) !== sha || (task.reviewer.received_output_sha256 && task.reviewer.received_output_sha256 !== sha) ||
         digest(received.binding) !== digest(binding) || received.version !== 1 || !received.complete || typeof received.output !== 'string' ||
-        Buffer.byteLength(received.output) > MAX_PACKET || this.safe(received.output) !== received.output || digest(received.output) !== received.output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
+        Buffer.byteLength(received.output) > MAX_REVIEW_OUTPUT || this.safe(received.output) !== received.output || digest(received.output) !== received.output_sha256) throw new BridgeError('AUTOMATIC_REVIEW_RECEIPT_INVALID');
     this.reviewProtocol(task);
     const local = { ...received.observed_local, server_closed: task.reviewer.local.server_closed };
     this.applyReceivedReview(local, received);
@@ -2340,8 +2344,9 @@ export class Controller {
         const stat = await handle.stat();
         if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_PACKET) throw Error();
         // A fixed-size positional read also bounds a file grown after fstat.
-        const buffer = Buffer.alloc(MAX_PACKET + 1), read = await handle.read(buffer, 0, buffer.length, 0);
-        if (read.bytesRead > MAX_PACKET) throw Error();
+        const buffer = Buffer.alloc(stat.size + 1), read = await handle.read(buffer, 0, buffer.length, 0);
+        const after = await handle.stat();
+        if (read.bytesRead !== stat.size || ['dev', 'ino', 'mode', 'nlink', 'size', 'mtimeMs', 'ctimeMs'].some(key => stat[key] !== after[key])) throw Error();
         text = buffer.subarray(0, read.bytesRead).toString('utf8');
       } catch { text = undefined; }
       finally { await handle?.close(); }
@@ -3206,7 +3211,7 @@ export class Controller {
     await verifyTaskWorktree(root, t.repository);
     const contract = JSON.parse(await fs.readFile(path.join(root, 'contract.json'), 'utf8'));
     const taskFile = path.join(repo, 'TASK.md'), taskStat = await fs.lstat(taskFile);
-    if (!taskStat.isFile() || taskStat.isSymbolicLink() || taskStat.size > MAX_PACKET ||
+    if (!taskStat.isFile() || taskStat.isSymbolicLink() || taskStat.size > MAX_PROTECTED_CAPTURE ||
         await fs.readFile(taskFile, 'utf8') !== contractMarkdown(contract, t.execution_backend)) throw new BridgeError('TASK_CONTRACT_CHANGED');
     const changed = [...new Set([...git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', t.baseline, '--').split('\0'),
       ...git(repo, 'ls-files', '--others', '--exclude-standard', '-z').split('\0')].filter(Boolean))];
@@ -3231,7 +3236,7 @@ export class Controller {
         entries.push([name, 'directory', stat.mode]);
         for (const child of (await fs.readdir(target)).sort()) await walk(`${name}/${child}`);
       } else {
-        bytes += stat.size; if (bytes > MAX_PACKET) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
+        bytes += stat.size; if (bytes > MAX_PROTECTED_CAPTURE) throw new BridgeError('LOCAL_PROTECTED_CAPTURE_LIMIT');
         entries.push([name, 'file', stat.mode, digest(await fs.readFile(target))]);
       }
     };
@@ -3406,7 +3411,7 @@ export class Controller {
         const key = `${type}:${oid}`;
         if (!objects.has(key)) {
           const buffer = execFileSync('/usr/bin/git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'cat-file', type, oid], {
-            cwd: repo, maxBuffer: MAX_PACKET * 2, timeout: 10000,
+            cwd: repo, maxBuffer: 256 * 1024, timeout: 10000,
             // Binary trees must retain their exact bytes, unlike the text Git runner.
             env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0',
               ...(readOnly ? { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' } : {}) },
