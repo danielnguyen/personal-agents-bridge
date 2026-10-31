@@ -167,6 +167,38 @@ test('both streams retain exactly 4 MiB, including many small chunks', async () 
   }
 });
 
+test('adversarial one-byte fragments have bounded allocation overhead', async () => {
+  const fragment = Buffer.from('f');
+  const fragmentCount = 100_000;
+  const output = Array(fragmentCount).fill(fragment);
+  output.push(Buffer.alloc(VALIDATION_CAPTURE_BYTES - fragmentCount, 'z'));
+
+  // Detect per-fragment copies deterministically: the previous implementation
+  // allocated a distinct one-byte Buffer for every data event.
+  const originalFrom = Buffer.from;
+  let oneByteCopies = 0;
+  try {
+    Buffer.from = function (...args) {
+      if (Buffer.isBuffer(args[0]) && args[0].length === 1) oneByteCopies++;
+      return Reflect.apply(originalFrom, this, args);
+    };
+    const fixture = observationFixture([ownership, completion()], { stdout: output });
+    const result = await observeValidationProcess('synthetic', [], { timeoutMs: 10000, bound: value => value,
+      spawnProcess: fixture.spawnProcess });
+    assert.equal(result.status, 'passed');
+    assert.equal(result.stdout.bytes_observed, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result.stdout.text.length, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result.stdout.text.slice(0, fragmentCount), 'f'.repeat(fragmentCount));
+    assert.equal(result.stdout.text.at(-1), 'z');
+    assert.equal(result.stdout.truncated, false);
+    assert.equal(result.stderr.text, '');
+    assert.equal(result.termination_confirmed, true);
+  } finally {
+    Buffer.from = originalFrom;
+  }
+  assert(oneByteCopies < 256, 'capturing one-byte fragments must not allocate one Buffer per fragment');
+});
+
 for (const stream of ['stdout', 'stderr']) {
   test('output beyond 4 MiB on ' + stream + ' stays incomplete and never qualifies', async () => {
     const output = Buffer.alloc(VALIDATION_CAPTURE_BYTES + 1, stream === 'stdout' ? 'a' : 'b');
