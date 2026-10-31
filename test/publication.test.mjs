@@ -1205,9 +1205,12 @@ test('bounded SCOPE separates optional output limitations from execution and req
     failed.findings[0].evidence = 'Required output contents are not independently established.';
     if (availability !== 'empty' && availability !== 'present') {
       for (const alteration of [() => {}, data => { const output = data.native_activity.commands[0].output;
-        Object.assign(output, { availability: 'present', value: '[REDACTED]', missing: false, redacted: true }); data.native_activity.commands[0].missing = []; },
+        Object.assign(output, { availability: 'present', value: '[REDACTED]', missing: false, redacted: true }); data.native_activity.commands[0].missing = [];
+        // This is intentional valid retained output, so update its byte meter.
+        data.native_activity.record_bytes = Buffer.byteLength(JSON.stringify([...data.native_activity.commands, ...data.native_activity.file_changes])); },
       data => { const output = data.native_activity.commands[0].output;
-        Object.assign(output, { availability: 'present', value: 'partial', missing: false, truncated: true, source_truncated: true }); data.native_activity.commands[0].missing = []; }]) {
+        Object.assign(output, { availability: 'present', value: 'partial', missing: false, truncated: true, source_truncated: true }); data.native_activity.commands[0].missing = [];
+        data.native_activity.record_bytes = Buffer.byteLength(JSON.stringify([...data.native_activity.commands, ...data.native_activity.file_changes])); }]) {
         const limited = structuredClone(candidate); alteration(limited);
         const outputContract = { ...value.contract, requirements: [{ id: 'R1', text: 'The command must emit the exact complete stdout token expected-output.' }] };
         limited.contract = contractMarkdown(outputContract, 'local_codex');
@@ -1219,6 +1222,18 @@ test('bounded SCOPE separates optional output limitations from execution and req
         assert.deepEqual(rejected.scope_qualification.command_output_limitations[0].redacted, limited.native_activity.commands[0].output.redacted);
       }
     }
+  }
+  // Keep meter attacks separate from the two intentional valid-output edits
+  // above. Never repair a negative case through a shared fixture normalizer.
+  for (const tamper of [data => data.native_activity.record_bytes++,
+    data => data.native_activity.record_bytes = -1,
+    data => data.native_activity.record_bytes = '2',
+    data => data.native_activity.record_bytes = 2.5,
+    data => data.native_activity.commands[0].output.value += 'stale retained output']) {
+    const candidate = observedPacket('exact'); tamper(candidate);
+    const rejected = validateLocalReview(JSON.stringify(raw), value.contract, candidate, text => text);
+    assert.equal(rejected.overall, 'FAIL'); assert.equal(rejected.scope_qualification.status, 'failed');
+    assert(rejected.scope_qualification.blockers.includes('SCOPE_NATIVE_COVERAGE_UNCERTAIN'));
   }
   for (const candidate of [observedPacket(null, { exitCode: null }), observedPacket(null, {}, false), observedPacket(null, {}, true, false),
     observedPacket({}), observedPacket(null, { command: 'changed' }), observedPacket(null, { cwd: '/other' }),
