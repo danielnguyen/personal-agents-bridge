@@ -229,14 +229,15 @@ test('4 MiB ledger byte budget counts exactly and fails closed when full', () =>
 
 test('an omitted completion never fabricates results for the retained start', () => {
   const ledger = createLocalEvidence('task'); started(ledger);
-  for (let index = 0; index < 190; index++) {
-    const item = largeFileChange(index);
-    started(ledger, item); observe(ledger, notification(item));
-  }
+  // Simulate a saturated, already-retained ledger. The independent overflow
+  // test above proves genuine 4 MiB exhaustion; this focuses on a rejected
+  // completion rather than on constructing another multi-megabyte fixture.
+  ledger.record_bytes = LOCAL_RECORD_BYTES;
   observe(ledger, notification({ ...command, command: 'x'.repeat(2048), cwd: 'x'.repeat(1024), aggregatedOutput: '🙂'.repeat(2000) }));
-  assert(ledger.commands[0].missing.includes('completion')); assert.equal(ledger.commands[0].exit_code, null);
-  assert(ledger.omitted_events > 0);
-  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+  assert(ledger.commands[0].missing.includes('completion'));
+  assert.equal(ledger.commands[0].exit_code, null);
+  assert.equal(ledger.commands[0].completion_observed, false);
+  assert.equal(ledger.omitted_events, 1);
 });
 
 test('512 ordinary records fit without native omissions and size accounting survives completion', () => {
