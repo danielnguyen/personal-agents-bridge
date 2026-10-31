@@ -195,7 +195,7 @@ finally:
 
 export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, bound, spawnProcess = spawn }) {
   return new Promise(resolve => {
-    const output = { stdout: { chunks: [], captured_bytes: 0, bytes: 0 }, stderr: { chunks: [], captured_bytes: 0, bytes: 0 } };
+    const output = { stdout: { data: null, captured_bytes: 0, bytes: 0 }, stderr: { data: null, captured_bytes: 0, bytes: 0 } };
     let child, timer, grace, settled = false, closed = false, spawned = false, spawnFailed = false;
     const nonce = randomUUID();
     let timedOut = false, cancelled = signal?.aborted === true, background = false, exitCode = null, exitSignal = null;
@@ -205,7 +205,7 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
       settled = true; clearTimeout(timer); clearTimeout(grace); signal?.removeEventListener('abort', abort);
       const streams = Object.fromEntries(Object.entries(output).map(([name, value]) => {
         let text, encodingError = false;
-        const captured = Buffer.concat(value.chunks, value.captured_bytes);
+        const captured = value.data === null ? Buffer.alloc(0) : value.data.subarray(0, value.captured_bytes);
         try { text = new TextDecoder('utf-8', { fatal: true }).decode(captured); }
         catch { text = captured.toString('utf8'); encodingError = true; }
         let sanitized;
@@ -242,11 +242,10 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
       const value = output[name], remaining = Math.max(0, OUTPUT_LIMIT - value.captured_bytes);
       value.bytes += buffer.length;
       if (remaining > 0) {
-        // Copy only the bounded prefix; avoid retaining an oversized upstream chunk
-        // and repeated Buffer.concat work for large or heavily chunked output.
-        const captured = Buffer.from(buffer.subarray(0, remaining));
-        value.chunks.push(captured);
-        value.captured_bytes += captured.length;
+        // One lazily allocated fixed-size buffer per stream bounds allocation
+        // overhead even when a process emits millions of one-byte fragments.
+        if (value.data === null) value.data = Buffer.alloc(OUTPUT_LIMIT);
+        value.captured_bytes += buffer.copy(value.data, value.captured_bytes, 0, remaining);
       }
     });
     child.once('spawn', () => { spawned = true; if (cancelled) terminate(); });
