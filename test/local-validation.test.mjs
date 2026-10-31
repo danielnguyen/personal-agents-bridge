@@ -89,7 +89,7 @@ test('environment construction is an allowlist, not an inherited environment', (
 
 for (const [label, command, status] of [
   ['nonzero exit', 'printf failure >&2; exit 7', 'failed'],
-  ['truncated output', "python3 -B -c 'print(\"x\"*5000)'", 'incomplete'],
+  ['truncated output', "python3 -B -c 'print(\"x\"*(4*1024*1024+1))'", 'incomplete'],
   ['redacted output', "printf 'token=synthetic'", 'incomplete'],
   ['non-UTF8 output', "python3 -B -c 'import os; os.write(1,bytes([255]))'", 'incomplete'],
 ]) test(`independent ${label} cannot qualify as PASS`, async context => {
@@ -97,7 +97,7 @@ for (const [label, command, status] of [
   const [result] = await runner.run({ ...value, commands: [command], attemptId: 'attempt', onRecord: () => {} });
   assert.equal(result.status, status); assert.equal(result.completion_observed, true);
   if (label === 'nonzero exit') { assert.equal(result.exit_code, 7); assert.equal(result.stderr.text, 'failure'); }
-  if (label === 'truncated output') { assert.equal(result.stdout.truncated, true); assert(result.stdout.text.length <= 2048); }
+  if (label === 'truncated output') { assert.equal(result.stdout.truncated, true); assert.equal(result.stdout.text.length, 4 * 1024 * 1024); }
   if (label === 'redacted output') { assert.equal(result.stdout.redacted, true); assert(!result.stdout.text.includes('synthetic')); }
   if (label === 'non-UTF8 output') assert.equal(result.stdout.encoding_error, true);
 });
@@ -113,7 +113,7 @@ for (const action of ['timeout', 'cancel']) test(`independent ${action} terminat
   assert.equal(results[0].termination_confirmed, true); assert.equal(results[0].exit_code, null);
 });
 
-function observationFixture(events, { close = true, code = 0, observedSignal = null } = {}) {
+function observationFixture(events, { close = true, code = 0, observedSignal = null, stdout = [], stderr = [] } = {}) {
   const child = new EventEmitter(); child.pid = 424242; child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.stdio = [null, child.stdout, child.stderr, new PassThrough()];
   const kills = []; child.kill = signal => { kills.push(signal); return true; };
@@ -122,6 +122,8 @@ function observationFixture(events, { close = true, code = 0, observedSignal = n
     const request = JSON.parse(args.at(-1));
     queueMicrotask(() => {
       child.emit('spawn');
+      for (const chunk of Array.isArray(stdout) ? stdout : [stdout]) child.stdout.write(chunk);
+      for (const chunk of Array.isArray(stderr) ? stderr : [stderr]) child.stderr.write(chunk);
       for (const event of events) child.stdio[3].write(JSON.stringify({ nonce: request.nonce, ...event }) + '\n');
       if (close) child.emit('close', code, observedSignal);
     });
@@ -130,6 +132,108 @@ function observationFixture(events, { close = true, code = 0, observedSignal = n
 }
 const ownership = { event: 'ready', init_pid: 424243, namespace: 'pid:[123456]' };
 const completion = (command = { code: 0, background: false }) => ({ event: 'complete', termination_confirmed: true, command });
+
+const VALIDATION_CAPTURE_BYTES = 4 * 1024 * 1024;
+
+test('ordinary verbose test output above 2 KiB qualifies when complete and sanitized', async () => {
+  const output = 'test synthetic_case ... ok\n'.repeat(100);
+  assert(Buffer.byteLength(output) > 2048);
+  const fixture = observationFixture([ownership, completion()], { stderr: [output] });
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value,
+    spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'passed');
+  assert.equal(result.stderr.text, output);
+  assert.equal(result.stderr.bytes_observed, Buffer.byteLength(output));
+  assert.equal(result.stderr.truncated, false);
+  assert.equal(result.termination_confirmed, true);
+  assert.equal(result.exit_code, 0);
+});
+
+test('both streams retain exactly 4 MiB, including many small chunks', async () => {
+  const chunk = Buffer.alloc(4096, 's'), stdout = Array.from({ length: 1024 }, () => chunk);
+  const stderr = Buffer.alloc(VALIDATION_CAPTURE_BYTES, 'e');
+  const fixture = observationFixture([ownership, completion()], { stdout, stderr: [stderr] });
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value,
+    spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'passed');
+  for (const [stream, character] of [['stdout', 's'], ['stderr', 'e']]) {
+    assert.equal(result[stream].bytes_observed, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result[stream].text.length, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result[stream].text[0], character);
+    assert.equal(result[stream].text.at(-1), character);
+    assert.equal(result[stream].truncated, false);
+    assert.equal(result[stream].redacted, false);
+    assert.equal(result[stream].encoding_error, false);
+  }
+});
+
+test('adversarial one-byte fragments have bounded allocation overhead', async () => {
+  const fragment = Buffer.from('f');
+  const fragmentCount = 100_000;
+  const output = Array(fragmentCount).fill(fragment);
+  output.push(Buffer.alloc(VALIDATION_CAPTURE_BYTES - fragmentCount, 'z'));
+
+  // Detect per-fragment copies deterministically: the previous implementation
+  // allocated a distinct one-byte Buffer for every data event.
+  const originalFrom = Buffer.from;
+  let oneByteCopies = 0;
+  try {
+    Buffer.from = function (...args) {
+      if (Buffer.isBuffer(args[0]) && args[0].length === 1) oneByteCopies++;
+      return Reflect.apply(originalFrom, this, args);
+    };
+    const fixture = observationFixture([ownership, completion()], { stdout: output });
+    const result = await observeValidationProcess('synthetic', [], { timeoutMs: 10000, bound: value => value,
+      spawnProcess: fixture.spawnProcess });
+    assert.equal(result.status, 'passed');
+    assert.equal(result.stdout.bytes_observed, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result.stdout.text.length, VALIDATION_CAPTURE_BYTES);
+    assert.equal(result.stdout.text.slice(0, fragmentCount), 'f'.repeat(fragmentCount));
+    assert.equal(result.stdout.text.at(-1), 'z');
+    assert.equal(result.stdout.truncated, false);
+    assert.equal(result.stderr.text, '');
+    assert.equal(result.termination_confirmed, true);
+  } finally {
+    Buffer.from = originalFrom;
+  }
+  assert(oneByteCopies < 256, 'capturing one-byte fragments must not allocate one Buffer per fragment');
+});
+
+for (const stream of ['stdout', 'stderr']) {
+  test('output beyond 4 MiB on ' + stream + ' stays incomplete and never qualifies', async () => {
+    const output = Buffer.alloc(VALIDATION_CAPTURE_BYTES + 1, stream === 'stdout' ? 'a' : 'b');
+    const fixture = observationFixture([ownership, completion()], { [stream]: [output] });
+    const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value,
+      spawnProcess: fixture.spawnProcess });
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.exit_code, 0);
+    assert.equal(result.termination_confirmed, true);
+    assert.equal(result[stream].truncated, true);
+    assert.equal(result[stream].bytes_observed, VALIDATION_CAPTURE_BYTES + 1);
+    assert.equal(result[stream].text.length, VALIDATION_CAPTURE_BYTES);
+  });
+}
+
+test('larger capture still blocks redacted output and nonzero test failures', async () => {
+  const sensitive = 'token=synthetic\n'.repeat(150);
+  for (const [label, code, bound, status] of [
+    ['redacted', 0, value => value.replaceAll('token=synthetic', 'token=[REDACTED]'), 'incomplete'],
+    ['nonzero', 2, value => value, 'failed'],
+  ]) {
+    const fixture = observationFixture([ownership, completion({ code, background: false })], { stderr: [sensitive] });
+    const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound,
+      spawnProcess: fixture.spawnProcess });
+    assert.equal(result.status, status, label);
+    assert.equal(result.termination_confirmed, true);
+    assert.equal(result.stderr.bytes_observed, Buffer.byteLength(sensitive));
+    if (label === 'redacted') {
+      assert.equal(result.stderr.redacted, true);
+      assert(!result.stderr.text.includes('synthetic'));
+    } else {
+      assert.equal(result.exit_code, 2);
+    }
+  }
+});
 
 test('missing completion stays uncertain even after attempted termination', async () => {
   const fixture = observationFixture([ownership], { close: false });
@@ -226,9 +330,9 @@ print(json.dumps(dict(pid=os.getpid(),proc_pid=int(status['Pid']),ids=list(map(i
 
 for (const [label, script, flag] of [
   ['non-UTF8', 'import os; os.write(1,bytes([255]))', 'encoding_error'],
-  ['truncated', 'print("x"*5000)', 'truncated'],
+  ['truncated', 'print("x"*(4*1024*1024+1))', 'truncated'],
 ]) test(`real namespace ${label} output retains explicit incomplete evidence`, async () => {
-  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 3000, bound: value => value });
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 10000, bound: value => value });
   assert.equal(result.status, 'incomplete', JSON.stringify(result)); assert.equal(result.stdout[flag], true);
   assert.equal(result.exit_code, 0); assert.equal(result.background_processes_observed, false);
   assert.equal(result.termination_confirmed, true);
