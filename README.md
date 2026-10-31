@@ -537,10 +537,13 @@ The task's SQLite `local_validation` record is exposed under
 It retains the operation/task/attempt correlation, exact candidate tree and sampled
 Git state, per-command attempt and cwd identity, start intent/observations, completion,
 exit code/signal, timeouts, termination uncertainty, and redacted stdout/stderr.
-Output is capped at 2048 bytes per stream per command; truncation or redaction
-cannot qualify as verified passing evidence. At most ten 1000-character commands
-run, with a maximum 60-second process deadline each, also bounded by task expiration.
-Existing packet-size rejection remains in force; no evidence is silently discarded.
+Independent validation captures up to 4 MiB per stream per command; genuine
+truncation, sanitizer redaction or invalid encoding cannot qualify as verified
+passing evidence. Captures retain the observed byte count and remain bounded even
+when a command emits more output. At most ten 1000-character commands run, with a
+maximum 60-second process deadline each, also bounded by task expiration. The
+separate 64 MiB retained review-packet limit still rejects oversized aggregate
+evidence before reviewer creation; no evidence is silently discarded.
 
 Results are synchronously saved before packet construction. Candidate and normal
 checkout snapshots are compared after execution; mismatch blocks reviewer startup.
