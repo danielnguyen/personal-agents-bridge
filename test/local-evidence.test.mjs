@@ -37,6 +37,7 @@ test('moderate native activity retains essential command and file records despit
   started(ledger, file); observe(ledger, notification(file));
   assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
   assert.equal(ledger.commands.length, 13); assert.equal(ledger.file_changes.length, 1);
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
   assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
   for (const [index, record] of ledger.commands.entries()) {
     assert.equal(record.command.value, `printf fixture-${index}`); assert.equal(record.cwd.value, '/task');
@@ -49,7 +50,7 @@ test('moderate native activity retains essential command and file records despit
 
 test('essential evidence overflow and prohibited indications are not discarded to obtain complete coverage', () => {
   const ledger = createLocalEvidence('task');
-  for (let index = 0; index < 30; index++) {
+  for (let index = 0; index < LOCAL_RECORD_LIMIT + 20; index++) {
     const item = { ...command, id: `required-${index}`, command: 'git push ' + 'x'.repeat(1700), aggregatedOutput: null };
     started(ledger, item); observe(ledger, notification(item));
   }
@@ -193,20 +194,72 @@ test('duplicate, out-of-order, cross-thread/turn and invalid identity notificati
 
 test('record and UTF-8 byte limits retain explicit omission counters', () => {
   const ledger = createLocalEvidence('task');
-  for (let index = 0; index < 100; index++) observe(ledger, notification({ ...command, id: `cmd-${index}`, aggregatedOutput: '🙂'.repeat(2000) }));
+  for (let index = 0; index < LOCAL_RECORD_LIMIT + 20; index++) observe(ledger, notification({ ...command, id: `cmd-${index}`, aggregatedOutput: '🙂'.repeat(2000) }));
   assert(ledger.omitted_events > 0); assert(ledger.commands.length <= LOCAL_RECORD_LIMIT);
   assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
   const small = createLocalEvidence('task');
-  for (let index = 0; index < 100; index++) observe(small, notification({ id: `file-${index}`, type: 'fileChange' }));
+  for (let index = 0; index < LOCAL_RECORD_LIMIT + 20; index++) observe(small, notification({ id: `file-${index}`, type: 'fileChange' }));
   assert(small.file_changes.length <= LOCAL_RECORD_LIMIT); assert(small.omitted_events > 0);
+});
+
+// A long native file-change event can consume significantly more bytes than a
+// command. These are synthetic records, not reads from any browser or host.
+function largeFileChange(index) {
+  return { id: `large-change-${index}`, type: 'fileChange', status: 'completed',
+    changes: Array.from({ length: 16 }, (_, part) => ({
+      path: `/task/long-${index}-${part}-` + 'p'.repeat(970),
+      kind: { type: 'update' }, diff: '+' + 'd'.repeat(1000) })) };
+}
+
+test('4 MiB ledger byte budget counts exactly and fails closed when full', () => {
+  const ledger = createLocalEvidence('task');
+  let firstOmitted = null;
+  for (let index = 0; index < 190; index++) {
+    const item = largeFileChange(index);
+    started(ledger, item); observe(ledger, notification(item));
+    const measured = Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes]));
+    assert.equal(ledger.record_bytes, measured);
+    assert(measured <= LOCAL_RECORD_BYTES);
+    if (ledger.omitted_events && firstOmitted === null) firstOmitted = index;
+  }
+  assert(firstOmitted !== null, 'synthetic file changes must exhaust the byte budget');
+  assert(ledger.file_changes.length < LOCAL_RECORD_LIMIT);
+  assert(ledger.omitted_events > 0);
 });
 
 test('an omitted completion never fabricates results for the retained start', () => {
   const ledger = createLocalEvidence('task'); started(ledger);
-  for (let index = 0; index < 100; index++) observe(ledger, notification({ ...command, id: `cmd-${index}`, aggregatedOutput: 'x'.repeat(2048) }));
+  for (let index = 0; index < 190; index++) {
+    const item = largeFileChange(index);
+    started(ledger, item); observe(ledger, notification(item));
+  }
   observe(ledger, notification({ ...command, command: 'x'.repeat(2048), cwd: 'x'.repeat(1024), aggregatedOutput: '🙂'.repeat(2000) }));
   assert(ledger.commands[0].missing.includes('completion')); assert.equal(ledger.commands[0].exit_code, null);
   assert(ledger.omitted_events > 0);
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+});
+
+test('512 ordinary records fit without native omissions and size accounting survives completion', () => {
+  const ledger = createLocalEvidence('task');
+  for (let index = 0; index < LOCAL_RECORD_LIMIT; index++) {
+    const item = { ...command, id: `normal-${index}`,
+      command: `python3 -B check.py --case=${index}`, aggregatedOutput: '🙂'.repeat(64) };
+    started(ledger, item); observe(ledger, notification(item));
+  }
+  assert.equal(ledger.commands.length, LOCAL_RECORD_LIMIT);
+  assert.equal(ledger.omitted_events, 0);
+  assert.equal(ledger.rejected_events, 0);
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+  observe(ledger, notification({ ...command, id: 'one-more' }));
+  assert.equal(ledger.omitted_events, 1);
+  assert.equal(ledger.commands.length, LOCAL_RECORD_LIMIT);
+});
+
+test('byte meter fallback supports older retained records without inventing scope proof', () => {
+  const ledger = createLocalEvidence('task'); started(ledger); delete ledger.record_bytes;
+  observe(ledger, notification());
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+  assert.equal(ledger.omitted_events, 0);
 });
 
 for (const state of ['completed', 'interrupted', 'uncertain', 'failed']) test(`packet preserves ${state} execution and excludes model prose and human responses`, () => {
