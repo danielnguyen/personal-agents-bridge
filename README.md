@@ -181,17 +181,20 @@ checks bind baseline commit/tree, blob IDs, content SHA-256, lengths and modes a
 compare the candidate reference files against the baseline again. Context is
 untrusted source data, not reviewer instructions, runtime proof or independent
 validation. Existing contracts select no files implicitly; Agents API contracts
-do not support this optional field. The whole packet still has the same 128 KiB bound.
+do not support this optional field. The whole packet is independently bounded at 64 MiB.
 
-Native notification retention keeps the existing 24,576-byte/64-record budgets,
-but optional command output now retains at most 256 characters per event instead
-of 2,048. Missing, malformed, redacted, truncated and upstream-unverified output
+Native notification retention allows at most 4 MiB of record JSON and 512
+command/file-change records per local task, independently of the 64 MiB full
+review-packet budget. Record-array bytes are metered incrementally during
+native callbacks and verified again during review. Optional command output
+still retains at most 256 characters per event, independently of required
+command and file-change evidence. Missing, malformed, redacted, truncated and upstream-unverified output
 remain explicit; output-dependent requirements may still FAIL. Required command,
 identity, lifecycle, exit and file-operation fields are not reduced. Genuine
 essential-evidence overflow still increments `omitted_events` and blocks SCOPE.
 Previously omitted events cannot be reconstructed and historical FAILs are unchanged.
 
-Local evidence remains limited to 131,072 UTF-8 JSON bytes. When a full packet
+Local review packets remain limited to 64 MiB of UTF-8 JSON evidence. When a full packet
 overflows, the Controller may encode repeated complete-file patch bodies as
 `pab.exact-diff-references.v1` references into the existing baseline/current maps.
 Literal fragments retain all patch headers, modes, paths and unsupported/binary
@@ -364,12 +367,13 @@ controller before/after repository snapshots, current file hashes, unauthorized
 file detection and Git state checks. Agents API packet behavior is unchanged;
 native notifications never populate Agents API or file-RPC evidence structures.
 
-Limits: at most 64 command/file records together and 24 KiB of record JSON;
+Limits: at most 512 command/file records together and 4 MiB of record JSON;
 command text is bounded to 2048 characters and optional output to 256 characters,
-cwd to 1024, and file-change
-records to 16 entries with 1024-character paths/diffs. Overflow is counted, not
-silently treated as complete history. Packets share the existing 128 KiB UTF-8
-limit and reject overflow without dropping required sections. Sensitive text uses
+cwd to 1024, and each file-change record retains at most 16 changes with
+1024-character paths/diffs. Incremental byte accounting avoids repeated full
+ledger measurement, and scope qualification verifies the recorded byte count.
+Overflow remains counted and blocks scope qualification; review packets have a
+separate 64 MiB UTF-8 limit and reject overflow without losing required sections. Sensitive text uses
 existing controller redaction; evidence remains private operational data.
 Bounded output length/SHA-256 comparisons of UTF-8 JSON strings distinguish consistent start/completion
 prefixes from conflicts beyond the retained text. Truncation still does not imply
@@ -1043,9 +1047,10 @@ Retained packet metadata remains available after cleanup/restart where saved.
 Candidate metadata requires the existing hash-checked packet, authorized file scope
 and recorded Git tree/contract binding. Live source is never read for disclosure.
 Private future model-message retention remains bounded to 16 messages of 4096
-characters per role; command observations to 64 records/24 KiB with 2048 characters
-per stream. Reporting is bounded to 64 history observations, 16 previous reviewers
-and 512 KiB per section. These limits do not invent historical evidence or remove
+characters per role; local native command/file-change observations to 512 records
+and 4 MiB of serialized records, with command text bounded at 2048 characters and
+optional output at 256. Reporting remains bounded to 64 history observations,
+16 previous reviewers and 512 KiB per evidence section. These limits do not invent historical evidence or remove
 the runtime confidentiality limitations in SECURITY.md.
 
 [Tool schemas and contracts](docs/TOOLS.md) describe scope, costs, retries, review
