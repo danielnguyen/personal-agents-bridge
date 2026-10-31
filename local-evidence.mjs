@@ -2,8 +2,10 @@ import { PACKET_LIMIT, NEW_PACKET_LIMIT, INLINE_REVIEW_OPTIMIZATION_BYTES, packe
 import { createHash } from 'node:crypto';
 
 export const LOCAL_EVIDENCE_VERSION = 'pab.local-codex-review.v1';
-export const LOCAL_RECORD_LIMIT = 64;
-export const LOCAL_RECORD_BYTES = 24576;
+// Native command/file-change retention is separate from the 64 MiB review-packet cap.
+// Store the serialized record-array length incrementally to avoid quadratic remeasurement.
+export const LOCAL_RECORD_LIMIT = 512;
+export const LOCAL_RECORD_BYTES = 4 * 1024 * 1024;
 export const LOCAL_OUTPUT_LIMIT = 256;
 export const LOCAL_REFERENCE_LIMIT = 4;
 export const LOCAL_REFERENCE_BYTES = 32768;
@@ -13,7 +15,7 @@ const outputHash = value => createHash('sha256').update(JSON.stringify(value), '
 
 export function createLocalEvidence(taskId) {
   return { version: 1, task_id: taskId, provenance: 'controller_retained_codex_app_server_notifications',
-    commands: [], file_changes: [], rejected_events: 0, omitted_events: 0,
+    commands: [], file_changes: [], record_bytes: 2, rejected_events: 0, omitted_events: 0,
     exhaustive: false, output_completeness: 'unverified',
     limitations: ['Notifications are not independent command or filesystem verification.',
       'Missing notifications and operations outside these channels cannot be ruled out.',
@@ -94,11 +96,19 @@ export function observeLocalEvidence(ledger, event, identity, bound) {
     if (record.start_completion_conflict) record.start_changes = previous.changes;
   }
   const total = ledger.commands.length + ledger.file_changes.length;
-  const bytes = size([...ledger.commands, ...ledger.file_changes]) - (previous ? size(previous) + 1 : 0) + size(record) + 1;
+  // JSON array bytes: brackets (2), each serialized record, and one comma
+  // between adjacent records. A completed event replaces its existing start.
+  // Legacy ledgers without the meter remain readable; only the size check
+  // falls back to a full measurement.
+  const retainedBytes = Number.isSafeInteger(ledger.record_bytes) && ledger.record_bytes >= 2
+    ? ledger.record_bytes : size([...ledger.commands, ...ledger.file_changes]);
+  const bytes = retainedBytes + size(record) - (previous ? size(previous) : 0) +
+    (!previous && total > 0 ? 1 : 0);
   if ((!previous && total >= LOCAL_RECORD_LIMIT) || bytes > LOCAL_RECORD_BYTES) {
     ledger.omitted_events = count(ledger.omitted_events); return true;
   }
   if (previous) records[index] = record; else records.push(record);
+  ledger.record_bytes = bytes;
   return true;
 }
 
