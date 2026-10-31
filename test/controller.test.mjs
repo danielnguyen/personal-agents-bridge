@@ -663,7 +663,7 @@ test('single correction authorization accepts only explicit local versioned 3/1 
     max_duration_seconds: 120, max_codex_turns: 3, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
   assert.equal(c.automaticAuthorization(input).max_corrections, 1);
   for (const changes of [{ max_codex_turns: 2 }, { max_codex_turns: 5 }, { max_corrections: 0 }, { max_corrections: 2 },
-    { review_protocol: undefined }, { review_protocol: 'legacy' }, { max_duration_seconds: 901 }])
+    { review_protocol: undefined }, { review_protocol: 'legacy' }, { max_duration_seconds: 14401 }])
     assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...changes } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
   for (const changes of [{ execution_backend: 'agents_api' }, { repository_id: undefined }])
     assert.throws(() => c.automaticAuthorization({ ...input, ...changes }), /INVALID_AUTOMATIC_AUTHORIZATION/);
@@ -707,7 +707,7 @@ test('four-turn authorization accepts only explicit versioned local repository 4
     publish: { title: 'Fixture', draft: true }, max_duration_seconds: 120, max_codex_turns: 4, max_corrections: 1, review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } };
   assert.equal(c.automaticAuthorization(input).max_codex_turns, 4);
   for (const change of [{ max_codex_turns: 5 }, { max_corrections: 0 }, { max_corrections: 2 }, { review_protocol: undefined },
-    { review_protocol: 'v1' }, { authorize_review: true }, { max_duration_seconds: 901 }])
+    { review_protocol: 'v1' }, { authorize_review: true }, { max_duration_seconds: 14401 }])
     assert.throws(() => c.automaticAuthorization({ ...input, automatic: { ...input.automatic, ...change } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
   for (const change of [{ execution_backend: undefined }, { execution_backend: 'agents_api' }, { repository_id: undefined }])
     assert.throws(() => c.automaticAuthorization({ ...input, ...change }), /INVALID_AUTOMATIC_AUTHORIZATION/);
@@ -3433,4 +3433,36 @@ test(`safe restart expiry still cancels owned resources with ${fault}`, async t 
     assert.equal(read(id).automatic.status, 'succeeded');
     assert.equal(read(id).cleanup, undefined);
   } finally { c.task = read; c.transactionUnresolved = false; }
+});
+
+
+for (const seconds of [7200, 14400])
+test(`long automatic ${seconds} corrections and independent reviewers inherit original time authority`, async t => {
+  let originalDeadline; const backends = [], validations = []; const now = Date.now(); let clock = now;
+  t.mock.method(Date, 'now', () => clock);
+  const value = await automaticAttempt(t, { versioned: true, postReview: true, requiredValidation: true,
+    configure(c, input) {
+      c.timeoutMs = 900000; input.automatic.max_duration_seconds = seconds; input.automatic.validation_timeout_seconds = 600;
+      const backendFactory = c.localBackendFactory, validationFactory = c.localValidationFactory;
+      c.localBackendFactory = options => { backends.push({ options, at: clock }); return backendFactory(options); };
+      c.localValidationFactory = options => { validations.push({ options, at: clock }); return validationFactory(options); };
+    },
+    beforeCorrection(c, options) { originalDeadline = c.db.prepare('SELECT value FROM tasks').all().map(row => JSON.parse(row.value)).find(task => !task.correction).deadline; clock += 900001; },
+    beforeCorrectiveReview() { clock += 1000; },
+  });
+  const { c, id } = value, parent = c.task(id), child = c.task(parent.automatic.correction.task_id);
+  assert.equal(parent.deadline, now + seconds * 1000); assert.equal(originalDeadline, parent.deadline);
+  assert.equal(child.deadline, parent.deadline); assert.equal(child.automatic.deadline, parent.deadline);
+  assert.equal(child.correction.authorization_sha256, digest(parent.automatic.authorization));
+  assert.deepEqual(child.automatic.authorization, parent.automatic.authorization);
+  assert.equal(child.automatic.review_authorization.authorization_sha256, digest(parent.automatic.authorization));
+  assert.deepEqual(value.calls, ['implementer', 'reviewer', 'corrector', 'corrective-reviewer']);
+  assert.equal(backends.length, 4); assert.equal(validations.length, 2);
+  for (const { options, at } of backends) assert.equal(options.timeoutMs, parent.deadline - at);
+  for (const { options, at } of validations) {
+    assert.equal(options.timeoutMs, parent.deadline - at); assert.equal(options.commandTimeoutMs, 600000); assert.equal(options.deadline, parent.deadline);
+  }
+  assert.equal(child.reviewer.review_result.overall, 'PASS'); assert.deepEqual(value.publisherCalls, []);
+  const changed = structuredClone(parent); changed.automatic.authorization.validation_timeout_seconds = 60;
+  assert.throws(() => c.automaticGuard(changed), /LOCAL_REVIEW_PROTOCOL_CHANGED/);
 });

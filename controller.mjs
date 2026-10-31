@@ -1074,18 +1074,21 @@ export class Controller {
     if (input.automatic === undefined) return undefined;
     const value = input.automatic, plain = object => object && typeof object === 'object' && !Array.isArray(object);
     if (input.execution_backend !== 'local_codex' || !input.repository_id || !plain(value) ||
-        Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol', 'publish_after_correction'].includes(key)) ||
+        Object.keys(value).some(key => !['publish', 'max_duration_seconds', 'max_codex_turns', 'max_corrections', 'review_protocol', 'publish_after_correction', 'validation_timeout_seconds'].includes(key)) ||
         (Object.hasOwn(value, 'publish_after_correction') && (value.publish_after_correction !== true || value.max_codex_turns !== 4 ||
           value.max_corrections !== 1 || value.review_protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION)) ||
         (Object.hasOwn(value, 'review_protocol') && value.review_protocol !== LOCAL_ACTIONABILITY_REVIEW_VERSION) ||
         !((value.max_codex_turns === 2 && value.max_corrections === 0) ||
           ([3, 4].includes(value.max_codex_turns) && value.max_corrections === 1 && value.review_protocol === LOCAL_ACTIONABILITY_REVIEW_VERSION)) || !Number.isInteger(value.max_duration_seconds) ||
-        value.max_duration_seconds < 1 || value.max_duration_seconds > 900 || !plain(value.publish) ||
+        value.max_duration_seconds < 1 || value.max_duration_seconds > 14400 ||
+        (Object.hasOwn(value, 'validation_timeout_seconds') && (!Number.isInteger(value.validation_timeout_seconds) ||
+          value.validation_timeout_seconds < 1 || value.validation_timeout_seconds > 600)) || !plain(value.publish) ||
         Object.keys(value.publish).some(key => !['title', 'body', 'draft'].includes(key)) || value.publish.draft !== true ||
         typeof value.publish.title !== 'string' || !value.publish.title.trim() || value.publish.title.length > 200 || /[\x00-\x1f]/.test(value.publish.title) ||
         (value.publish.body !== undefined && (typeof value.publish.body !== 'string' || value.publish.body.length > 16000))) throw new BridgeError('INVALID_AUTOMATIC_AUTHORIZATION');
     this.rejectSecret(value);
     return { publish: { title: value.publish.title, body: value.publish.body || '', draft: true },
+      ...(Object.hasOwn(value, 'validation_timeout_seconds') ? { validation_timeout_seconds: value.validation_timeout_seconds } : {}),
       max_duration_seconds: value.max_duration_seconds, max_codex_turns: value.max_codex_turns, max_corrections: value.max_corrections,
       ...(value.review_protocol ? { review_protocol: value.review_protocol } : {}),
       ...(value.publish_after_correction === true ? { publish_after_correction: true } : {}) };
@@ -2129,7 +2132,7 @@ export class Controller {
     const t = { id, execution_backend, created: Date.now(), deadline: Date.now() + this.timeoutMs, baseline: repository?.baseline_commit || null, ...(repository ? { repository } : {}), implementer: { state: 'starting' }, request_id,
       evidence_contract: { sha256: digest(contract), contract }, ...(revision ? { revision } : {}) };
     if (automatic) {
-      t.deadline = t.created + Math.min(this.timeoutMs, automatic.max_duration_seconds * 1000);
+      t.deadline = t.created + automatic.max_duration_seconds * 1000;
       t.automatic = { authorization: automatic, status: 'progressing', phase: 'implementation', reason: null,
         contract_binding: { sha256: digest(contract), contract },
         deadline: t.deadline, owner_instance: this.instanceId, human_attention_required: false,
@@ -3688,7 +3691,10 @@ export class Controller {
     const normal = await checkoutSnapshot(task.repository.canonical_path, this.bounded.bind(this));
     if (normal.status !== 'captured') throw new BridgeError('VALIDATION_NORMAL_SNAPSHOT_UNAVAILABLE');
     if (this.closed || this.task(id).reviewer.stopping) return;
-    const runner = this.localValidationFactory({ root, timeoutMs: this.executionTimeout(this.task(id)), bound: this.bounded.bind(this) });
+    task = this.task(id);
+    const runner = this.localValidationFactory({ root, timeoutMs: this.executionTimeout(task),
+      ...(task.automatic ? { commandTimeoutMs: (task.automatic.authorization.validation_timeout_seconds ?? 60) * 1000,
+        deadline: task.deadline } : {}), bound: this.bounded.bind(this) });
     this.validationRuns.set(id, runner);
     if (task.correction) this.validationRuns.set(task.correction.parent_task_id, runner);
     task = this.task(id); task.local_validation.status = 'running'; this.save(task);

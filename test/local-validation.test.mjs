@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs, readFileSync, readdirSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -534,4 +535,43 @@ test('only complete independent exact-tree evidence may remove TEST_EVIDENCE flo
     { evidence_version: LOCAL_EVIDENCE_VERSION, execution: { task_id: 'task-fixture' }, independent_validation: validation, reviewed_git_state: reviewed }, value => value);
   assert.equal(result.overall, 'FAIL'); assert.deepEqual(result.controller_overrides, ['SCOPE']);
   assert.equal(result.findings.find(finding => finding.id === 'TEST_EVIDENCE').status, 'PASS');
+});
+
+
+for (const explicit of [false, true])
+test(`validation ${explicit ? 'explicit ten-minute' : 'legacy one-minute'} timeout is applied to processes and recalculated after preparation`, async context => {
+  const value = await fixture(context), now = Date.now(), deadline = now + 7200000;
+  let clock = now, spawns = 0; const timeouts = [];
+  context.mock.method(Date, 'now', () => clock);
+  const originalTimeout = globalThis.setTimeout;
+  context.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+    timeouts.push(milliseconds); return originalTimeout(callback, milliseconds, ...args);
+  });
+  context.mock.method(childProcess, 'spawn', (...args) => {
+    spawns++; return observationFixture([ownership, completion()]).spawnProcess(...args);
+  });
+  syncBuiltinESMExports();
+  context.after(() => { context.mock.restoreAll(); syncBuiltinESMExports(); });
+  const runner = new LocalValidation({ root: value.root, timeoutMs: 7200000, deadline,
+    ...(explicit ? { commandTimeoutMs: 600000 } : {}) });
+  const results = await runner.run({ ...value, commands: ['first', 'second', 'expired'], attemptId: 'original', onRecord(record) {
+    if (record.command_index === 0 && record.status === 'preparing') clock += 1000;
+    if (record.command_index === 0 && record.status === 'passed') clock = deadline - 50;
+    if (record.command_index === 1 && record.status === 'preparing') clock = deadline - 25;
+    if (record.command_index === 1 && record.status === 'running') clock += 5;
+    if (record.command_index === 2 && record.status === 'preparing') clock = deadline;
+  } });
+  assert.deepEqual(timeouts, [explicit ? 600000 : 60000, 20]);
+  assert.equal(spawns, 2); assert.deepEqual(results.map(result => result.status), ['passed', 'passed', 'timed_out']);
+  assert.equal(results[2].start_attempted, false); assert.equal(results[2].timeout, true);
+  assert.equal(runner.terminationConfirmed, true);
+});
+
+test('validation hard maximum rejects oversized or malformed command budgets before process execution', () => {
+  for (const commandTimeoutMs of [0, -1, 600001, 0.5, NaN, Infinity, '600000', null]) {
+    assert.throws(() => new LocalValidation({ root: '/unused', timeoutMs: 7200000, commandTimeoutMs }), /VALIDATION_TIMEOUT_INVALID/);
+  }
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 14400000, commandTimeoutMs: 600000 }).timeoutMs, 600000);
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 900000 }).timeoutMs, 60000);
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 500, commandTimeoutMs: 600000 }).timeoutMs, 500);
 });

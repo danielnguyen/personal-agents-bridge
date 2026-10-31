@@ -73,7 +73,7 @@ may instead authorize the entire successful local-Codex path in one `start_task`
   },
   "automatic": {
     "publish": {"title": "Add answer fixture", "body": "Implement the authorized fixture.", "draft": true},
-    "max_duration_seconds": 900,
+    "max_duration_seconds": 7200,
     "max_codex_turns": 2,
     "max_corrections": 0
   }
@@ -91,8 +91,13 @@ All automatic fields are strictly checked and included in request fingerprinting
 Only explicit `local_codex` repository tasks qualify. The metadata authorizes one
 draft PR, never merge, deployment, another repository or additional scope. Bounds
 are at most two submitted Codex turns (one implementer and one reviewer), zero
-corrections and an overall 1–900 second deadline, also capped by the Controller's
-configured task timeout. Review does not renew that deadline. These are turn/time
+corrections and an explicit overall 1–14400 second deadline. For substantial
+engineering tasks, authorize 7200 seconds (two hours); explicitly select 14400
+seconds (four hours) when needed. Automatic tasks receive the full requested
+duration independently of the manual Controller timeout (15 minutes by default).
+The original deadline covers implementation, validation, review, correction and
+publication, and never renews on a later stage or restart. Existing tasks keep
+their persisted deadlines and authority. These are turn/time
 limits, not token or monetary metering; token usage and billing attribution remain
 unknown. Agents API remains the default and its legacy fingerprints are unchanged.
 
@@ -545,8 +550,14 @@ Independent validation captures up to 4 MiB per stream per command; genuine
 truncation, sanitizer redaction or invalid encoding cannot qualify as verified
 passing evidence. Captures retain the observed byte count and remain bounded even
 when a command emits more output. At most ten 1000-character commands run, with a
-maximum 60-second process deadline each, also bounded by task expiration. The
-separate 64 MiB retained review-packet limit still rejects oversized aggregate
+maximum 60-second process deadline each by default. Automatic tasks may explicitly
+set `automatic.validation_timeout_seconds` to an integer from 1 through 600
+seconds (ten minutes); this original authorization also binds corrective validation
+and review. Each command is bounded by that limit, the hard 600-second maximum,
+and the remaining original task deadline, recalculated after preparation and before
+each command. Manual validation retains its existing 60-second maximum. Longer
+authorizations can hold task slots and processes longer; output/storage limits
+and turn counts are unchanged. The separate 64 MiB retained review-packet limit still rejects oversized aggregate
 evidence before reviewer creation; no evidence is silently discarded.
 
 Results are synchronously saved before packet construction. Candidate and normal

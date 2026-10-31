@@ -289,8 +289,10 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
 }
 
 export class LocalValidation {
-  constructor({ root, binary = process.env.CODEX_BINARY || `${homedir()}/.local/bin/codex`, timeoutMs = 60000, bound = value => value }) {
-    this.root = root; this.binary = binary; this.timeoutMs = Math.min(timeoutMs, 60000); this.bound = bound;
+  constructor({ root, binary = process.env.CODEX_BINARY || `${homedir()}/.local/bin/codex`, timeoutMs = 60000, commandTimeoutMs = 60000, deadline, bound = value => value }) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(commandTimeoutMs) || commandTimeoutMs < 1 || commandTimeoutMs > 600000 ||
+        (deadline !== undefined && !Number.isSafeInteger(deadline))) fail('VALIDATION_TIMEOUT_INVALID');
+    this.root = root; this.binary = binary; this.timeoutMs = Math.min(timeoutMs, commandTimeoutMs, 600000); this.deadline = deadline; this.bound = bound;
     this.abort = new AbortController(); this.terminationConfirmed = true;
   }
   cancel() { this.abort.abort(); }
@@ -326,11 +328,16 @@ export class LocalValidation {
         const env = validationEnvironment(control), commandEnv = validationEnvironment(scratch);
         const args = ['sandbox', '-c', `permissions=${table}`, '-P', 'bridge_task', '-C', control, '--', '/usr/bin/env', '-i',
           ...Object.entries(commandEnv).map(([name, value]) => `${name}=${value}`), '/bin/sh', '-c', 'cd -- "$1" && exec /bin/sh -c "$2"', 'pab-validation', cwd, command];
+        // Preparation and prior commands consume the same original task budget.
+        let timeoutMs = Math.min(this.timeoutMs, this.deadline === undefined ? Infinity : this.deadline - Date.now());
+        if (timeoutMs <= 0) { record.status = 'timed_out'; record.timeout = true; persist(record); break; }
         record.status = 'running'; record.start_attempted = true; record.started_at = new Date().toISOString();
         persist(record);
+        timeoutMs = Math.min(timeoutMs, this.deadline === undefined ? Infinity : this.deadline - Date.now());
+        if (timeoutMs <= 0) { record.status = 'timed_out'; record.timeout = true; persist(record); break; }
         this.terminationConfirmed = false;
         const observed = await observeValidationProcess(this.binary, args, { cwd: control, env, signal: this.abort.signal,
-          timeoutMs: this.timeoutMs, bound: this.bound });
+          timeoutMs, bound: this.bound });
         this.terminationConfirmed = observed.termination_confirmed;
         Object.assign(record, observed, { completed_at: new Date().toISOString() });
       } catch (error) {
