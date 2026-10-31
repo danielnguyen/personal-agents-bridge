@@ -4,7 +4,7 @@ import { localReviewerInstructions, validateLocalReview, localContractBinding, l
   LOCAL_ACTIONABILITY_REVIEW_VERSION, localActionabilityReviewerInstructions, validateLocalActionabilityReview } from '../local-reviewer-instructions.mjs';
 import { contractMarkdown, digest } from '../controller.mjs';
 import { contract } from './helpers.mjs';
-import { LOCAL_EVIDENCE_VERSION, createLocalEvidence } from '../local-evidence.mjs';
+import { LOCAL_EVIDENCE_VERSION, createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 const input = () => ({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Claim based on packet facts' })) });
 const packet = { evidence_version: LOCAL_EVIDENCE_VERSION, independent_validation: { status: 'unavailable' } };
@@ -169,6 +169,115 @@ function actionabilityCase(ids = ['R2']) {
   return { value, packet: data, raw, context,
     validate() { return validateLocalActionabilityReview(JSON.stringify(raw), value, data, text => text, context); } };
 }
+
+// Literal acceptance workloads, deliberately independent of runtime limits.
+// All packets retain Controller identity, registration, tree and validation proof.
+function nativeScopeWorkload({ commandCount = 12, fileCount = 4, large = false, alterEvent = event => event } = {}) {
+  const fixture = actionabilityCase([]), { packet, value } = fixture;
+  value.allowed_files = ['greeting.txt', 'lib/message.mjs', 'test/message.test.mjs', 'README.md'];
+  const binding = boundContractPacket(value);
+  packet.contract = binding.contract; packet.contract_binding = binding.contract_binding;
+  packet.local_scope.contract_sha256 = binding.local_scope.contract_sha256;
+  packet.changed_files = [...value.allowed_files];
+  const ledger = packet.native_activity;
+  const identity = { thread_id: packet.execution.thread_id, turn_id: packet.execution.turn_id };
+  const record = (item, method) => {
+    const event = alterEvent({ method, params: { threadId: identity.thread_id, turnId: identity.turn_id, item } });
+    if (event) observeLocalEvidence(ledger, event, identity, text => text);
+  };
+  const commands = ['pwd', 'git status --short', 'cat greeting.txt', 'cat lib/message.mjs',
+    'cat test/message.test.mjs', 'cat README.md', 'node --check lib/message.mjs',
+    'node --test test/message.test.mjs', 'node check.mjs',
+    'git diff -- greeting.txt lib/message.mjs test/message.test.mjs README.md',
+    'git diff --check', 'git status --porcelain=v1'];
+  for (let index = 0; index < commandCount; index++) {
+    const item = { id: `cmd-${index}`, type: 'commandExecution',
+      command: commands[index % 12], cwd: '/fixture/worktree', status: 'completed', exitCode: 0,
+      aggregatedOutput: '検証結果\n'.repeat(2000) };
+    record({ ...item, status: 'inProgress', aggregatedOutput: '検証結果\n' }, 'item/started');
+    record(item, 'item/completed');
+  }
+  for (let index = 0; index < fileCount; index++) {
+    const item = { id: `change-${index}`, type: 'fileChange', status: 'completed',
+      changes: Array.from({ length: large ? 16 : 1 }, (_, part) => ({
+        path: `/fixture/worktree/${value.allowed_files[(index + part) % 4]}`, kind: { type: 'update' },
+        diff: '+仕様と検証の更新\n'.repeat(100).slice(0, 1024) })) };
+    record({ ...item, status: 'inProgress' }, 'item/started'); record(item, 'item/completed');
+  }
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+  return { ...fixture, record };
+}
+
+function assertScopePass(fixture) {
+  const result = fixture.validate();
+  assert.equal(result.overall, 'PASS', JSON.stringify(result.scope_qualification));
+  assert.deepEqual(result.controller_overrides, []); assert.equal(result.scope_qualification.status, 'qualified');
+  assert.equal(fixture.packet.native_activity.omitted_events, 0); assert.equal(fixture.packet.native_activity.rejected_events, 0);
+}
+function assertScopeFail(fixture, blocker) {
+  const result = fixture.validate();
+  assert.equal(result.overall, 'FAIL'); assert.equal(result.findings.find(finding => finding.id === 'SCOPE').status, 'FAIL');
+  assert.deepEqual(result.controller_overrides, ['SCOPE']); assert.equal(result.scope_qualification.status, 'failed');
+  assert(result.scope_qualification.blockers.includes(blocker), JSON.stringify(result.scope_qualification.blockers));
+}
+
+test('12-command/four-file workload exceeds the former 24 KiB ledger and qualifies with identity/scope proof', () => {
+  const fixture = nativeScopeWorkload(), ledger = fixture.packet.native_activity;
+  assert.equal(ledger.commands.length, 12); assert.equal(ledger.file_changes.length, 4);
+  assert.equal(new Set(ledger.file_changes.flatMap(record => record.changes.map(change => change.path.value))).size, 4);
+  assert(ledger.record_bytes > 24_576);
+  assert(ledger.commands.every(record => record.start_observed && record.completion_observed && !record.start_completion_conflict));
+  assertScopePass(fixture);
+});
+
+test('512 distinct native records qualify SCOPE; fixed record 513 fails closed', () => {
+  const fixture = nativeScopeWorkload({ commandCount: 512, fileCount: 0 }), ledger = fixture.packet.native_activity;
+  assert.equal(ledger.commands.length, 512); assert.equal(new Set(ledger.commands.map(record => record.item_id)).size, 512);
+  assertScopePass(fixture);
+  fixture.record({ id: 'record-513', type: 'commandExecution', command: 'pwd', cwd: '/fixture/worktree',
+    status: 'completed', exitCode: 0, aggregatedOutput: '' }, 'item/completed');
+  assert.equal(ledger.commands.length, 512); assert.equal(ledger.omitted_events, 1);
+  assertScopeFail(fixture, 'SCOPE_NATIVE_COVERAGE_UNCERTAIN');
+});
+
+test('fixed multi-megabyte native workload qualifies SCOPE above a 1 MiB ceiling', () => {
+  const fixture = nativeScopeWorkload({ fileCount: 64, large: true }), ledger = fixture.packet.native_activity;
+  assert.equal(ledger.commands.length, 12); assert.equal(ledger.file_changes.length, 64);
+  assert(ledger.record_bytes > 1_048_576); assert(ledger.record_bytes < 4_194_304);
+  assertScopePass(fixture);
+  delete ledger.record_bytes; // legacy retained ledgers still need all other proof
+  assertScopePass(fixture);
+});
+
+for (const [label, alter, blocker] of [
+  ['missing start', event => event.params.item.id === 'cmd-0' && event.method === 'item/started' ? null : event, 'SCOPE_NATIVE_IDENTITY_OR_COMPLETION'],
+  ['missing completion', event => event.params.item.id === 'cmd-0' && event.method === 'item/completed' ? null : event, 'SCOPE_NATIVE_IDENTITY_OR_COMPLETION'],
+  ['conflicting completion', event => { if (event.params.item.id === 'cmd-0' && event.method === 'item/completed') event.params.item.command = 'cat README.md'; return event; }, 'SCOPE_COMMAND_UNCERTAIN'],
+  ['prohibited command', event => { if (event.params.item.id === 'cmd-0') event.params.item.command = 'git push origin HEAD'; return event; }, 'SCOPE_PROHIBITED_GIT_INDICATION'],
+  ['outside command cwd', event => { if (event.params.item.id === 'cmd-0') event.params.item.cwd = '/outside'; return event; }, 'SCOPE_COMMAND_UNCERTAIN'],
+  ['outside file', event => { if (event.params.item.id === 'change-0') event.params.item.changes[0].path = '/outside/file.txt'; return event; }, 'SCOPE_UNAUTHORIZED_WRITE_INDICATION'],
+  ['protected file', event => { if (event.params.item.id === 'change-0') event.params.item.changes[0].path = '/fixture/worktree/TASK.md'; return event; }, 'SCOPE_UNAUTHORIZED_WRITE_INDICATION'],
+  ['foreign thread', event => { if (event.params.item.id === 'cmd-0') event.params.threadId = 'foreign'; return event; }, 'SCOPE_NATIVE_COVERAGE_UNCERTAIN'],
+  ['foreign turn', event => { if (event.params.item.id === 'cmd-0') event.params.turnId = 'foreign'; return event; }, 'SCOPE_NATIVE_COVERAGE_UNCERTAIN'],
+]) test(`capacity workload cannot mask ${label}`, () => {
+  assertScopeFail(nativeScopeWorkload({ alterEvent: alter }), blocker);
+});
+
+test('genuine byte exhaustion still blocks SCOPE with retained records', () => {
+  const fixture = nativeScopeWorkload({ fileCount: 160, large: true }), ledger = fixture.packet.native_activity;
+  assert(ledger.record_bytes > 1_048_576); assert(ledger.record_bytes <= 4_194_304);
+  assert(ledger.file_changes.length < 160); assert(ledger.omitted_events > 0);
+  assertScopeFail(fixture, 'SCOPE_NATIVE_COVERAGE_UNCERTAIN');
+});
+
+for (const [label, tamper] of [
+  ['stale meter', ledger => ledger.record_bytes++], ['negative meter', ledger => ledger.record_bytes = -1],
+  ['noninteger meter', ledger => ledger.record_bytes = 2.5], ['string meter', ledger => ledger.record_bytes = '2'],
+  ['retained output changed after capture', ledger => ledger.commands[0].output.value += 'changed'],
+]) test(`capacity workload rejects ${label} without repairing it`, () => {
+  const fixture = nativeScopeWorkload(); tamper(fixture.packet.native_activity);
+  assertScopeFail(fixture, 'SCOPE_NATIVE_COVERAGE_UNCERTAIN');
+});
 
 test('versioned concrete permitted implementation defect qualifies only as a non-executable assessment', () => {
   const fixture = actionabilityCase(), result = fixture.validate();

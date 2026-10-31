@@ -1,4 +1,4 @@
-import { LOCAL_EVIDENCE_VERSION, reconstructLocalDiff, localReferencesValid } from './local-evidence.mjs';
+import { LOCAL_EVIDENCE_VERSION, LOCAL_RECORD_BYTES, LOCAL_RECORD_LIMIT, reconstructLocalDiff, localReferencesValid } from './local-evidence.mjs';
 import { independentValidationPassed } from './local-validation.mjs';
 import { compareSnapshots } from './review-evidence.mjs';
 import { createHash } from 'node:crypto';
@@ -77,7 +77,11 @@ export function localScopeQualification(contract, packet) {
   const native = packet.native_activity;
   require(native?.provenance === 'controller_retained_codex_app_server_notifications' && native.version === 1 && native.task_id === execution?.task_id &&
     native.rejected_events === 0 && native.omitted_events === 0 && native.exhaustive === false && native.output_completeness === 'unverified' &&
-    Array.isArray(native.commands) && Array.isArray(native.file_changes), 'SCOPE_NATIVE_COVERAGE_UNCERTAIN');
+    Array.isArray(native.commands) && Array.isArray(native.file_changes) &&
+    native.commands.length + native.file_changes.length <= LOCAL_RECORD_LIMIT &&
+    (native.record_bytes === undefined || (Number.isSafeInteger(native.record_bytes) &&
+      native.record_bytes === Buffer.byteLength(JSON.stringify([...native.commands, ...native.file_changes])) &&
+      native.record_bytes <= LOCAL_RECORD_BYTES)), 'SCOPE_NATIVE_COVERAGE_UNCERTAIN');
   for (const record of [...(Array.isArray(native?.commands) ? native.commands : []), ...(Array.isArray(native?.file_changes) ? native.file_changes : [])]) {
     if (!record || typeof record !== 'object') { require(false, 'SCOPE_NATIVE_RECORD_INVALID'); continue; }
     require(record.provenance === 'codex_app_server_notification' && record.task_id === execution?.task_id && record.thread_id === execution?.thread_id &&

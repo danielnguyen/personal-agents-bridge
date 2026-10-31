@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalEvidence, observeLocalEvidence, localTestCorrelation, localEvidencePacket, budgetLocalPacket,
-  LOCAL_EVIDENCE_VERSION, LOCAL_RECORD_BYTES, LOCAL_RECORD_LIMIT, LOCAL_OUTPUT_LIMIT } from '../local-evidence.mjs';
+  LOCAL_EVIDENCE_VERSION, LOCAL_RECORD_BYTES, LOCAL_OUTPUT_LIMIT } from '../local-evidence.mjs';
 import { PACKET_LIMIT } from '../packet-budget.mjs';
 import { Controller } from '../controller.mjs';
 
@@ -37,6 +37,7 @@ test('moderate native activity retains essential command and file records despit
   started(ledger, file); observe(ledger, notification(file));
   assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
   assert.equal(ledger.commands.length, 13); assert.equal(ledger.file_changes.length, 1);
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
   assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
   for (const [index, record] of ledger.commands.entries()) {
     assert.equal(record.command.value, `printf fixture-${index}`); assert.equal(record.cwd.value, '/task');
@@ -49,7 +50,7 @@ test('moderate native activity retains essential command and file records despit
 
 test('essential evidence overflow and prohibited indications are not discarded to obtain complete coverage', () => {
   const ledger = createLocalEvidence('task');
-  for (let index = 0; index < 30; index++) {
+  for (let index = 0; index < 532; index++) {
     const item = { ...command, id: `required-${index}`, command: 'git push ' + 'x'.repeat(1700), aggregatedOutput: null };
     started(ledger, item); observe(ledger, notification(item));
   }
@@ -191,22 +192,112 @@ test('duplicate, out-of-order, cross-thread/turn and invalid identity notificati
   assert.equal(ledger.rejected_events, 7); assert.equal(ledger.commands.length, 1); assert.equal(ledger.file_changes.length, 0);
 });
 
-test('record and UTF-8 byte limits retain explicit omission counters', () => {
+// These workloads come from the acceptance requirement, independently of the
+// implementation constants: 512 records, a 513th record, and 4,194,304 bytes.
+const recordBytes = ledger => Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes]));
+function assertMeter(ledger) { assert.equal(ledger.record_bytes, recordBytes(ledger)); }
+
+test('512 distinct records survive start/completion replacement; the fixed 513th is omitted', () => {
   const ledger = createLocalEvidence('task');
-  for (let index = 0; index < 100; index++) observe(ledger, notification({ ...command, id: `cmd-${index}`, aggregatedOutput: '🙂'.repeat(2000) }));
-  assert(ledger.omitted_events > 0); assert(ledger.commands.length <= LOCAL_RECORD_LIMIT);
-  assert(Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])) <= LOCAL_RECORD_BYTES);
-  const small = createLocalEvidence('task');
-  for (let index = 0; index < 100; index++) observe(small, notification({ id: `file-${index}`, type: 'fileChange' }));
-  assert(small.file_changes.length <= LOCAL_RECORD_LIMIT); assert(small.omitted_events > 0);
+  const items = Array.from({ length: 512 }, (_, index) => ({ ...command, id: `normal-${index}`,
+    command: `python3 -B check.py --case=${index}`, aggregatedOutput: undefined }));
+  for (const item of items) { started(ledger, item); assertMeter(ledger); }
+  // Complete in reverse order, at the count limit, so replacements cannot be
+  // mistaken for appends or depend on the record being last.
+  for (const item of [...items].reverse()) {
+    observe(ledger, notification({ ...item, aggregatedOutput: '検証🙂\n'.repeat(80) })); assertMeter(ledger);
+  }
+  assert.equal(ledger.commands.length, 512);
+  assert.deepEqual(ledger.commands.map(record => record.item_id), items.map(item => item.id));
+  assert(ledger.commands.every(record => record.start_observed && record.completion_observed && record.exit_code === 0));
+  assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
+  const before = JSON.stringify(ledger.commands), bytes = ledger.record_bytes;
+  started(ledger, { ...command, id: 'record-513' });
+  observe(ledger, notification({ ...command, id: 'record-513' }));
+  assert.equal(ledger.omitted_events, 2); assert.equal(ledger.rejected_events, 0);
+  assert.equal(JSON.stringify(ledger.commands), before); assert.equal(ledger.record_bytes, bytes); assertMeter(ledger);
 });
 
-test('an omitted completion never fabricates results for the retained start', () => {
-  const ledger = createLocalEvidence('task'); started(ledger);
-  for (let index = 0; index < 100; index++) observe(ledger, notification({ ...command, id: `cmd-${index}`, aggregatedOutput: 'x'.repeat(2048) }));
-  observe(ledger, notification({ ...command, command: 'x'.repeat(2048), cwd: 'x'.repeat(1024), aggregatedOutput: '🙂'.repeat(2000) }));
-  assert(ledger.commands[0].missing.includes('completion')); assert.equal(ledger.commands[0].exit_code, null);
-  assert(ledger.omitted_events > 0);
+// Construct a fixed-size, valid notification workload using per-field UTF-8
+// content, never by assigning the meter or padding retained records afterward.
+// A pending command leaves room for each file's larger start representation;
+// its completion consumes that room and lands exactly on the required ceiling.
+function exactByteWorkload() {
+  const ledger = createLocalEvidence('task');
+  const final = { ...command, id: 'boundary-command', aggregatedOutput: '検'.repeat(128) };
+  const probe = createLocalEvidence('task');
+  started(probe, { ...final, aggregatedOutput: undefined }); observe(probe, notification(final));
+  const files = Array.from({ length: 96 }, (_, index) => ({ id: `file-${index}`, type: 'fileChange', status: 'completed',
+    changes: Array.from({ length: 16 }, (_, part) => ({ path: `/task/source-${index}-${part}.mjs`,
+      kind: { type: 'update' }, diff: '+' })) }));
+  let baseline = recordBytes(probe) + files.length; // one comma per added record
+  for (const item of files) {
+    const single = createLocalEvidence('task'); started(single, item); observe(single, notification(item));
+    baseline += recordBytes(single) - 2;
+  }
+  let remaining = 4_194_304 - baseline;
+  assert(remaining > 1_048_576, 'the fixed workload must exceed the old 1 MiB ceiling');
+  for (const item of files) for (const change of item.changes) {
+    const characters = Math.min(1023, Math.floor(remaining / 3));
+    change.diff += '検'.repeat(characters); remaining -= characters * 3;
+    const ascii = Math.min(1024 - change.diff.length, remaining);
+    change.diff += 'x'.repeat(ascii); remaining -= ascii;
+  }
+  assert.equal(remaining, 0, 'the accepted per-field bounds must represent the exact target');
+  started(ledger, { ...final, aggregatedOutput: undefined }); assertMeter(ledger);
+  for (const item of files) {
+    started(ledger, item); assertMeter(ledger);
+    observe(ledger, notification(item)); assertMeter(ledger);
+  }
+  assert.equal(ledger.file_changes.length, 96);
+  assert.equal(ledger.commands.length, 1);
+  assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
+  return { ledger, final };
+}
+
+test('exact 4,194,304-byte UTF-8 retention accepts completion and rejects the next event', () => {
+  const { ledger, final } = exactByteWorkload();
+  observe(ledger, notification(final)); assertMeter(ledger);
+  assert.equal(recordBytes(ledger), 4_194_304);
+  assert.equal(ledger.omitted_events, 0); assert.equal(ledger.rejected_events, 0);
+  assert(ledger.commands[0].completion_observed);
+  assert(ledger.file_changes.every(record => record.start_observed && record.completion_observed && !record.start_completion_conflict));
+  assert.equal(new Set(ledger.file_changes.map(record => record.item_id)).size, 96);
+  const before = JSON.stringify([...ledger.commands, ...ledger.file_changes]);
+  observe(ledger, notification({ ...command, id: 'beyond-byte-budget' }));
+  assert.equal(ledger.omitted_events, 1); assert.equal(ledger.rejected_events, 0);
+  assert.equal(JSON.stringify([...ledger.commands, ...ledger.file_changes]), before); assertMeter(ledger);
+  assert.equal(ledger.record_bytes, 4_194_304);
+});
+
+test('genuine byte overflow cannot fabricate completion or results for a retained start', () => {
+  const { ledger, final } = exactByteWorkload();
+  const before = structuredClone(ledger.commands[0]), bytes = ledger.record_bytes;
+  observe(ledger, notification({ ...final, aggregatedOutput: '検'.repeat(256) }));
+  assert.equal(ledger.omitted_events, 1); assert.equal(ledger.rejected_events, 0);
+  assert.deepEqual(ledger.commands[0], before); assert.equal(ledger.record_bytes, bytes); assertMeter(ledger);
+  assert(ledger.commands[0].missing.includes('completion'));
+  assert.equal(ledger.commands[0].exit_code, null); assert.equal(ledger.commands[0].completion_observed, false);
+  // A later fitting event does not erase the earlier coverage failure.
+  observe(ledger, notification(final)); assertMeter(ledger);
+  assert.equal(ledger.record_bytes, 4_194_304); assert.equal(ledger.omitted_events, 1);
+});
+
+test('legacy meter fallback accounts for interleaved UTF-8 records and rejected events', () => {
+  const ledger = createLocalEvidence('task');
+  started(ledger, { ...command, aggregatedOutput: undefined });
+  const file = { id: 'unicode-file', type: 'fileChange', status: 'completed',
+    changes: [{ path: '/task/検証.txt', kind: { type: 'update' }, diff: '+café🙂\n' }] };
+  started(ledger, file); delete ledger.record_bytes;
+  observe(ledger, notification({ ...command, aggregatedOutput: 'café🙂\n' })); assertMeter(ledger);
+  delete ledger.record_bytes; observe(ledger, notification(file)); assertMeter(ledger);
+  const before = JSON.stringify([...ledger.commands, ...ledger.file_changes]), bytes = ledger.record_bytes;
+  for (const event of [notification(), notification(command, 'item/completed', { threadId: 'foreign' }),
+    notification({ ...file, id: command.id }), notification({ ...command, id: null })]) {
+    observe(ledger, event); assertMeter(ledger);
+  }
+  assert.equal(ledger.rejected_events, 4); assert.equal(ledger.omitted_events, 0);
+  assert.equal(JSON.stringify([...ledger.commands, ...ledger.file_changes]), before); assert.equal(ledger.record_bytes, bytes);
 });
 
 for (const state of ['completed', 'interrupted', 'uncertain', 'failed']) test(`packet preserves ${state} execution and excludes model prose and human responses`, () => {
