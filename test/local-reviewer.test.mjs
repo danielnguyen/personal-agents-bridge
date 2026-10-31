@@ -4,7 +4,7 @@ import { localReviewerInstructions, validateLocalReview, localContractBinding, l
   LOCAL_ACTIONABILITY_REVIEW_VERSION, localActionabilityReviewerInstructions, validateLocalActionabilityReview } from '../local-reviewer-instructions.mjs';
 import { contractMarkdown, digest } from '../controller.mjs';
 import { contract } from './helpers.mjs';
-import { LOCAL_EVIDENCE_VERSION, createLocalEvidence } from '../local-evidence.mjs';
+import { LOCAL_EVIDENCE_VERSION, createLocalEvidence, observeLocalEvidence } from '../local-evidence.mjs';
 
 const input = () => ({ overall: 'PASS', findings: ['R1', 'R2', 'I1', 'SCOPE', 'TEST_EVIDENCE'].map(id => ({ id, status: 'PASS', evidence: 'Claim based on packet facts' })) });
 const packet = { evidence_version: LOCAL_EVIDENCE_VERSION, independent_validation: { status: 'unavailable' } };
@@ -169,6 +169,47 @@ function actionabilityCase(ids = ['R2']) {
   return { value, packet: data, raw, context,
     validate() { return validateLocalActionabilityReview(JSON.stringify(raw), value, data, text => text, context); } };
 }
+
+test('12 commands and 4 file changes retain full scope evidence and qualify review', () => {
+  const fixture = actionabilityCase([]);
+  const ledger = fixture.packet.native_activity;
+  const identity = { thread_id: fixture.packet.execution.thread_id, turn_id: fixture.packet.execution.turn_id };
+  const record = (item, method) => observeLocalEvidence(ledger, {
+    method, params: { threadId: identity.thread_id, turnId: identity.turn_id, item }
+  }, identity, text => text);
+
+  for (let index = 0; index < 12; index++) {
+    const item = { id: `cmd-${index}`, type: 'commandExecution',
+      command: `python3 -B synthetic-check.py --case=${index}`,
+      cwd: '/fixture/worktree', status: 'completed', exitCode: 0, aggregatedOutput: `ok-${index}` };
+    record({ ...item, status: 'inProgress' }, 'item/started');
+    record(item, 'item/completed');
+  }
+  for (let index = 0; index < 4; index++) {
+    const item = { id: `change-${index}`, type: 'fileChange', status: 'completed',
+      changes: [{ path: '/fixture/worktree/greeting.txt', kind: { type: 'update' }, diff: `+fixture-${index}` }] };
+    record({ ...item, status: 'inProgress' }, 'item/started');
+    record(item, 'item/completed');
+  }
+  assert.equal(ledger.commands.length, 12);
+  assert.equal(ledger.file_changes.length, 4);
+  assert.equal(ledger.omitted_events, 0);
+  assert.equal(ledger.rejected_events, 0);
+  assert.equal(ledger.record_bytes, Buffer.byteLength(JSON.stringify([...ledger.commands, ...ledger.file_changes])));
+  const result = fixture.validate();
+  assert.equal(result.overall, 'PASS');
+  assert.deepEqual(result.controller_overrides, []);
+  assert.equal(result.scope_qualification.status, 'qualified');
+});
+
+test('tampered native byte meter cannot pass independent SCOPE', () => {
+  const fixture = actionabilityCase([]);
+  fixture.packet.native_activity.record_bytes = 12;
+  const result = fixture.validate();
+  assert.equal(result.overall, 'FAIL');
+  assert.deepEqual(result.controller_overrides, ['SCOPE']);
+  assert(result.scope_qualification.blockers.includes('SCOPE_NATIVE_COVERAGE_UNCERTAIN'));
+});
 
 test('versioned concrete permitted implementation defect qualifies only as a non-executable assessment', () => {
   const fixture = actionabilityCase(), result = fixture.validate();
