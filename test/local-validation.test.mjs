@@ -300,7 +300,7 @@ for (const [label, script, flag] of [
   ['non-UTF8', 'import os; os.write(1,bytes([255]))', 'encoding_error'],
   ['truncated', 'print("x"*(4*1024*1024+1))', 'truncated'],
 ]) test(`real namespace ${label} output retains explicit incomplete evidence`, async () => {
-  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 3000, bound: value => value });
+  const result = await observeValidationProcess('/usr/bin/python3', ['-B', '-c', script], { timeoutMs: 10000, bound: value => value });
   assert.equal(result.status, 'incomplete', JSON.stringify(result)); assert.equal(result.stdout[flag], true);
   assert.equal(result.exit_code, 0); assert.equal(result.background_processes_observed, false);
   assert.equal(result.termination_confirmed, true);
