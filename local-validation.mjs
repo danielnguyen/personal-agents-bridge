@@ -5,7 +5,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const VALIDATION_VERSION = 'pab.controller-local-validation.v1';
-const OUTPUT_LIMIT = 2048;
+// Bounded complete output is required for independent validation qualification.
+// A busy test suite can exceed 2 KiB on stderr even when all tests pass.
+const OUTPUT_LIMIT = 4 * 1024 * 1024;
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 export const validationEnvironment = home => ({ PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', HOME: home,
   CODEX_HOME: home, TMPDIR: path.join(home, 'tmp'), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
@@ -193,7 +195,7 @@ finally:
 
 export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, bound, spawnProcess = spawn }) {
   return new Promise(resolve => {
-    const output = { stdout: { data: Buffer.alloc(0), bytes: 0 }, stderr: { data: Buffer.alloc(0), bytes: 0 } };
+    const output = { stdout: { chunks: [], captured_bytes: 0, bytes: 0 }, stderr: { chunks: [], captured_bytes: 0, bytes: 0 } };
     let child, timer, grace, settled = false, closed = false, spawned = false, spawnFailed = false;
     const nonce = randomUUID();
     let timedOut = false, cancelled = signal?.aborted === true, background = false, exitCode = null, exitSignal = null;
@@ -203,8 +205,9 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
       settled = true; clearTimeout(timer); clearTimeout(grace); signal?.removeEventListener('abort', abort);
       const streams = Object.fromEntries(Object.entries(output).map(([name, value]) => {
         let text, encodingError = false;
-        try { text = new TextDecoder('utf-8', { fatal: true }).decode(value.data); }
-        catch { text = value.data.toString('utf8'); encodingError = true; }
+        const captured = Buffer.concat(value.chunks, value.captured_bytes);
+        try { text = new TextDecoder('utf-8', { fatal: true }).decode(captured); }
+        catch { text = captured.toString('utf8'); encodingError = true; }
         let sanitized;
         try { sanitized = bound(text, OUTPUT_LIMIT); if (typeof sanitized !== 'string') throw Error('invalid output'); }
         catch { sanitized = ''; observationFailed = true; }
@@ -236,8 +239,15 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
       { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }); }
     catch { spawnFailed = true; finish(); return; }
     for (const name of ['stdout', 'stderr']) child[name]?.on('data', buffer => {
-      const value = output[name], remaining = Math.max(0, OUTPUT_LIMIT - value.bytes);
-      value.bytes += buffer.length; value.data = Buffer.concat([value.data, buffer.subarray(0, remaining)]);
+      const value = output[name], remaining = Math.max(0, OUTPUT_LIMIT - value.captured_bytes);
+      value.bytes += buffer.length;
+      if (remaining > 0) {
+        // Copy only the bounded prefix; avoid retaining an oversized upstream chunk
+        // and repeated Buffer.concat work for large or heavily chunked output.
+        const captured = Buffer.from(buffer.subarray(0, remaining));
+        value.chunks.push(captured);
+        value.captured_bytes += captured.length;
+      }
     });
     child.once('spawn', () => { spawned = true; if (cancelled) terminate(); });
     child.once('error', () => { spawnFailed = !spawned; if (spawned) terminate(); else finish(); });
