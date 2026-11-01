@@ -11,7 +11,7 @@ and task scratch. Implementation agents cannot push or merge.
 
 A separate session independently reviews bounded controller evidence. Only after
 a completed PASS can `publish_task` freeze the task and publish the exact reviewed
-Git tree through the trusted controller. The human retains the merge decision.
+Git tree through the trusted controller. The bridge does not merge pull requests; merge authorization is handled separately.
 
 This is a public source demonstration, **not a multi-user production service or
 an official OpenAI project**. Repository sandboxes permit broad reads; use a
