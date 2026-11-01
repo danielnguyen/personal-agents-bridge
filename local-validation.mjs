@@ -56,6 +56,14 @@ def exited(fd): return bool(select.select([fd],[],[],0)[0])
 def stop(fd):
  if fd is not None and not exited(fd): signal.pidfd_send_signal(fd,signal.SIGKILL)
 stopping=False
+timed_out=False
+dispatched=False
+def expire():
+ global stopping,timed_out
+ if time.monotonic_ns()>=cutoff_ns or (deadline_ms is not None and time.time_ns()>=deadline_ms*1000000):
+  stopping=True
+  timed_out=True
+ return timed_out
 def cancel(*_):
  global stopping
  stopping=True
@@ -103,12 +111,21 @@ command=None
 buffer=b''
 eof=False
 try:
+ # Node hrtime and Python monotonic_ns share Linux CLOCK_MONOTONIC outside
+ # the command namespace. This absolute cutoff already includes spawn delay.
+ raw=request['cutoff_ns']
+ if type(raw) is not str or not raw.isascii() or not raw.isdecimal() or len(raw)>24: raise ValueError('invalid cutoff')
+ cutoff_ns=int(raw)
+ if cutoff_ns>time.monotonic_ns()+600000000000: raise ValueError('unbounded cutoff')
+ deadline_ms=request['deadline_ms']
+ if deadline_ms is not None and (type(deadline_ms) is not int or abs(deadline_ms)>9007199254740991): raise ValueError('invalid deadline')
+ expire()
  prctl(36,1) # PR_SET_CHILD_SUBREAPER, scoped to this observer.
  parent=request['owner_pid']
  prctl(1,signal.SIGTERM) # Owner death initiates the same bounded shutdown.
  if os.getppid()!=parent: raise RuntimeError('owner exited')
  if stopping:
-  emit('complete',termination_confirmed=True,command=None,not_started=True)
+  emit('complete',termination_confirmed=True,command=None,not_started=True,timeout=timed_out)
   os._exit(0)
  reader,writer=os.pipe()
  gate_reader,gate_writer=os.pipe()
@@ -124,12 +141,13 @@ try:
  os.close(writer)
  os.close(gate_reader)
  while True:
+  expire()
   # On early cancellation, finish trusted namespace setup without opening the
   # dispatch gate. This lets ownership be proved within the existing grace.
   if stopping and initialized:
    stop(wrapper_fd)
    stop(init_fd)
-  if select.select([reader],[],[],0.01)[0]:
+  if select.select([reader],[],[],min(0.01,max(0,(cutoff_ns-time.monotonic_ns())/1e9)) if not stopping else 0.01)[0]:
    data=os.read(reader,4096)
    if not data: eof=True
    buffer+=data
@@ -160,7 +178,10 @@ try:
      init_pid,init_fd=candidate,candidate_fd
      initialized=True
      emit('ready',init_pid=init_pid,namespace=namespace)
-     if not stopping: os.write(gate_writer,b'1')
+     expire()
+     if not stopping:
+      os.write(gate_writer,b'1')
+      dispatched=True
      os.close(gate_writer)
     elif message['event']=='command':
      if not initialized or command is not None: raise RuntimeError('unowned completion')
@@ -176,7 +197,8 @@ try:
  if init_pid is not None:
   try: os.waitpid(init_pid,os.WNOHANG)
   except ChildProcessError: pass
- emit('complete',termination_confirmed=confirmed,command=command,
+ expire()
+ emit('complete',termination_confirmed=confirmed,command=command,timeout=timed_out,not_started=not dispatched,
   diagnostic=None if command is not None else 'VALIDATION_NAMESPACE_EXECUTION_UNAVAILABLE')
 except BaseException:
  try:
@@ -191,9 +213,18 @@ except BaseException:
 finally:
  for fd in [wrapper_fd,init_fd]:
   if fd is not None: os.close(fd)
+# Keep cancellation handlers installed until exit; interpreter shutdown restores
+# SIGTERM and can race Node's fallback after confirmed native termination.
+os._exit(0)
 `;
 
-export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, bound, spawnProcess = spawn }) {
+export function observeValidationProcess(binary, args, { cwd, env, signal, timeoutMs, deadline, bound, spawnProcess = spawn }) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs<=0 || (deadline!==undefined && !Number.isSafeInteger(deadline))) fail('VALIDATION_TIMEOUT_INVALID');
+  // Sample monotonic time before wall time: neither serialization nor process
+  // creation may renew the authorized command budget or original task deadline.
+  const started = process.hrtime.bigint();
+  const remainingMs = Math.max(0, Math.min(timeoutMs, 600000, deadline === undefined ? Infinity : deadline - Date.now()));
+  const cutoffNs = started + BigInt(Math.floor(remainingMs * 1000000));
   return new Promise(resolve => {
     const output = { stdout: { data: null, captured_bytes: 0, bytes: 0 }, stderr: { data: null, captured_bytes: 0, bytes: 0 } };
     let child, timer, grace, settled = false, closed = false, spawned = false, spawnFailed = false;
@@ -216,7 +247,7 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
       }));
       const terminationConfirmed = spawnFailed || (spawned && closed && supervisorCode === 0 && !observationFailed &&
         (ownership !== null || (completion?.not_started === true && (cancelled || timedOut))) && completion?.termination_confirmed === true);
-      const status = !terminationConfirmed ? 'uncertain' : cancelled || background ? 'interrupted' : timedOut ? 'timed_out' :
+      const status = !terminationConfirmed ? 'uncertain' : timedOut ? 'timed_out' : cancelled || background ? 'interrupted' :
         !closed || !Number.isInteger(exitCode) ? 'unavailable' : exitCode !== 0 || exitSignal ? 'failed' :
           Object.values(streams).some(value => value.truncated || value.redacted || value.encoding_error || !value.available) ? 'incomplete' : 'passed';
       resolve({ status, start_observed: spawned, completion_observed: closed, exit_code: exitCode, signal: exitSignal,
@@ -235,7 +266,7 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
     };
     const abort = () => { cancelled = true; terminate(); };
     if (cancelled) { spawnFailed = true; finish(); return; }
-    try { child = spawnProcess('/usr/bin/python3', ['-B', '-c', namespaceObserver, JSON.stringify({ binary, args, nonce, owner_pid: process.pid })],
+    try { child = spawnProcess('/usr/bin/python3', ['-B', '-c', namespaceObserver, JSON.stringify({ binary, args, nonce, owner_pid: process.pid, cutoff_ns: String(cutoffNs), deadline_ms: deadline ?? null })],
       { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }); }
     catch { spawnFailed = true; finish(); return; }
     for (const name of ['stdout', 'stderr']) child[name]?.on('data', buffer => {
@@ -261,8 +292,8 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
           if (message.nonce !== nonce || completion || observationFailed) throw Error('invalid observation');
           if (message.event === 'ready' && !ownership && Number.isSafeInteger(message.init_pid) && message.init_pid > 1 && /^pid:\[\d+\]$/.test(message.namespace)) {
             ownership = { init_pid: message.init_pid, namespace: message.namespace };
-          } else if (message.event === 'complete' && typeof message.termination_confirmed === 'boolean') {
-            completion = message;
+          } else if (message.event === 'complete' && typeof message.termination_confirmed === 'boolean' && typeof message.timeout === 'boolean') {
+            completion = message; timedOut ||= message.timeout;
             const command = message.command;
             if (command !== null) {
               if (!ownership || !Number.isSafeInteger(command.code) || typeof command.background !== 'boolean') throw Error('invalid completion');
@@ -284,13 +315,15 @@ export function observeValidationProcess(binary, args, { cwd, env, signal, timeo
     });
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
+    timer = setTimeout(() => { timedOut = true; terminate(); }, Math.max(1, remainingMs));
   });
 }
 
 export class LocalValidation {
-  constructor({ root, binary = process.env.CODEX_BINARY || `${homedir()}/.local/bin/codex`, timeoutMs = 60000, bound = value => value }) {
-    this.root = root; this.binary = binary; this.timeoutMs = Math.min(timeoutMs, 60000); this.bound = bound;
+  constructor({ root, binary = process.env.CODEX_BINARY || `${homedir()}/.local/bin/codex`, timeoutMs = 60000, commandTimeoutMs = 60000, deadline, bound = value => value }) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(commandTimeoutMs) || commandTimeoutMs < 1 || commandTimeoutMs > 600000 ||
+        (deadline !== undefined && !Number.isSafeInteger(deadline))) fail('VALIDATION_TIMEOUT_INVALID');
+    this.root = root; this.binary = binary; this.timeoutMs = Math.min(timeoutMs, commandTimeoutMs, 600000); this.deadline = deadline; this.bound = bound;
     this.abort = new AbortController(); this.terminationConfirmed = true;
   }
   cancel() { this.abort.abort(); }
@@ -326,11 +359,16 @@ export class LocalValidation {
         const env = validationEnvironment(control), commandEnv = validationEnvironment(scratch);
         const args = ['sandbox', '-c', `permissions=${table}`, '-P', 'bridge_task', '-C', control, '--', '/usr/bin/env', '-i',
           ...Object.entries(commandEnv).map(([name, value]) => `${name}=${value}`), '/bin/sh', '-c', 'cd -- "$1" && exec /bin/sh -c "$2"', 'pab-validation', cwd, command];
+        // Preparation and prior commands consume the same original task budget.
+        let timeoutMs = Math.min(this.timeoutMs, this.deadline === undefined ? Infinity : this.deadline - Date.now());
+        if (timeoutMs <= 0) { record.status = 'timed_out'; record.timeout = true; persist(record); break; }
         record.status = 'running'; record.start_attempted = true; record.started_at = new Date().toISOString();
         persist(record);
+        timeoutMs = Math.min(timeoutMs, this.deadline === undefined ? Infinity : this.deadline - Date.now());
+        if (timeoutMs <= 0) { record.status = 'timed_out'; record.timeout = true; persist(record); break; }
         this.terminationConfirmed = false;
         const observed = await observeValidationProcess(this.binary, args, { cwd: control, env, signal: this.abort.signal,
-          timeoutMs: this.timeoutMs, bound: this.bound });
+          timeoutMs, deadline: this.deadline, bound: this.bound });
         this.terminationConfirmed = observed.termination_confirmed;
         Object.assign(record, observed, { completed_at: new Date().toISOString() });
       } catch (error) {

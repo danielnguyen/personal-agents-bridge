@@ -309,7 +309,7 @@ for (const [label, change] of [
   ['correction rounds', input => { input.automatic.max_corrections = 1; }],
   ['extra turns', input => { input.automatic.max_codex_turns = 3; }],
   ['missing deadline', input => { delete input.automatic.max_duration_seconds; }],
-  ['extended deadline', input => { input.automatic.max_duration_seconds = 901; }],
+  ['extended deadline', input => { input.automatic.max_duration_seconds = 14401; }],
   ['non-draft publication', input => { input.automatic.publish.draft = false; }],
   ['empty title', input => { input.automatic.publish.title = ' '; }],
   ['unbounded metadata', input => { input.automatic.publish.body = 'x'.repeat(16001); }],
@@ -1569,7 +1569,7 @@ for (const kind of ['command', 'file', 'question', 'transport_loss']) test(`real
 
 // Complete the real Controller's implementation/review/publication path using
 // fake sessions and a memory-only GitHub remote; interrupt only final status.
-async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false, testCommands = ['test "$(cat greeting.txt)" = candidate'] } = {}) {
+async function completedPublication(context, { turns = 2, versioned = false, pendingOperation = false, beforeCompletion = false, afterPush = false, testCommands = ['test "$(cat greeting.txt)" = candidate'], authority = {} } = {}) {
   let validations = 0;
   const value = await setup(context, { reviewTurn: 'independent-review-turn', implementationDiagnostics: [] }, {
     fixturePrefix: '/var/tmp/personal-agents-bridge/local-recovery-', noApi: true, localValidationFactory: options => {
@@ -1596,7 +1596,7 @@ async function completedPublication(context, { turns = 2, versioned = false, pen
   value.input.contract.test_commands = testCommands;
   value.input.automatic = { ...automaticAuthority(), max_codex_turns: turns, max_corrections: turns > 2 ? 1 : 0,
     ...(versioned || turns > 2 ? { review_protocol: LOCAL_ACTIONABILITY_REVIEW_VERSION } : {}),
-    ...(turns === 4 ? { publish_after_correction: true } : {}) };
+    ...(turns === 4 ? { publish_after_correction: true } : {}), ...authority };
   const finish = value.controller.finishAutomatic.bind(value.controller);
   value.controller.finishAutomatic = (id, status, reason) => { if (status !== 'succeeded') finish(id, status, reason); };
   const opDone = value.controller.opDone.bind(value.controller);
@@ -2290,4 +2290,123 @@ test('automatic SQLite history retains exact multi-megabyte packets after worksp
   const retained = c.db.prepare("SELECT * FROM automatic_attempts WHERE task_id=? AND json_extract(value,'$.kind')='review_packet'").all(task.id);
   assert.deepEqual(retained, original);
   context.diagnostic(`Automatic retained packet: ${Buffer.byteLength(text)} bytes; exact authenticated history survives cleanup.`);
+});
+
+
+for (const seconds of [1, 120, 900, 901, 7200, 14400])
+test(`automatic duration ${seconds} receives its full original deadline independently of manual timeout`, async context => {
+  const value = await setup(context), c = value.controller, now = Date.now();
+  let clock = now; context.mock.method(Date, 'now', () => clock);
+  assert.equal(c.timeoutMs, 900000);
+  const input = { ...value.input, automatic: { ...automaticAuthority(), max_duration_seconds: seconds } };
+  const started = await c.start(input), backend = await value.running(), task = c.task(started.task_id);
+  assert.equal(task.created, now); assert.equal(task.deadline, now + seconds * 1000);
+  assert.equal(task.automatic.deadline, now + seconds * 1000);
+  assert.equal(backend.options.timeoutMs, seconds * 1000);
+  assert.equal(c.executionTimeout(task), seconds * 1000);
+  if (seconds >= 7200) { clock = now + 900001; assert.equal(c.executionTimeout(task), seconds * 1000 - 900001); }
+  clock = task.deadline - 1; assert.equal(c.executionTimeout(c.task(task.id)), 1);
+  clock = task.deadline; assert.throws(() => c.executionTimeout(c.task(task.id)), /TASK_EXPIRED/);
+  await Promise.all([c.expireAutomatic(task.id), c.expireAutomatic(task.id)]); await value.drain();
+  assert.equal(c.task(task.id).deadline, task.deadline); assert(c.task(task.id).automatic.expiry_stop);
+  // Concurrent expiry races retain uncertainty rather than inventing a confirmed stop.
+  assert.equal(c.task(task.id).automatic.status, 'uncertain');
+  assert.equal(c.task(task.id).automatic.reason, 'TASK_EXPIRED'); assert(backend.calls.includes('cancel'));
+  assert.throws(() => c.automaticGuard(c.task(task.id)), /TASK_EXPIRED/);
+  assert.equal(value.instances.length, 1);
+});
+
+test('manual local tasks retain the default 900000 ms Controller timeout', async context => {
+  const value = await setup(context), c = value.controller, now = Date.now();
+  context.mock.method(Date, 'now', () => now);
+  const started = await value.start(), backend = await value.running(), task = c.task(started.task_id);
+  assert.equal(task.automatic, undefined); assert.equal(task.deadline, now + 900000);
+  assert.equal(backend.options.timeoutMs, 900000); assert.equal(c.executionTimeout(task), 900000);
+});
+
+const budgetInvalidChanges = [
+  ...[0, -1, 14401, 1.5, '7200', null, true, [], {}].map(max_duration_seconds => ({ max_duration_seconds })),
+  ...[0, -1, 601, 1.5, '600', null, true, [], {}].map(validation_timeout_seconds => ({ validation_timeout_seconds })),
+  { max_duration_seconds: undefined }, { deadline: 9999999999999 }, { validationTimeout: 600 },
+];
+test('MCP schema and Controller enforce the same duration and validation authorization boundaries before execution', async context => {
+  const value = await setup(context), c = value.controller, server = createServer(c, async () => {});
+  const client = new Client({ name: 'budget-boundaries', version: '1' }), [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(a); await client.connect(b); context.after(async () => { await client.close(); await server.close(); });
+  const schema = (await client.listTools()).tools.find(tool => tool.name === 'start_task').inputSchema.properties.automatic;
+  assert.equal(schema.properties.max_duration_seconds.maximum, 14400); assert.equal(schema.properties.max_duration_seconds.minimum, 1);
+  assert(schema.required.includes('max_duration_seconds'));
+  assert.equal(schema.properties.validation_timeout_seconds.minimum, 1); assert.equal(schema.properties.validation_timeout_seconds.maximum, 600);
+  assert(!schema.required.includes('validation_timeout_seconds')); assert.equal(schema.additionalProperties, false);
+  const admitted = [1, 120, 900, 901, 7200, 14400].flatMap(max_duration_seconds =>
+    [undefined, 1, 60, 600].map(validation_timeout_seconds => ({ max_duration_seconds,
+      ...(validation_timeout_seconds === undefined ? {} : { validation_timeout_seconds }) })));
+  for (const [valid, changes] of [...admitted.map(value => [true, value]), ...budgetInvalidChanges.map(value => [false, value])]) {
+    const input = { ...value.input, repository_id: 'missing_fixture', automatic: { ...automaticAuthority(), ...changes } };
+    if (changes.max_duration_seconds === undefined && Object.hasOwn(changes, 'max_duration_seconds')) delete input.automatic.max_duration_seconds;
+    await assert.rejects(c.start(input), valid ? /UNKNOWN_REPOSITORY_ID/ : /INVALID_AUTOMATIC_AUTHORIZATION/);
+    const response = await client.callTool({ name: 'start_task', arguments: input });
+    assert.equal(response.isError, true);
+    assert.equal(response.content[0].text.includes('UNKNOWN_REPOSITORY_ID'), valid, JSON.stringify(changes));
+  }
+  for (const field of ['max_duration_seconds', 'validation_timeout_seconds']) for (const number of [NaN, Infinity, -Infinity]) {
+    await assert.rejects(c.start({ ...value.input, automatic: { ...automaticAuthority(), [field]: number } }), /INVALID_AUTOMATIC_AUTHORIZATION/);
+  }
+  assert.equal(c.db.prepare('SELECT count(*) AS n FROM tasks').get().n, 0);
+  assert.equal(c.db.prepare('SELECT count(*) AS n FROM operations').get().n, 0);
+  assert.equal(value.instances.length, 0); assert.equal(value.api.created.length, 0);
+});
+
+test('duplicate automatic requests cannot replace original execution or validation budgets', async context => {
+  const value = await setup(context), c = value.controller;
+  const input = { ...value.input, automatic: { ...automaticAuthority(), max_duration_seconds: 7200, validation_timeout_seconds: 600 } };
+  const started = await c.start(input); await value.running();
+  const original = c.task(started.task_id);
+  for (const changes of [{ max_duration_seconds: 14400 }, { max_duration_seconds: 120 }, { validation_timeout_seconds: 60 }]) {
+    await assert.rejects(c.start({ ...input, automatic: { ...input.automatic, ...changes } }), /REQUEST_ID_REUSED/);
+  }
+  const omitted = structuredClone(input); delete omitted.automatic.validation_timeout_seconds;
+  await assert.rejects(c.start(omitted), /REQUEST_ID_REUSED/);
+  assert.equal((await c.start(input)).task_id, original.id);
+  assert.deepEqual(c.task(original.id).automatic.authorization, original.automatic.authorization);
+  assert.equal(c.task(original.id).deadline, original.deadline); assert.equal(value.instances.length, 1);
+});
+
+for (const seconds of [undefined, 1, 600])
+test(`Controller validation uses original per-command authorization ${seconds ?? 'legacy 60'} and remaining deadline`, async context => {
+  const captured = [], now = Date.now(); let clock = now;
+  const value = await setup(context, { implementationDiagnostics: [] }, { localValidationFactory: options => {
+    captured.push(options); return new LocalValidation(options);
+  } });
+  context.mock.method(Date, 'now', () => clock);
+  const c = value.controller, input = { ...value.input, automatic: { ...automaticAuthority(), max_duration_seconds: 7200,
+    ...(seconds === undefined ? {} : { validation_timeout_seconds: seconds }) } };
+  // Empty commands still exercise Controller validation admission and its factory.
+  input.contract.test_commands = [];
+  const started = await c.start(input), implementer = await value.running();
+  clock = now + 7199500; implementer.finish(); await value.drain(); await value.running(1);
+  assert.equal(captured.length, 1); assert.equal(captured[0].commandTimeoutMs, (seconds ?? 60) * 1000);
+  assert.equal(captured[0].timeoutMs, 500); assert.equal(captured[0].deadline, now + 7200000);
+  assert.equal(c.task(started.task_id).deadline, now + 7200000);
+  assert.equal(value.instances[1].options.timeoutMs, 500);
+  value.instances[1].finish('interrupted'); await value.drain(); await Promise.all([...c.automaticJobs.values()]);
+});
+
+
+for (const seconds of [7200, 14400])
+test(`long automatic ${seconds} timely publication recovers after original expiry without replay or authority change`, async context => {
+  const value = await completedPublication(context, { pendingOperation: true, authority: { max_duration_seconds: seconds, validation_timeout_seconds: 600 } });
+  const task = value.task; assert.equal(task.deadline, task.created + seconds * 1000);
+  assert.equal(task.automatic.authorization.validation_timeout_seconds, 600);
+  interruptController(value.controller); context.mock.method(Date, 'now', () => task.deadline + 1);
+  const recovered = await new Controller({ ...value.config,
+    localBackendFactory() { assert.fail('No model replay'); }, localValidationFactory() { assert.fail('No validation replay'); } }).init();
+  try {
+    await Promise.all([recovered.expireAutomatic(task.id), recovered.expireAutomatic(task.id)]);
+    assert.equal(recovered.task(task.id).automatic.status, 'succeeded');
+    assert.equal(recovered.task(task.id).deadline, task.deadline);
+    assert.deepEqual(recovered.task(task.id).automatic.authorization, task.automatic.authorization);
+    assert.equal(value.counts.pushes, 1); assert.equal(value.counts.creates, 1);
+    assert.equal(recovered.automaticJobs.size, 0); assert.equal(recovered.validationRuns.size, 0);
+  } finally { await recovered.close(); }
 });

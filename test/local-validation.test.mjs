@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs, readFileSync, readdirSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -131,7 +132,7 @@ function observationFixture(events, { close = true, code = 0, observedSignal = n
   } };
 }
 const ownership = { event: 'ready', init_pid: 424243, namespace: 'pid:[123456]' };
-const completion = (command = { code: 0, background: false }) => ({ event: 'complete', termination_confirmed: true, command });
+const completion = (command = { code: 0, background: false }) => ({ event: 'complete', termination_confirmed: true, command, timeout: false });
 
 const VALIDATION_CAPTURE_BYTES = 4 * 1024 * 1024;
 
@@ -276,7 +277,7 @@ test('background namespace activity prevents PASS even when the shell exits zero
 
 for (const [label, events, options] of [
   ['missing ownership', [completion()], {}],
-  ['namespace initialization failure', [{ event: 'complete', termination_confirmed: false, command: null }], {}],
+  ['namespace initialization failure', [{ event: 'complete', termination_confirmed: false, command: null, timeout: false }], {}],
   ['unconfirmed termination', [ownership, { ...completion(), termination_confirmed: false }], {}],
   ['unobserved exit', [ownership], {}],
   ['foreign observation', [{ ...ownership, nonce: 'foreign' }, completion()], {}],
@@ -534,4 +535,169 @@ test('only complete independent exact-tree evidence may remove TEST_EVIDENCE flo
     { evidence_version: LOCAL_EVIDENCE_VERSION, execution: { task_id: 'task-fixture' }, independent_validation: validation, reviewed_git_state: reviewed }, value => value);
   assert.equal(result.overall, 'FAIL'); assert.deepEqual(result.controller_overrides, ['SCOPE']);
   assert.equal(result.findings.find(finding => finding.id === 'TEST_EVIDENCE').status, 'PASS');
+});
+
+
+for (const explicit of [false, true])
+test(`validation ${explicit ? 'explicit ten-minute' : 'legacy one-minute'} timeout is applied to processes and recalculated after preparation`, async context => {
+  const value = await fixture(context), now = Date.now(), deadline = now + 7200000;
+  let clock = now, spawns = 0; const timeouts = [];
+  context.mock.method(Date, 'now', () => clock);
+  const originalTimeout = globalThis.setTimeout;
+  context.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+    timeouts.push(milliseconds); return originalTimeout(callback, milliseconds, ...args);
+  });
+  context.mock.method(childProcess, 'spawn', (...args) => {
+    spawns++; return observationFixture([ownership, completion()]).spawnProcess(...args);
+  });
+  syncBuiltinESMExports();
+  context.after(() => { context.mock.restoreAll(); syncBuiltinESMExports(); });
+  const runner = new LocalValidation({ root: value.root, timeoutMs: 7200000, deadline,
+    ...(explicit ? { commandTimeoutMs: 600000 } : {}) });
+  const results = await runner.run({ ...value, commands: ['first', 'second', 'expired'], attemptId: 'original', onRecord(record) {
+    if (record.command_index === 0 && record.status === 'preparing') clock += 1000;
+    if (record.command_index === 0 && record.status === 'passed') clock = deadline - 50;
+    if (record.command_index === 1 && record.status === 'preparing') clock = deadline - 25;
+    if (record.command_index === 1 && record.status === 'running') clock += 5;
+    if (record.command_index === 2 && record.status === 'preparing') clock = deadline;
+  } });
+  assert.deepEqual(timeouts, [explicit ? 600000 : 60000, 20]);
+  assert.equal(spawns, 2); assert.deepEqual(results.map(result => result.status), ['passed', 'passed', 'timed_out']);
+  assert.equal(results[2].start_attempted, false); assert.equal(results[2].timeout, true);
+  assert.equal(runner.terminationConfirmed, true);
+});
+
+test('validation hard maximum rejects oversized or malformed command budgets before process execution', () => {
+  for (const commandTimeoutMs of [0, -1, 600001, 0.5, NaN, Infinity, '600000', null]) {
+    assert.throws(() => new LocalValidation({ root: '/unused', timeoutMs: 7200000, commandTimeoutMs }), /VALIDATION_TIMEOUT_INVALID/);
+  }
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 14400000, commandTimeoutMs: 600000 }).timeoutMs, 600000);
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 900000 }).timeoutMs, 60000);
+  assert.equal(new LocalValidation({ root: '/unused', timeoutMs: 500, commandTimeoutMs: 600000 }).timeoutMs, 500);
+});
+
+const shellQuote = text => "'" + text.replaceAll("'", "'\\''") + "'";
+const blockNode = milliseconds => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+
+for (const limit of ['task deadline', 'command timeout'])
+test(`native cutoff prevents late sandboxed descendant effects while another validator blocks Node: ${limit}`, { timeout: 30000 }, async context => {
+  const value = await fixture(context), nonce = randomUUID(), started = Date.now(), deadline = started + 1000;
+  const runner = new LocalValidation({ root: value.root, timeoutMs: 600000,
+    commandTimeoutMs: limit === 'command timeout' ? 1000 : 600000, ...(limit === 'task deadline' ? { deadline } : {}) });
+  // The escaped session would write an OS timestamp four seconds after cutoff.
+  // A pipe handshake proves that it exists before Node is deliberately blocked.
+  const script = `import ctypes,os,pathlib,time
+r,w=os.pipe()
+if os.fork()==0:
+ os.close(r); os.setsid(); ctypes.CDLL(None).prctl(15,ctypes.c_char_p(b'pab-escape'),0,0,0)
+ os.write(w,b'1'); os.close(w); time.sleep(5)
+ pathlib.Path('late').write_text(str(time.time_ns())); os._exit(0)
+os.close(w); os.read(r,1); pathlib.Path('ready').write_text(str(time.time_ns())); time.sleep(8)`;
+  let cwd, commandCutoff, watcher, watching, blockStarted, blockFinished;
+  const running = runner.run({ ...value, commands: ['/usr/bin/python3 -B -c ' + shellQuote(script) + ' ' + nonce], attemptId: 'native-cutoff', onRecord(record) {
+    if (record.status === 'running') { cwd = record.cwd; commandCutoff = Date.now() + 1000; }
+  } });
+  let blockerRun;
+  try {
+    let identity;
+    for (let i = 0; i < 200 && !identity; i++) {
+      if (cwd && await fs.stat(path.join(cwd, 'ready')).then(() => true, () => false)) identity = findEscapedProcess(nonce);
+      if (!identity) await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert(identity, 'sandboxed escaped session was never observed alive');
+    const cutoff = limit === 'task deadline' ? deadline : commandCutoff;
+    const readyAt = Number(await fs.readFile(path.join(cwd, 'ready'), 'utf8')) / 1000000;
+    assert(readyAt < cutoff, 'command must start before its authorized cutoff');
+    const watchScript = watchExit.replace("print('EXIT_VERIFIED',flush=True)", "print('EXIT_VERIFIED',time.time_ns(),flush=True)");
+    watcher = spawn('/usr/bin/python3', ['-B', '-c', watchScript, String(identity.pid)]);
+    watching = new Promise((resolve, reject) => {
+      let output = '', error = ''; watcher.stdout.on('data', data => { output += data; }); watcher.stderr.on('data', data => { error += data; });
+      watcher.once('error', reject); watcher.once('close', code => code === 0 ? resolve(output) : reject(Error(error)));
+    });
+    watching.catch(() => {});
+    const blocker = new LocalValidation({ root: value.root, bound(text) {
+      if (text.includes('BLOCK_NODE')) { blockStarted = Date.now(); blockNode(12000); blockFinished = Date.now(); }
+      return text;
+    } });
+    blockerRun = blocker.run({ ...value, commands: ['printf BLOCK_NODE'], attemptId: 'concurrent-blocker', onRecord() {} });
+    const [[result], [blocked]] = await Promise.all([running, blockerRun]);
+    assert.equal(blocked.status, 'passed', JSON.stringify(blocked));
+    assert(blockStarted < cutoff, 'Node must block before cutoff'); assert(blockFinished >= cutoff + 5000);
+    const exit = /EXIT_VERIFIED (\d+)/.exec(await watching); assert(exit, 'independent pidfd exit/reaping proof missing');
+    const exitedAt = Number(exit[1]) / 1000000;
+    assert(exitedAt < cutoff + 750, 'native termination must occur while Node is blocked, not when it resumes');
+    await assert.rejects(fs.stat(path.join(cwd, 'late')), { code: 'ENOENT' });
+    assert.equal(result.status, 'timed_out', JSON.stringify(result)); assert.equal(result.timeout, true);
+    assert.equal(result.termination_confirmed, true); assert.equal(result.escaped_descendants_verified, true);
+    context.diagnostic(JSON.stringify({ limit, blocked_ms: blockFinished - blockStarted,
+      native_exit_after_cutoff_ms: Math.round(exitedAt - cutoff), late_effect_observed: false, termination_confirmed: true }));
+  } finally { await Promise.allSettled([running, blockerRun, watching].filter(Boolean)); }
+});
+
+for (const limit of ['task deadline', 'command timeout'])
+for (const stage of ['supervisor startup', 'dispatch gate'])
+test(`native ${limit} refuses expired sandboxed dispatch after delayed ${stage}`, async context => {
+  const value = await fixture(context), realSpawn = childProcess.spawn;
+  let launches = 0, cwd;
+  context.mock.method(childProcess, 'spawn', (binary, args, options) => {
+    launches++; const changed = [...args];
+    if (stage === 'supervisor startup') blockNode(600);
+    else {
+      changed[2] = changed[2].replace('     initialized=True', '     initialized=True\n     time.sleep(0.6)');
+      assert.notEqual(changed[2], args[2]);
+    }
+    const child = realSpawn(binary, changed, options);
+    // Suppress Node's fallback timer until the native observer has expired.
+    if (stage === 'dispatch gate') blockNode(1000);
+    return child;
+  });
+  syncBuiltinESMExports(); context.after(() => { context.mock.restoreAll(); syncBuiltinESMExports(); });
+  const runner = new LocalValidation({ root: value.root, timeoutMs: 600000, commandTimeoutMs: limit === 'command timeout' ? 200 : 600000,
+    ...(limit === 'task deadline' ? { deadline: Date.now() + 200 } : {}) });
+  const [result] = await runner.run({ ...value, commands: ["printf started > dispatched"], attemptId: 'expired-dispatch', onRecord(record) { if (record.cwd) cwd = record.cwd; } });
+  assert.equal(launches, 1); assert.equal(result.status, 'timed_out', JSON.stringify(result));
+  assert.equal(result.namespace_initialized, stage === 'dispatch gate'); assert.equal(result.termination_confirmed, true);
+  await assert.rejects(fs.stat(path.join(cwd, 'dispatched')), { code: 'ENOENT' });
+  context.diagnostic(JSON.stringify({ limit, stage, command_dispatched: false, timeout: true, termination_confirmed: true }));
+});
+
+for (const phase of ['preparing', 'running'])
+test(`native task deadline consumed by ${phase} persistence never starts a command`, async context => {
+  const value = await fixture(context), runner = new LocalValidation({ root: value.root, timeoutMs: 600000, commandTimeoutMs: 600000, deadline: Date.now() + 100 });
+  let launches = 0;
+  context.mock.method(childProcess, 'spawn', () => { launches++; assert.fail('Expired command must not launch'); });
+  syncBuiltinESMExports(); context.after(() => { context.mock.restoreAll(); syncBuiltinESMExports(); });
+  const [result] = await runner.run({ ...value, commands: ['printf late > late'], attemptId: 'delayed-persistence', onRecord(record) { if (record.status === phase) blockNode(200); } });
+  assert.equal(launches, 0); assert.equal(result.status, 'timed_out'); assert.equal(result.timeout, true);
+  assert.equal(result.termination_confirmed, true); assert.equal(result.start_observed, false);
+});
+
+test('native timeout completion cannot PASS even with zero exit and no Node timer callback', async () => {
+  const fixture = observationFixture([ownership, { ...completion(), timeout: true }]);
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 600000, bound: value => value, spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'timed_out'); assert.equal(result.exit_code, 0);
+  assert.equal(result.timeout, true); assert.equal(result.termination_confirmed, true);
+});
+
+for (const timeout of [undefined, null, 1, 'true'])
+test(`malformed native timeout observation fails closed: ${String(timeout)}`, async () => {
+  const fixture = observationFixture([ownership, { ...completion(), timeout }]);
+  const result = await observeValidationProcess('synthetic', [], { timeoutMs: 1000, bound: value => value, spawnProcess: fixture.spawnProcess });
+  assert.equal(result.status, 'uncertain'); assert.equal(result.termination_confirmed, false);
+});
+
+test('timely sandboxed validation writes its timestamp before both cutoffs and retains complete PASS evidence', async context => {
+  const value = await fixture(context), deadline = Date.now() + 5000;
+  const runner = new LocalValidation({ root: value.root, timeoutMs: 3000, commandTimeoutMs: 3000, deadline });
+  const [result] = await runner.run({ ...value,
+    commands: ["/usr/bin/python3 -B -c 'import time; print(time.time_ns())' > timely; cat timely"],
+    attemptId: 'timely-native', onRecord() {} });
+  const writtenAt = Number((await fs.readFile(path.join(result.cwd, 'timely'), 'utf8')).trim()) / 1000000;
+  assert(writtenAt >= Date.parse(result.started_at));
+  assert(writtenAt < Math.min(deadline, Date.parse(result.started_at) + 3000));
+  assert.equal(result.status, 'passed', JSON.stringify(result)); assert.equal(result.exit_code, 0);
+  assert.equal(result.timeout, false); assert.equal(result.cancelled, false);
+  assert.equal(result.termination_confirmed, true); assert.equal(result.escaped_descendants_verified, true);
+  assert.equal(result.stdout.available, true); assert.equal(result.stderr.available, true);
+  assert.equal(result.stdout.truncated, false); assert.equal(result.stdout.redacted, false);
 });

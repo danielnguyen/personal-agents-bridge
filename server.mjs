@@ -20,7 +20,9 @@ const humanResponse = z.object({ request_ref: z.string().uuid(), thread_id: z.st
 const requirement = z.object({ id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,39}$/), text: z.string().min(1).max(4000) }).strict();
 const automaticAuthorization = z.object({
   publish: z.object({ title: z.string().min(1).max(200).regex(/^[^\x00-\x1f]+$/), body: z.string().max(16000).optional(), draft: z.literal(true) }).strict(),
-  max_duration_seconds: z.number().int().min(1).max(900), max_codex_turns: z.union([z.literal(2), z.literal(3), z.literal(4)]), max_corrections: z.union([z.literal(0), z.literal(1)]),
+  max_duration_seconds: z.number().int().min(1).max(14400).describe('Required original overall deadline: 7200 seconds recommended for substantial engineering; explicitly select up to 14400 maximum. Independent of the manual task timeout; never renewed.'),
+  validation_timeout_seconds: z.number().int().min(1).max(600).optional().describe('Original per-command independent validation authorization; omission preserves 60 seconds. Always bounded by the remaining overall deadline.'),
+  max_codex_turns: z.union([z.literal(2), z.literal(3), z.literal(4)]), max_corrections: z.union([z.literal(0), z.literal(1)]),
   review_protocol: z.literal(LOCAL_ACTIONABILITY_REVIEW_VERSION).optional().describe('Explicit local automatic review format. Omit for the original protocol.'),
   publish_after_correction: z.literal(true).optional().describe('Original versioned 4/1 local repository authority only: publish one qualified corrected PASS as an exact-tree draft.'),
 }).strict().refine(value => (value.max_codex_turns === 2 && value.max_corrections === 0) ||
